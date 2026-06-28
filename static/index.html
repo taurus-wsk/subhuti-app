@@ -1,0 +1,1471 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Subhuti API 测试台</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            min-height: 100vh;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        header {
+            text-align: center;
+            padding: 30px 0;
+            border-bottom: 1px solid #1e293b;
+            margin-bottom: 30px;
+        }
+        header h1 {
+            font-size: 28px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        header p { color: #64748b; margin-top: 8px; }
+        .main-grid {
+            display: grid;
+            grid-template-columns: 280px 1fr;
+            gap: 20px;
+        }
+        .panel {
+            background: #1e293b;
+            border-radius: 12px;
+            padding: 20px;
+            border: 1px solid #334155;
+        }
+        .panel h2 {
+            font-size: 16px;
+            margin-bottom: 16px;
+            color: #f1f5f9;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .panel h2::before {
+            content: '';
+            width: 4px;
+            height: 16px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 2px;
+        }
+        .endpoint-list { list-style: none; }
+        .endpoint-category {
+            font-size: 11px;
+            color: #64748b;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin: 12px 0 8px 0;
+            padding-left: 8px;
+        }
+        .endpoint-item {
+            padding: 10px 12px;
+            border-radius: 8px;
+            cursor: pointer;
+            margin-bottom: 4px;
+            transition: all 0.2s;
+            border: 1px solid transparent;
+        }
+        .endpoint-item:hover {
+            background: #334155;
+        }
+        .endpoint-item.active {
+            background: rgba(102, 126, 234, 0.15);
+            border-color: #667eea;
+        }
+        .endpoint-method {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            margin-right: 8px;
+        }
+        .method-get { background: #22c55e; color: #052e16; }
+        .method-post { background: #3b82f6; color: #0c1e3d; }
+        .method-delete { background: #ef4444; color: white; }
+        .endpoint-path {
+            font-family: 'SF Mono', Monaco, monospace;
+            font-size: 12px;
+            color: #cbd5e1;
+        }
+        .form-group { margin-bottom: 16px; }
+        .form-group label {
+            display: block;
+            font-size: 13px;
+            color: #94a3b8;
+            margin-bottom: 6px;
+        }
+        .form-group input,
+        .form-group select,
+        .form-group textarea {
+            width: 100%;
+            padding: 10px 12px;
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 6px;
+            color: #e2e8f0;
+            font-size: 14px;
+            font-family: inherit;
+            transition: border-color 0.2s;
+        }
+        .form-group input:focus,
+        .form-group select:focus,
+        .form-group textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        .form-group textarea {
+            min-height: 80px;
+            resize: vertical;
+            font-family: 'SF Mono', Monaco, monospace;
+            font-size: 13px;
+        }
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            width: 100%;
+        }
+        .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4); }
+        .btn-secondary {
+            background: #334155;
+            color: #e2e8f0;
+        }
+        .btn-secondary:hover { background: #475569; }
+        .btn-success {
+            background: #1e4d3a;
+            color: #10b981;
+        }
+        .btn-success:hover {
+            background: #10b981;
+            color: #0f172a;
+        }
+        .btn-danger {
+            background: #4d1e1e;
+            color: #ef4444;
+        }
+        .btn-danger:hover {
+            background: #ef4444;
+            color: white;
+        }
+        .btn-group { display: flex; gap: 8px; }
+        .response-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+        .status-badge {
+            padding: 4px 10px;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        .status-2xx { background: #22c55e; color: #052e16; }
+        .status-4xx { background: #f59e0b; color: #451a03; }
+        .status-5xx { background: #ef4444; color: #450a0a; }
+        .response-meta {
+            font-size: 12px;
+            color: #64748b;
+        }
+        .response-body {
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            padding: 16px;
+            font-family: 'SF Mono', Monaco, monospace;
+            font-size: 13px;
+            white-space: pre-wrap;
+            word-break: break-all;
+            max-height: 500px;
+            overflow-y: auto;
+        }
+        .trace-id {
+            margin-top: 12px;
+            padding: 8px 12px;
+            background: rgba(102, 126, 234, 0.1);
+            border-radius: 6px;
+            font-size: 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .trace-id span:first-child { color: #667eea; font-weight: 600; }
+        .trace-id span:last-child { color: #cbd5e1; font-family: 'SF Mono', Monaco, monospace; }
+        .quick-params {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-bottom: 12px;
+        }
+        .quick-param-tag {
+            padding: 4px 10px;
+            background: #334155;
+            border-radius: 20px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .quick-param-tag:hover { background: #475569; }
+        .tabs {
+            display: flex;
+            gap: 4px;
+            margin-bottom: 16px;
+            border-bottom: 1px solid #334155;
+            flex-wrap: wrap;
+        }
+        .tab {
+            padding: 8px 16px;
+            cursor: pointer;
+            font-size: 13px;
+            color: #64748b;
+            border-bottom: 2px solid transparent;
+            transition: all 0.2s;
+        }
+        .tab.active {
+            color: #e2e8f0;
+            border-bottom-color: #667eea;
+        }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
+        .persona-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+        .persona-card {
+            background: #0f172a;
+            border: 1px solid #1e293b;
+            border-radius: 8px;
+            padding: 12px;
+        }
+        .bar-item { margin-bottom: 10px; }
+        .bar-item:last-child { margin-bottom: 0; }
+        .bar-label {
+            display: flex;
+            justify-content: space-between;
+            font-size: 12px;
+            color: #94a3b8;
+            margin-bottom: 4px;
+        }
+        .bar-track {
+            height: 6px;
+            background: #1e293b;
+            border-radius: 3px;
+            overflow: hidden;
+        }
+        .bar-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #3b82f6, #8b5cf6);
+            border-radius: 3px;
+            transition: width 0.3s ease;
+        }
+        .trait-tag {
+            font-size: 11px;
+            padding: 2px 8px;
+            background: #1e3a5f;
+            color: #60a5fa;
+            border-radius: 10px;
+        }
+        .loading {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 40px;
+            color: #64748b;
+        }
+        .spinner {
+            width: 30px;
+            height: 30px;
+            border: 3px solid #334155;
+            border-top-color: #667eea;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-right: 12px;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .history-item {
+            padding: 10px 12px;
+            border-radius: 6px;
+            margin-bottom: 6px;
+            background: #0f172a;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .history-item:hover { background: #334155; }
+        .history-item .h-method {
+            font-size: 11px;
+            font-weight: 600;
+            margin-right: 6px;
+        }
+        .history-item .h-path {
+            font-size: 12px;
+            color: #94a3b8;
+        }
+        .history-item .h-time {
+            font-size: 11px;
+            color: #64748b;
+            margin-top: 4px;
+        }
+
+        /* Expert 插件样式 */
+        .expert-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 16px;
+        }
+        .expert-card {
+            background: #0f172a;
+            border: 1px solid #1e293b;
+            border-radius: 8px;
+            padding: 16px;
+            transition: all 0.2s;
+        }
+        .expert-card:hover {
+            border-color: #334155;
+        }
+        .expert-card.active-expert {
+            border-color: #10b981;
+            background: rgba(16, 185, 129, 0.05);
+        }
+        .expert-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+        .expert-name {
+            font-size: 15px;
+            font-weight: 600;
+            color: #e2e8f0;
+        }
+        .expert-status {
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 10px;
+        }
+        .status-enabled { background: #22c55e; color: #052e16; }
+        .status-activated { background: #3b82f6; color: white; }
+        .status-disabled { background: #475569; color: #cbd5e1; }
+        .expert-desc {
+            font-size: 13px;
+            color: #94a3b8;
+            margin-bottom: 12px;
+        }
+        .expert-meta {
+            display: flex;
+            gap: 16px;
+            font-size: 12px;
+            color: #64748b;
+            margin-bottom: 12px;
+        }
+        .expert-tags {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-bottom: 12px;
+        }
+        .expert-tag {
+            font-size: 11px;
+            padding: 2px 8px;
+            background: #1e293b;
+            color: #94a3b8;
+            border-radius: 4px;
+        }
+        .expert-actions {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .expert-actions .btn {
+            flex: 1;
+            min-width: 80px;
+            padding: 6px 12px;
+            font-size: 12px;
+        }
+
+        /* Trace 样式 */
+        .trace-card {
+            background: #0f172a;
+            border: 1px solid #1e293b;
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 8px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .trace-card:hover {
+            border-color: #334155;
+        }
+        .trace-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        .trace-id-small {
+            font-family: 'SF Mono', Monaco, monospace;
+            font-size: 12px;
+            color: #667eea;
+        }
+        .trace-time {
+            font-size: 12px;
+            color: #64748b;
+        }
+        .trace-input {
+            font-size: 13px;
+            color: #e2e8f0;
+            margin-bottom: 8px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .trace-meta {
+            display: flex;
+            gap: 12px;
+            font-size: 11px;
+            color: #64748b;
+        }
+        .trace-meta span {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .trace-status {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        .trace-success { background: #22c55e; color: #052e16; }
+        .trace-failed { background: #ef4444; color: white; }
+
+        /* Span 树样式 */
+        .span-tree {
+            padding-left: 0;
+        }
+        .span-item {
+            list-style: none;
+            padding-left: 20px;
+            border-left: 2px solid #1e293b;
+            margin-left: 8px;
+        }
+        .span-item:last-child {
+            border-left-color: transparent;
+        }
+        .span-node {
+            padding: 8px 12px;
+            background: #0f172a;
+            border: 1px solid #1e293b;
+            border-radius: 6px;
+            margin-bottom: 4px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .span-kind {
+            font-size: 11px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            margin-right: 8px;
+        }
+        .kind-request { background: #8b5cf6; color: white; }
+        .kind-llm { background: #3b82f6; color: white; }
+        .kind-skill { background: #22c55e; color: #052e16; }
+        .kind-tool { background: #f59e0b; color: #451a03; }
+        .span-name {
+            flex: 1;
+            font-size: 13px;
+            color: #e2e8f0;
+        }
+        .span-duration {
+            font-size: 12px;
+            color: #64748b;
+        }
+        .span-error {
+            color: #ef4444;
+            font-size: 12px;
+        }
+
+        .two-col {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+        @media (max-width: 1000px) {
+            .two-col { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🧠 Subhuti API 测试台</h1>
+            <p>AI Agent 框架 · Trace 追踪 · 专家插件 · 心灵层</p>
+        </header>
+
+        <div class="main-grid">
+            <div class="panel" style="max-height: calc(100vh - 150px); overflow-y: auto;">
+                <h2>API 端点</h2>
+                <div id="endpointList"></div>
+            </div>
+
+            <div>
+                <div class="panel" style="margin-bottom: 20px;">
+                    <h2 id="requestTitle">请求配置</h2>
+
+                    <div class="tabs">
+                        <div class="tab active" data-tab="params">参数</div>
+                        <div class="tab" data-tab="trace">🔍 Trace</div>
+                        <div class="tab" data-tab="expert">🎯 专家</div>
+                        <div class="tab" data-tab="persona">🧠 心灵层</div>
+                        <div class="tab" data-tab="logs">📋 日志</div>
+                        <div class="tab" data-tab="history">历史</div>
+                    </div>
+
+                    <!-- 参数 Tab -->
+                    <div class="tab-content active" id="tab-params">
+                        <div id="paramsForm"></div>
+                        <div class="btn-group" style="margin-top: 16px;">
+                            <button class="btn btn-primary" id="sendBtn" onclick="sendRequest()">发送请求</button>
+                            <button class="btn btn-secondary" onclick="loadEndpointDocs()">查看文档</button>
+                        </div>
+                    </div>
+
+                    <!-- Trace Tab -->
+                    <div class="tab-content" id="tab-trace">
+                        <div style="display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap;">
+                            <div class="form-group" style="flex: 1; min-width: 200px; margin-bottom: 0;">
+                                <label>Trace ID</label>
+                                <input type="text" id="traceSearchId" placeholder="输入 Trace ID 查询">
+                            </div>
+                            <div class="form-group" style="width: 120px; margin-bottom: 0;">
+                                <label>数量</label>
+                                <select id="traceLimit">
+                                    <option value="10">10</option>
+                                    <option value="20" selected>20</option>
+                                    <option value="50">50</option>
+                                </select>
+                            </div>
+                            <div style="display: flex; align-items: flex-end; gap: 8px;">
+                                <button class="btn btn-primary" onclick="loadTraces()">查询</button>
+                                <button class="btn btn-secondary" onclick="loadTraceDetail()">详情</button>
+                            </div>
+                        </div>
+                        <div id="traceList"></div>
+                        <div id="traceDetail" style="margin-top: 16px;"></div>
+                    </div>
+
+                    <!-- 专家 Tab -->
+                    <div class="tab-content" id="tab-expert">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+                            <div>
+                                <span style="font-size: 14px; color: #94a3b8;">当前专家：</span>
+                                <span id="activeExpertName" style="font-size: 14px; font-weight: 600; color: #e2e8f0;">无</span>
+                            </div>
+                            <button class="btn btn-secondary" onclick="loadExperts()">刷新</button>
+                        </div>
+                        <div id="expertList"></div>
+
+                        <!-- 专家匹配测试 -->
+                        <div style="margin-top: 24px; padding-top: 20px; border-top: 1px solid #334155;">
+                            <h3 style="font-size: 14px; color: #94a3b8; margin-bottom: 12px;">🔮 自动匹配测试</h3>
+                            <div class="form-group">
+                                <label>输入一段话，测试专家匹配</label>
+                                <textarea id="matchInput" placeholder="例如：我最近压力很大，睡不着觉" style="min-height: 60px;"></textarea>
+                            </div>
+                            <button class="btn btn-primary" onclick="testExpertMatch()">测试匹配</button>
+                            <div id="matchResult" style="margin-top: 12px;"></div>
+                        </div>
+                    </div>
+
+                    <!-- 心灵层 Tab -->
+                    <div class="tab-content" id="tab-persona">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+                            <div>
+                                <span style="font-size: 15px; font-weight: 600; color: #e2e8f0;">性格快照</span>
+                                <span id="personaVersion" style="margin-left: 8px; font-size: 12px; color: #64748b;">v1</span>
+                                <span id="personaTone" style="margin-left: 8px; font-size: 12px; padding: 2px 8px; background: #3b82f6; border-radius: 10px;">友好</span>
+                            </div>
+                            <div style="display: flex; gap: 8px;">
+                                <button class="btn" onclick="loadPersona()">刷新</button>
+                                <button class="btn btn-primary" onclick="evolvePersona()">✨ 触发演化</button>
+                            </div>
+                        </div>
+
+                        <!-- 反馈区域 -->
+                        <div style="background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; padding: 12px; margin-bottom: 16px;">
+                            <div style="display: flex; justify-content: space-between; align-items: center;">
+                                <div>
+                                    <span style="font-size: 13px; color: #94a3b8;">用户反馈</span>
+                                    <span id="feedbackCounts" style="margin-left: 12px; font-size: 12px;">👍 0 / 👎 0</span>
+                                </div>
+                                <div style="display: flex; gap: 8px;">
+                                    <button class="btn btn-success" onclick="sendFeedback('like')" style="padding: 6px 12px; font-size: 13px;">👍 点赞</button>
+                                    <button class="btn btn-danger" onclick="sendFeedback('dislike')" style="padding: 6px 12px; font-size: 13px;">👎 点踩</button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="persona-grid">
+                            <div class="persona-card">
+                                <h3 style="font-size: 13px; color: #94a3b8; margin-bottom: 12px;">性格五维</h3>
+                                <div id="bigFiveBars"></div>
+                            </div>
+
+                            <div class="persona-card">
+                                <h3 style="font-size: 13px; color: #94a3b8; margin-bottom: 12px;">技能熟练度</h3>
+                                <div id="skillProfBars"></div>
+                            </div>
+
+                            <div class="persona-card">
+                                <h3 style="font-size: 13px; color: #94a3b8; margin-bottom: 12px;">擅长领域</h3>
+                                <div id="expertiseBars"></div>
+                            </div>
+
+                            <div class="persona-card">
+                                <h3 style="font-size: 13px; color: #94a3b8; margin-bottom: 12px;">互动统计</h3>
+                                <div id="interactionStats">
+                                    <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+                                        <span style="color: #94a3b8;">总互动</span>
+                                        <span id="totalInteractions" style="color: #e2e8f0; font-weight: 600;">0</span>
+                                    </div>
+                                    <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+                                        <span style="color: #94a3b8;">距下次演化</span>
+                                        <span id="sinceEvolve" style="color: #e2e8f0; font-weight: 600;">0/20</span>
+                                    </div>
+                                    <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+                                        <span style="color: #94a3b8;">平均响应</span>
+                                        <span id="avgResponse" style="color: #e2e8f0; font-weight: 600;">0ms</span>
+                                    </div>
+                                    <div style="margin-top: 12px;">
+                                        <div style="font-size: 12px; color: #94a3b8; margin-bottom: 6px;">性格特征</div>
+                                        <div id="personaTraits" style="display: flex; gap: 6px; flex-wrap: wrap;"></div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- 演化进度可视化 -->
+                        <div style="background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; padding: 12px; margin-top: 16px;">
+                            <div style="font-size: 13px; color: #94a3b8; margin-bottom: 8px;">演化进度</div>
+                            <div class="bar-track" style="height: 8px;">
+                                <div id="evolveProgress" class="bar-fill" style="width: 0%; background: linear-gradient(90deg, #10b981, #3b82f6);"></div>
+                            </div>
+                            <div style="display: flex; justify-content: space-between; margin-top: 4px; font-size: 12px; color: #64748b;">
+                                <span>上次演化</span>
+                                <span id="evolveProgressText">0/20 互动</span>
+                                <span>下次演化</span>
+                            </div>
+                        </div>
+
+                        <div style="margin-top: 16px;">
+                            <div style="font-size: 13px; color: #94a3b8; margin-bottom: 8px;">原始数据</div>
+                            <pre id="personaRaw" style="background: #0f172a; padding: 12px; border-radius: 8px; font-size: 11px; color: #64748b; max-height: 150px; overflow: auto; margin: 0;">加载中...</pre>
+                        </div>
+                    </div>
+
+                    <!-- 日志 Tab -->
+                    <div class="tab-content" id="tab-logs">
+                        <div style="display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap;">
+                            <div class="form-group" style="flex: 1; min-width: 150px; margin-bottom: 0;">
+                                <label>Trace ID</label>
+                                <input type="text" id="logTraceId" placeholder="输入 Trace ID 过滤" onkeyup="if(event.key==='Enter')loadLogs()">
+                            </div>
+                            <div class="form-group" style="flex: 1; min-width: 120px; margin-bottom: 0;">
+                                <label>级别</label>
+                                <select id="logLevel" onchange="loadLogs()">
+                                    <option value="">全部</option>
+                                    <option value="INFO">INFO</option>
+                                    <option value="WARN">WARN</option>
+                                    <option value="ERROR">ERROR</option>
+                                    <option value="DEBUG">DEBUG</option>
+                                </select>
+                            </div>
+                            <div class="form-group" style="flex: 2; min-width: 200px; margin-bottom: 0;">
+                                <label>关键词</label>
+                                <input type="text" id="logKeyword" placeholder="搜索关键词..." onkeyup="if(event.key==='Enter')loadLogs()">
+                            </div>
+                            <div style="display: flex; align-items: flex-end;">
+                                <button class="btn btn-primary" onclick="loadLogs()">查询</button>
+                                <button class="btn" style="margin-left: 8px;" onclick="clearLogFilters()">清空</button>
+                            </div>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; font-size: 13px; color: #94a3b8;">
+                            <span id="logTotal">共 0 条</span>
+                            <div style="display: flex; gap: 8px; align-items: center;">
+                                <span>每页</span>
+                                <select id="logPageSize" onchange="loadLogs()" style="padding: 4px 8px; background: #0f172a; color: #e2e8f0; border: 1px solid #334155; border-radius: 4px;">
+                                    <option value="20">20</option>
+                                    <option value="50" selected>50</option>
+                                    <option value="100">100</option>
+                                </select>
+                                <span>条</span>
+                            </div>
+                        </div>
+                        <div id="logList" style="max-height: 400px; overflow-y: auto; font-family: 'SF Mono', Monaco, monospace; font-size: 12px; background: #0f172a; border-radius: 8px; padding: 12px;">
+                            <div style="color: #64748b; text-align: center; padding: 40px;">
+                                点击"查询"按钮加载日志
+                            </div>
+                        </div>
+                        <div id="logPagination" style="display: flex; justify-content: center; gap: 8px; margin-top: 16px;">
+                        </div>
+                    </div>
+
+                    <!-- 历史 Tab -->
+                    <div class="tab-content" id="tab-history">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                            <span style="color: #64748b; font-size: 13px;">最近 20 条请求记录</span>
+                            <button class="btn btn-secondary" onclick="clearHistory()" style="padding: 6px 12px; font-size: 12px;">清空历史</button>
+                        </div>
+                        <div id="historyList"></div>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <div class="response-header">
+                        <h2>响应结果</h2>
+                        <div id="statusBadge" style="display:none;"></div>
+                    </div>
+                    <div id="responseArea">
+                        <div style="color: #64748b; text-align: center; padding: 40px;">
+                            选择左侧端点并发送请求查看结果
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = '/subhuti/api/v1';
+
+        const endpoints = [
+            // 基础
+            { category: '基础', items: [
+                { method: 'GET', path: '/health', name: '健康检查', params: [] }
+            ]},
+            // Skill
+            { category: 'Skill 技能', items: [
+                { method: 'GET', path: '/skills', name: '技能列表', params: [] },
+                { method: 'POST', path: '/chat', name: '聊天 (AI匹配)', params: [
+                    { key: 'message', label: '消息', type: 'text', required: true, default: '你好' },
+                    { key: 'user_id', label: '用户ID', type: 'text', default: 'test_user' },
+                    { key: 'session_id', label: '会话ID', type: 'text', default: '' },
+                    { key: 'skill', label: '指定技能', type: 'text', default: '' },
+                    { key: 'flow_template', label: '流程模板', type: 'select', options: ['', 'simple', 'react', 'plan_act'], default: '' }
+                ], quickParams: [
+                    { name: '简单聊天', data: { message: '你好，介绍一下你自己' } },
+                    { name: '计算器', data: { message: '123 + 456 等于多少', skill: 'calculator' } },
+                    { name: '查记忆', data: { message: '我之前聊过什么', skill: 'search_long_memory' } }
+                ]},
+                { method: 'POST', path: '/chat/stream', name: '流式聊天', params: [
+                    { key: 'message', label: '消息', type: 'text', required: true, default: '写一首关于春天的诗' },
+                    { key: 'user_id', label: '用户ID', type: 'text', default: 'test_user' }
+                ]},
+                { method: 'POST', path: '/skills/{name}', name: '执行指定技能', params: [
+                    { key: '_name', label: '技能名', type: 'select', options: ['weather', 'calculator', 'default_chat', 'search_long_memory'], required: true, default: 'default_chat' },
+                    { key: 'message', label: '消息', type: 'text', required: true, default: '你好' },
+                    { key: 'user_id', label: '用户ID', type: 'text', default: 'test_user' }
+                ]}
+            ]},
+            // Trace
+            { category: '🔍 Trace 追踪', items: [
+                { method: 'GET', path: '/traces', name: 'Trace 列表', params: [
+                    { key: 'limit', label: '数量', type: 'text', default: '20' }
+                ]},
+                { method: 'GET', path: '/traces/{id}', name: 'Trace 详情', params: [
+                    { key: '_id', label: 'Trace ID', type: 'text', required: true, default: '' }
+                ]}
+            ]},
+            // 专家
+            { category: '🎯 专家插件', items: [
+                { method: 'GET', path: '/experts', name: '专家列表', params: [] },
+                { method: 'GET', path: '/experts/plugins', name: '插件详情', params: [] },
+                { method: 'GET', path: '/experts/active', name: '当前专家', params: [] },
+                { method: 'POST', path: '/experts/{id}/activate', name: '激活专家', params: [
+                    { key: '_id', label: '专家ID', type: 'select', options: ['psychology'], required: true, default: 'psychology' }
+                ]},
+                { method: 'POST', path: '/experts/deactivate', name: '停用专家', params: [] },
+                { method: 'POST', path: '/experts/match', name: '匹配专家', params: [
+                    { key: 'input', label: '输入文本', type: 'text', required: true, default: '我最近压力很大' }
+                ]}
+            ]},
+            // 心灵层
+            { category: '🧠 心灵层', items: [
+                { method: 'GET', path: '/persona', name: '人格快照', params: [] },
+                { method: 'POST', path: '/persona/feedback', name: '发送反馈', params: [
+                    { key: 'feedback_type', label: '反馈类型', type: 'select', options: ['like', 'dislike'], required: true, default: 'like' },
+                    { key: 'content', label: '内容', type: 'text', default: '' },
+                    { key: 'skill_name', label: '技能名', type: 'text', default: 'default_chat' }
+                ]},
+                { method: 'POST', path: '/persona/evolve', name: '触发演化', params: [] }
+            ]}
+        ];
+
+        let currentEndpoint = null;
+        let history = JSON.parse(localStorage.getItem('subhuti_test_history') || '[]');
+
+        function init() {
+            renderEndpointList();
+            selectEndpoint(endpoints[1].items[1]); // 默认选聊天
+            setupTabs();
+            renderHistory();
+            loadPersona();
+            loadExperts();
+        }
+
+        function renderEndpointList() {
+            const list = document.getElementById('endpointList');
+            let html = '';
+            endpoints.forEach(cat => {
+                html += `<div class="endpoint-category">${cat.category}</div>`;
+                cat.items.forEach(ep => {
+                    html += `<li class="endpoint-item" onclick='selectEndpoint(${JSON.stringify(ep).replace(/'/g, "&#39;")})'>
+                        <span class="endpoint-method method-${ep.method.toLowerCase()}">${ep.method}</span>
+                        <span class="endpoint-path">${ep.name}</span>
+                    </li>`;
+                });
+            });
+            list.innerHTML = html;
+        }
+
+        function selectEndpoint(ep) {
+            currentEndpoint = ep;
+            document.querySelectorAll('.endpoint-item').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.endpoint-item').forEach(el => {
+                if (el.textContent.includes(ep.name)) el.classList.add('active');
+            });
+            document.getElementById('requestTitle').textContent = ep.name + ' - ' + API_BASE + ep.path;
+            renderParamsForm();
+        }
+
+        function renderParamsForm() {
+            const form = document.getElementById('paramsForm');
+            let html = '';
+
+            if (currentEndpoint.quickParams) {
+                html += '<div style="margin-bottom: 12px;"><span style="font-size: 12px; color: #64748b;">快捷参数：</span><div class="quick-params">';
+                currentEndpoint.quickParams.forEach((qp, i) => {
+                    html += `<span class="quick-param-tag" onclick="fillQuickParams(${i})">${qp.name}</span>`;
+                });
+                html += '</div></div>';
+            }
+
+            currentEndpoint.params.forEach(param => {
+                html += '<div class="form-group">';
+                html += `<label>${param.label}${param.required ? ' *' : ''}</label>`;
+                if (param.type === 'select') {
+                    html += `<select id="param_${param.key}">`;
+                    param.options.forEach(opt => {
+                        html += `<option value="${opt}" ${opt === param.default ? 'selected' : ''}>${opt || '(留空)'}</option>`;
+                    });
+                    html += '</select>';
+                } else if (param.type === 'textarea') {
+                    html += `<textarea id="param_${param.key}" placeholder="${param.label}">${param.default || ''}</textarea>`;
+                } else {
+                    html += `<input type="${param.type === 'text' ? 'text' : param.type}" id="param_${param.key}" value="${param.default || ''}" placeholder="${param.label}">`;
+                }
+                html += '</div>';
+            });
+
+            form.innerHTML = html;
+        }
+
+        function fillQuickParams(idx) {
+            const qp = currentEndpoint.quickParams[idx];
+            Object.entries(qp.data).forEach(([key, value]) => {
+                const el = document.getElementById('param_' + key);
+                if (el) el.value = value;
+            });
+        }
+
+        function setupTabs() {
+            document.querySelectorAll('.tab').forEach(tab => {
+                tab.addEventListener('click', () => {
+                    const tabName = tab.dataset.tab;
+                    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                    tab.classList.add('active');
+                    document.getElementById('tab-' + tabName).classList.add('active');
+
+                    // 切换到对应 tab 时加载数据
+                    if (tabName === 'trace') loadTraces();
+                    if (tabName === 'expert') loadExperts();
+                });
+            });
+        }
+
+        function collectParams() {
+            const data = {};
+            let path = currentEndpoint.path;
+
+            currentEndpoint.params.forEach(param => {
+                const el = document.getElementById('param_' + param.key);
+                if (el) {
+                    const value = el.value;
+                    if (param.key.startsWith('_')) {
+                        path = path.replace('{' + param.key.substring(1) + '}', value);
+                    } else if (value) {
+                        data[param.key] = value;
+                    }
+                }
+            });
+
+            return { path, data };
+        }
+
+        async function sendRequest() {
+            const { path, data } = collectParams();
+            const url = API_BASE + path;
+
+            const responseArea = document.getElementById('responseArea');
+            responseArea.innerHTML = '<div class="loading"><div class="spinner"></div>请求中...</div>';
+            document.getElementById('statusBadge').style.display = 'none';
+
+            const startTime = Date.now();
+
+            try {
+                const options = {
+                    method: currentEndpoint.method,
+                    headers: { 'Content-Type': 'application/json' }
+                };
+
+                if (currentEndpoint.method === 'POST') {
+                    options.body = JSON.stringify(data);
+                }
+
+                const response = await fetch(url, options);
+                const duration = Date.now() - startTime;
+                const traceId = response.headers.get('x-trace-id');
+                const contentType = response.headers.get('content-type');
+
+                let responseData;
+                if (contentType && contentType.includes('text/event-stream')) {
+                    responseData = '[流式响应 - 请使用浏览器开发工具查看 Network]';
+                } else {
+                    responseData = await response.json();
+                }
+
+                const statusClass = response.status >= 500 ? 'status-5xx' :
+                                   response.status >= 400 ? 'status-4xx' : 'status-2xx';
+
+                const badge = document.getElementById('statusBadge');
+                badge.className = 'status-badge ' + statusClass;
+                badge.textContent = response.status + ' ' + response.statusText;
+                badge.style.display = 'inline-block';
+
+                let responseHtml = '';
+                if (traceId) {
+                    responseHtml += `<div class="trace-id"><span>Trace ID:</span><span style="cursor:pointer" onclick="showTraceDetail('${traceId}')">${traceId}</span></div>`;
+                }
+                responseHtml += `<div class="response-meta" style="margin: 12px 0;">耗时: ${duration}ms | 状态: ${response.status}</div>`;
+                responseHtml += `<div class="response-body">${typeof responseData === 'string' ? escapeHtml(responseData) : JSON.stringify(responseData, null, 2)}</div>`;
+
+                responseArea.innerHTML = responseHtml;
+                addToHistory(currentEndpoint.method, path, data, response.status, duration, traceId);
+
+            } catch (error) {
+                responseArea.innerHTML = `<div style="color: #ef4444; padding: 20px; text-align: center;">请求失败: ${error.message}</div>`;
+            }
+        }
+
+        function addToHistory(method, path, data, status, duration, traceId) {
+            history.unshift({ method, path, data, status, duration, traceId, time: new Date().toISOString() });
+            if (history.length > 20) history.pop();
+            localStorage.setItem('subhuti_test_history', JSON.stringify(history));
+            renderHistory();
+        }
+
+        function renderHistory() {
+            const list = document.getElementById('historyList');
+            if (history.length === 0) {
+                list.innerHTML = '<div style="color: #64748b; text-align: center; padding: 20px;">暂无历史记录</div>';
+                return;
+            }
+            list.innerHTML = history.map((h, i) => `
+                <div class="history-item" onclick="loadHistory(${i})">
+                    <span class="h-method method-${h.method.toLowerCase()}">${h.method}</span>
+                    <span class="h-path">${h.path}</span>
+                    <div class="h-time">${new Date(h.time).toLocaleString()} · ${h.duration}ms · ${h.status}</div>
+                </div>
+            `).join('');
+        }
+
+        function loadHistory(idx) {
+            const h = history[idx];
+            // 找到对应的 endpoint
+            endpoints.forEach(cat => {
+                cat.items.forEach(ep => {
+                    const epPath = ep.path.replace(/\{[^}]+\}/g, '');
+                    if (ep.method === h.method && h.path.startsWith(API_BASE + epPath)) {
+                        selectEndpoint(ep);
+                        Object.entries(h.data).forEach(([key, value]) => {
+                            const el = document.getElementById('param_' + key);
+                            if (el) el.value = value;
+                        });
+                    }
+                });
+            });
+        }
+
+        function clearHistory() {
+            history = [];
+            localStorage.removeItem('subhuti_test_history');
+            renderHistory();
+        }
+
+        function loadEndpointDocs() {
+            const doc = {
+                title: currentEndpoint.name,
+                path: API_BASE + currentEndpoint.path,
+                method: currentEndpoint.method,
+                params: currentEndpoint.params
+            };
+            document.getElementById('responseArea').innerHTML = `
+                <div class="response-body"><pre>${JSON.stringify(doc, null, 2)}</pre></div>
+            `;
+        }
+
+        // ── Trace 函数 ──────────────────────────────────────
+        async function loadTraces() {
+            const limit = document.getElementById('traceLimit').value;
+            try {
+                const res = await fetch(`${API_BASE}/traces?limit=${limit}`);
+                const data = await res.json();
+
+                if (!data.data || data.data.length === 0) {
+                    document.getElementById('traceList').innerHTML = '<div style="color: #64748b; text-align: center; padding: 20px;">暂无 Trace 数据</div>';
+                    return;
+                }
+
+                document.getElementById('traceList').innerHTML = data.data.map(t => `
+                    <div class="trace-card" onclick="showTraceDetail('${t.trace_id || t.id}')">
+                        <div class="trace-header">
+                            <span class="trace-id-small">${t.trace_id || t.id}</span>
+                            <span class="trace-status ${t.status === 'Success' ? 'trace-success' : 'trace-failed'}">${t.status || 'Unknown'}</span>
+                        </div>
+                        <div class="trace-input">${escapeHtml(t.input || '')}</div>
+                        <div class="trace-meta">
+                            <span>⏱ ${t.total_duration_ms || 0}ms</span>
+                            <span>🎯 ${t.matched_skill || '-'}</span>
+                            <span>🔢 ${t.token_usage?.total_tokens || 0} tokens</span>
+                        </div>
+                    </div>
+                `).join('');
+            } catch (e) {
+                document.getElementById('traceList').innerHTML = `<div style="color: #ef4444; padding: 20px;">加载失败: ${e.message}</div>`;
+            }
+        }
+
+        async function loadTraceDetail() {
+            const id = document.getElementById('traceSearchId').value.trim();
+            if (!id) {
+                alert('请输入 Trace ID');
+                return;
+            }
+            await showTraceDetail(id);
+        }
+
+        async function showTraceDetail(id) {
+            try {
+                const res = await fetch(`${API_BASE}/traces/${id}`);
+                const data = await res.json();
+
+                if (!data.success) {
+                    document.getElementById('traceDetail').innerHTML = `<div style="color: #ef4444; padding: 20px;">加载失败: ${data.error}</div>`;
+                    return;
+                }
+
+                const t = data.data;
+                const tokenInfo = t.token_usage || {};
+                const spans = Object.values(t.spans || {});
+
+                document.getElementById('traceDetail').innerHTML = `
+                    <div style="background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; padding: 16px;">
+                        <div style="display: flex; justify-content: space-between; margin-bottom: 16px;">
+                            <div>
+                                <span style="font-size: 14px; font-weight: 600; color: #e2e8f0;">Trace 详情</span>
+                                <span style="margin-left: 8px; font-family: monospace; font-size: 12px; color: #667eea;">${id}</span>
+                            </div>
+                            <span class="trace-status ${t.status === 'Success' ? 'trace-success' : 'trace-failed'}">${t.status}</span>
+                        </div>
+
+                        <div class="two-col">
+                            <div>
+                                <div style="font-size: 12px; color: #64748b; margin-bottom: 8px;">输入</div>
+                                <div style="background: #1e293b; padding: 12px; border-radius: 6px; font-size: 13px; margin-bottom: 16px;">${escapeHtml(t.input || '')}</div>
+
+                                <div style="font-size: 12px; color: #64748b; margin-bottom: 8px;">输出</div>
+                                <div style="background: #1e293b; padding: 12px; border-radius: 6px; font-size: 13px;">${escapeHtml(t.output || '')}</div>
+                            </div>
+
+                            <div>
+                                <div style="font-size: 12px; color: #64748b; margin-bottom: 8px;">统计</div>
+                                <div style="background: #1e293b; padding: 12px; border-radius: 6px; margin-bottom: 16px;">
+                                    <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+                                        <span style="color: #94a3b8;">耗时</span>
+                                        <span style="color: #e2e8f0;">${t.total_duration_ms}ms</span>
+                                    </div>
+                                    <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+                                        <span style="color: #94a3b8;">技能</span>
+                                        <span style="color: #e2e8f0;">${t.matched_skill || '-'}</span>
+                                    </div>
+                                    <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+                                        <span style="color: #94a3b8;">专家</span>
+                                        <span style="color: #e2e8f0;">${t.expert_id || '-'}</span>
+                                    </div>
+                                    <div style="display: flex; justify-content: space-between;">
+                                        <span style="color: #94a3b8;">Token</span>
+                                        <span style="color: #e2e8f0;">${tokenInfo.prompt_tokens || 0} + ${tokenInfo.completion_tokens || 0} = ${tokenInfo.total_tokens || 0}</span>
+                                    </div>
+                                </div>
+
+                                <div style="font-size: 12px; color: #64748b; margin-bottom: 8px;">调用链 (${spans.length} spans)</div>
+                                <div class="span-tree">
+                                    ${spans.map(s => `
+                                        <div class="span-item">
+                                            <div class="span-node">
+                                                <span class="span-kind kind-${s.kind?.toLowerCase() || 'request'}">${s.kind || 'Request'}</span>
+                                                <span class="span-name">${s.name}</span>
+                                                <span class="span-duration">${s.duration_ms || 0}ms</span>
+                                            </div>
+                                            ${s.error ? `<div class="span-error">❌ ${escapeHtml(s.error)}</div>` : ''}
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            } catch (e) {
+                document.getElementById('traceDetail').innerHTML = `<div style="color: #ef4444; padding: 20px;">加载失败: ${e.message}</div>`;
+            }
+        }
+
+        // ── Expert 函数 ──────────────────────────────────────
+        async function loadExperts() {
+            try {
+                const [listRes, activeRes] = await Promise.all([
+                    fetch(`${API_BASE}/experts`),
+                    fetch(`${API_BASE}/experts/active`)
+                ]);
+                const listData = await listRes.json();
+                const activeData = await activeRes.json();
+
+                const activeId = activeData.data?.id;
+                document.getElementById('activeExpertName').textContent = activeId || '无';
+
+                if (!listData.data || listData.data.length === 0) {
+                    document.getElementById('expertList').innerHTML = '<div style="color: #64748b; text-align: center; padding: 20px;">暂无专家插件</div>';
+                    return;
+                }
+
+                document.getElementById('expertList').innerHTML = `
+                    <div class="expert-grid">
+                        ${listData.data.map(e => `
+                            <div class="expert-card ${e.id === activeId ? 'active-expert' : ''}">
+                                <div class="expert-header">
+                                    <span class="expert-name">${e.name}</span>
+                                    <span class="expert-status ${e.status === 'Activated' ? 'status-activated' : e.status === 'Enabled' ? 'status-enabled' : 'status-disabled'}">${e.status}</span>
+                                </div>
+                                <div class="expert-desc">${e.description || ''}</div>
+                                <div class="expert-meta">
+                                    <span>🎯 ${e.category || 'general'}</span>
+                                    <span>📦 v${e.version || '1.0'}</span>
+                                </div>
+                                <div class="expert-tags">
+                                    ${(e.keywords || []).map(k => `<span class="expert-tag">${k}</span>`).join('')}
+                                </div>
+                                <div class="expert-actions">
+                                    ${e.status !== 'Activated' ? `<button class="btn btn-success" onclick="activateExpert('${e.id}')">激活</button>` : `<button class="btn btn-danger" onclick="deactivateExpert()">停用</button>`}
+                                    ${e.status === 'Installed' || e.status === 'Disabled' ? `<button class="btn btn-secondary" onclick="enableExpert('${e.id}')">启用</button>` : ''}
+                                    ${e.status === 'Enabled' ? `<button class="btn btn-secondary" onclick="disableExpert('${e.id}')">停用</button>` : ''}
+                                </div>
+                            </div>
+                        `).join('')}
+                    </div>
+                `;
+            } catch (e) {
+                document.getElementById('expertList').innerHTML = `<div style="color: #ef4444; padding: 20px;">加载失败: ${e.message}</div>`;
+            }
+        }
+
+        async function activateExpert(id) {
+            try {
+                const res = await fetch(`${API_BASE}/experts/${id}/activate`, { method: 'POST' });
+                const data = await res.json();
+                if (data.success) {
+                    await loadExperts();
+                    showExpertResult(`✅ 已激活专家: ${id}`);
+                } else {
+                    showExpertResult(`❌ 激活失败: ${data.error}`);
+                }
+            } catch (e) {
+                showExpertResult(`❌ 错误: ${e.message}`);
+            }
+        }
+
+        async function deactivateExpert() {
+            try {
+                const res = await fetch(`${API_BASE}/experts/deactivate`, { method: 'POST' });
+                const data = await res.json();
+                if (data.success) {
+                    await loadExperts();
+                    showExpertResult('✅ 已停用专家');
+                } else {
+                    showExpertResult(`❌ 停用失败: ${data.error}`);
+                }
+            } catch (e) {
+                showExpertResult(`❌ 错误: ${e.message}`);
+            }
+        }
+
+        async function enableExpert(id) {
+            try {
+                const res = await fetch(`${API_BASE}/experts/${id}/enable`, { method: 'POST' });
+                const data = await res.json();
+                if (data.success) {
+                    await loadExperts();
+                    showExpertResult(`✅ 已启用: ${id}`);
+                } else {
+                    showExpertResult(`❌ 启用失败: ${data.error}`);
+                }
+            } catch (e) {
+                showExpertResult(`❌ 错误: ${e.message}`);
+            }
+        }
+
+        async function disableExpert(id) {
+            try {
+                const res = await fetch(`${API_BASE}/experts/${id}/disable`, { method: 'POST' });
+                const data = await res.json();
+                if (data.success) {
+                    await loadExperts();
+                    showExpertResult(`✅ 已停用: ${id}`);
+                } else {
+                    showExpertResult(`❌ 停用失败: ${data.error}`);
+                }
+            } catch (e) {
+                showExpertResult(`❌ 错误: ${e.message}`);
+            }
+        }
+
+        async function testExpertMatch() {
+            const input = document.getElementById('matchInput').value.trim();
+            if (!input) {
+                alert('请输入测试文本');
+                return;
+            }
+            try {
+                const res = await fetch(`${API_BASE}/experts/match`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ input })
+                });
+                const data = await res.json();
+                if (data.success && data.data) {
+                    const matched = data.data;
+                    document.getElementById('matchResult').innerHTML = `
+                        <div style="background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; padding: 12px;">
+                            <div style="color: #22c55e; font-weight: 600; margin-bottom: 8px;">🎯 匹配到: ${matched.name}</div>
+                            <div style="font-size: 12px; color: #64748b;">匹配度: ${Math.round(matched.score * 100)}%</div>
+                            <div style="font-size: 12px; color: #94a3b8; margin-top: 8px;">${matched.description}</div>
+                        </div>
+                    `;
+                } else {
+                    document.getElementById('matchResult').innerHTML = '<div style="color: #f59e0b;">未匹配到合适的专家</div>';
+                }
+            } catch (e) {
+                document.getElementById('matchResult').innerHTML = `<div style="color: #ef4444;">错误: ${e.message}</div>`;
+            }
+        }
+
+        function showExpertResult(msg) {
+            const div = document.createElement('div');
+            div.style.cssText = 'position: fixed; top: 20px; right: 20px; background: #1e293b; color: #e2e8f0; padding: 12px 20px; border-radius: 8px; z-index: 1000; box-shadow: 0 4px 12px rgba(0,0,0,0.3);';
+            div.textContent = msg;
+            document.body.appendChild(div);
+            setTimeout(() => div.remove(), 3000);
+        }
+
+        // ── 心灵层函数 ──────────────────────────────────────
+        async function loadPersona() {
+            try {
+                const res = await fetch(API_BASE + '/persona');
+                const data = await res.json();
+
+                document.getElementById('personaVersion').textContent = 'v' + data.version;
+                document.getElementById('personaTone').textContent = data.tone;
+
+                const bf = data.big_five || {};
+                const bfLabels = {
+                    openness: '开放性', conscientiousness: '尽责性',
+                    extraversion: '外向性', agreeableness: '宜人性', neuroticism: '情绪稳定性'
+                };
+                let bfHtml = '';
+                for (const [key, label] of Object.entries(bfLabels)) {
+                    const val = bf[key] || 0;
+                    bfHtml += `<div class="bar-item"><div class="bar-label"><span>${label}</span><span>${Math.round(val * 100)}%</span></div><div class="bar-track"><div class="bar-fill" style="width: ${val * 100}%"></div></div></div>`;
+                }
+                document.getElementById('bigFiveBars').innerHTML = bfHtml;
+
+                const skills = data.skill_proficiency || {};
+                let skillHtml = Object.entries(skills).sort((a, b) => b[1] - a[1]).map(([name, val]) =>
+                    `<div class="bar-item"><div class="bar-label"><span>${name}</span><span>${Math.round(val * 100)}%</span></div><div class="bar-track"><div class="bar-fill" style="width: ${val * 100}%; background: linear-gradient(90deg, #10b981, #06b6d4);"></div></div></div>`
+                ).join('') || '<div style="color: #64748b; font-size: 12px; text-align: center;">暂无数据</div>';
+                document.getElementById('skillProfBars').innerHTML = skillHtml;
+
+                const exp = data.expertise_areas || {};
+                let expHtml = Object.entries(exp).sort((a, b) => b[1] - a[1]).map(([name, val]) =>
+                    `<div class="bar-item"><div class="bar-label"><span>${name}</span><span>${Math.round(val * 100)}%</span></div><div class="bar-track"><div class="bar-fill" style="width: ${val * 100}%; background: linear-gradient(90deg, #f59e0b, #ef4444);"></div></div></div>`
+                ).join('');
+                document.getElementById('expertiseBars').innerHTML = expHtml;
+
+                const stats = data.interaction_stats || {};
+                document.getElementById('totalInteractions').textContent = stats.total_interactions || 0;
+                document.getElementById('sinceEvolve').textContent = (data.interactions_since_last_evolve || 0) + '/20';
+                document.getElementById('avgResponse').textContent = (stats.avg_response_time_ms || 0) + 'ms';
+                document.getElementById('feedbackCounts').textContent = `👍 ${stats.likes || 0} / 👎 ${stats.dislikes || 0}`;
+
+                const progress = ((data.interactions_since_last_evolve || 0) / 20) * 100;
+                document.getElementById('evolveProgress').style.width = `${progress}%`;
+                document.getElementById('evolveProgressText').textContent = `${data.interactions_since_last_evolve || 0}/20 互动`;
+
+                const traits = data.traits || [];
+                document.getElementById('personaTraits').innerHTML = traits.map(t => `<span class="trait-tag">${t}</span>`).join('');
+
+                document.getElementById('personaRaw').textContent = JSON.stringify(data, null, 2);
+            } catch (e) {
+                document.getElementById('personaRaw').textContent = '加载失败: ' + e.message;
+            }
+        }
+
+        async function sendFeedback(type) {
+            try {
+                const res = await fetch(API_BASE + '/persona/feedback', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ feedback_type: type, content: '', skill_name: 'default_chat' })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    document.getElementById('feedbackCounts').textContent = `👍 ${data.likes} / 👎 ${data.dislikes}`;
+                }
+            } catch (e) {
+                console.error('反馈失败:', e);
+            }
+        }
+
+        async function evolvePersona() {
+            const btn = event.target;
+            btn.textContent = '演化中...';
+            btn.disabled = true;
+            try {
+                const res = await fetch(API_BASE + '/persona/evolve', { method: 'POST' });
+                const data = await res.json();
+                alert(data.message);
+                await loadPersona();
+            } catch (e) {
+                alert('演化失败: ' + e.message);
+            } finally {
+                btn.textContent = '✨ 触发演化';
+                btn.disabled = false;
+            }
+        }
+
+        // ── 日志函数 ──────────────────────────────────────
+        let currentLogPage = 1;
+
+        async function loadLogs() {
+            const traceId = document.getElementById('logTraceId').value.trim();
+            const level = document.getElementById('logLevel').value;
+            const keyword = document.getElementById('logKeyword').value.trim();
+            const pageSize = document.getElementById('logPageSize').value;
+
+            const params = new URLSearchParams({ page: currentLogPage, page_size: pageSize });
+            if (traceId) params.set('trace_id', traceId);
+            if (level) params.set('level', level);
+            if (keyword) params.set('keyword', keyword);
+
+            try {
+                const res = await fetch(`${API_BASE}/logs?${params}`);
+                const data = await res.json();
+                document.getElementById('logTotal').textContent = `共 ${data.total} 条`;
+                renderLogList(data.logs);
+                renderLogPagination(data.total, data.page, data.page_size);
+            } catch (e) {
+                document.getElementById('logList').innerHTML = `<div style="color: #ef4444; text-align: center; padding: 40px;">加载失败: ${e.message}</div>`;
+            }
+        }
+
+        function renderLogList(logs) {
+            const list = document.getElementById('logList');
+            if (!logs || logs.length === 0) {
+                list.innerHTML = '<div style="color: #64748b; text-align: center; padding: 40px;">没有匹配的日志</div>';
+                return;
+            }
+            const levelColors = { 'INFO': '#22c55e', 'WARN': '#f59e0b', 'ERROR': '#ef4444', 'DEBUG': '#3b82f6' };
+            list.innerHTML = logs.map(log => {
+                const color = levelColors[log.level] || '#94a3b8';
+                const traceId = log.fields?.trace_id || '';
+                return `<div style="padding: 8px 0; border-bottom: 1px solid #1e293b;">
+                    <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                        <span style="color: #64748b;">${log.timestamp}</span>
+                        <span style="color: ${color}; font-weight: 600;">${log.level}</span>
+                        ${traceId ? `<span style="color: #f59e0b; cursor: pointer;" onclick="showTraceDetail('${traceId}')">trace=${traceId}</span>` : ''}
+                    </div>
+                    <div style="color: #e2e8f0; margin-top: 4px;">${escapeHtml(log.message)}</div>
+                </div>`;
+            }).join('');
+        }
+
+        function renderLogPagination(total, page, pageSize) {
+            const totalPages = Math.ceil(total / pageSize);
+            const pag = document.getElementById('logPagination');
+            if (totalPages <= 1) { pag.innerHTML = ''; return; }
+            let html = `<button class="btn" style="padding: 4px 10px;" ${page <= 1 ? 'disabled' : ''} onclick="goToLogPage(${page - 1})">上一页</button>`;
+            html += `<span style="padding: 4px 12px;">${page}/${totalPages}</span>`;
+            html += `<button class="btn" style="padding: 4px 10px;" ${page >= totalPages ? 'disabled' : ''} onclick="goToLogPage(${page + 1})">下一页</button>`;
+            pag.innerHTML = html;
+        }
+
+        function goToLogPage(page) { currentLogPage = page; loadLogs(); }
+        function clearLogFilters() {
+            document.getElementById('logTraceId').value = '';
+            document.getElementById('logLevel').value = '';
+            document.getElementById('logKeyword').value = '';
+            currentLogPage = 1;
+            loadLogs();
+        }
+
+        function escapeHtml(text) {
+            if (!text) return '';
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        init();
+    </script>
+</body>
+</html>

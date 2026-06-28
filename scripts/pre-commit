@@ -1,0 +1,47 @@
+#!/bin/bash
+# ============================================================
+# Subhuti pre-commit hook
+# ============================================================
+# 提交前自动检查：
+# 1. 代码格式化 (cargo fmt)
+# 2. Clippy 警告检查
+# 3. 所有测试通过
+# ============================================================
+set -e
+
+echo "🔍 pre-commit 检查中..."
+echo ""
+
+# 1. 代码格式化
+echo "📝 检查代码格式..."
+if ! cargo fmt --all -- --check 2>/dev/null; then
+    echo ""
+    echo "❌ 代码格式不正确！"
+    echo "   请运行: cargo fmt --all"
+    exit 1
+fi
+echo "   ✅ 格式正确"
+
+# 2. Clippy 检查
+echo "🔍 运行 Clippy..."
+if ! cargo clippy --workspace -- -D warnings 2>/dev/null; then
+    echo ""
+    echo "❌ Clippy 发现警告！"
+    echo "   请修复警告后重新提交"
+    exit 1
+fi
+echo "   ✅ Clippy 通过"
+
+# 3. 测试
+echo "🧪 运行测试..."
+if ! cargo test --workspace 2>/dev/null; then
+    echo ""
+    echo "❌ 测试失败！"
+    echo "   请修复失败测试后重新提交"
+    exit 1
+fi
+echo "   ✅ 测试通过"
+
+echo ""
+echo "✅ pre-commit 检查全部通过！"
+exit 0

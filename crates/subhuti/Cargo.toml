@@ -1,0 +1,62 @@
+# Subhuti - Rust 极简轻量 AI Agent 框架
+# 设计哲学：薄封装、无魔法、无全局状态
+
+[package]
+name = "subhuti"
+version = "0.1.0"
+edition = "2021"
+description = "Rust 极简轻量 AI Agent 框架"
+license = "MIT"
+repository = "https://github.com/yourname/subhuti"
+keywords = ["ai", "agent", "llm", "rust"]
+categories = ["ai", " robotics"]
+
+[dependencies]
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# PostgreSQL 数据库
+sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "postgres", "chrono", "uuid", "json"] }
+
+# 向量存储 (轻量实现)
+bincode = "1"
+
+# 日期时间
+chrono = { version = "0.4", features = ["serde"] }
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 唯一ID生成
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# 错误处理
+thiserror = "1"
+anyhow = "1"
+
+# 异步特性
+async-trait = "0.1"
+futures = "0.3"
+
+# LLM API 调用
+reqwest = { version = "0.12", features = ["json"] }
+
+# 命令行参数解析
+ clap = { version = "4", features = ["derive"] }
+
+# dotenv
+dotenvy = "0.15"
+
+[dev-dependencies]
+mockall = "0.12"
+tempfile = "3"
+
+[features]
+default = []
+openai = []
+ollama = []

@@ -1,0 +1,4 @@
+/target
+http_server_bin
+*.log
+/logs/
