@@ -25,11 +25,11 @@
 
 ### 五阶段流程
 
-```
+```text
 需求分析 → 设计评审 → 开发实现 → 测试验证 → 发布部署
    ↓           ↓           ↓           ↓           ↓
 需求文档   设计文档    代码实现    测试报告    发布清单
-```
+```text
 
 ### 关键原则
 
@@ -72,13 +72,13 @@
 ```bash
 # 替换 vX.X.0 为实际版本号，如 v0.2.0
 mkdir -p docs/releases/vX.X.0
-```
+```text
 
 #### 步骤 2: 复制需求模板
 
 ```bash
 cp docs/releases/TEMPLATE_REQUIREMENTS.md docs/releases/vX.X.0/REQUIREMENTS.md
-```
+```text
 
 #### 步骤 3: 填写需求文档
 
@@ -90,7 +90,7 @@ cp docs/releases/TEMPLATE_REQUIREMENTS.md docs/releases/vX.X.0/REQUIREMENTS.md
    > **日期**: YYYY-MM-DD  
    > **状态**: 草稿/评审中/已批准  
    > **作者**: XXX
-   ```
+```text
 
 2. **版本概述**
    - 版本目标：一句话描述核心目标
@@ -102,7 +102,7 @@ cp docs/releases/TEMPLATE_REQUIREMENTS.md docs/releases/vX.X.0/REQUIREMENTS.md
    | ID | 需求名称 | 类型 | 优先级 | 状态 | 备注 |
    |----|---------|------|--------|------|------|
    | REQ-001 | 功能名称 | 功能 | P0 | 待开发 | 说明 |
-   ```
+```text
    
    **优先级定义**：
    - P0: 必须完成（阻塞发布）
@@ -121,7 +121,7 @@ cp docs/releases/TEMPLATE_REQUIREMENTS.md docs/releases/vX.X.0/REQUIREMENTS.md
    **验收条件**：
    - [ ] 条件 1
    - [ ] 条件 2
-   ```
+```text
 
 5. **非功能需求**（如适用）
    - 性能指标
@@ -168,7 +168,7 @@ cp docs/releases/TEMPLATE_REQUIREMENTS.md docs/releases/vX.X.0/REQUIREMENTS.md
 
 ```bash
 cp docs/releases/TEMPLATE_DESIGN.md docs/releases/vX.X.0/DESIGN.md
-```
+```text
 
 #### 步骤 2: 填写设计文档
 
@@ -201,7 +201,7 @@ cp docs/releases/TEMPLATE_DESIGN.md docs/releases/vX.X.0/DESIGN.md
      "success": true,
      "data": { ... }
    }
-   ```
+```text
    ```
 
 4. **模块设计**（必填）
@@ -259,7 +259,7 @@ make install
 
 # 创建功能分支
 git checkout -b feature/vX.X.0-feature-name
-```
+```text
 
 #### 步骤 2: 编码实现
 
@@ -306,7 +306,7 @@ struct ProcessParams {
 fn process_data(params: &ProcessParams) -> Result<()> {
     // ...
 }
-```
+```text
 
 #### 步骤 3: 编写单元测试
 
@@ -324,7 +324,7 @@ mod tests {
         assert!(function_name(edge_input).is_err());
     }
 }
-```
+```text
 
 #### 步骤 4: 提交前检查
 
@@ -340,7 +340,7 @@ cargo test --workspace
 
 # 或使用 Makefile 一键检查
 make check
-```
+```text
 
 #### 步骤 5: 提交代码
 
@@ -351,7 +351,7 @@ git commit -m "feat: implement feature name
 - Add API endpoint
 - Add unit tests
 - Update documentation"
-```
+```text
 
 **提交规范**：
 
@@ -381,7 +381,7 @@ struct MyParams {
 fn my_function(params: &MyParams) -> Result<T> {
     // 使用 params.param1, params.param2
 }
-```
+```text
 
 #### Q2: Clippy 报错 "field_reassign_with_default"
 
@@ -400,7 +400,7 @@ let obj = MyStruct {
     field2: value2,
     ..Default::default()
 };
-```
+```text
 
 #### Q3: 编译通过但 clippy 失败
 
@@ -413,7 +413,7 @@ cargo clippy --fix --allow-dirty
 
 # 手动修复剩余问题
 cargo clippy --workspace -- -D warnings
-```
+```text
 
 ### 检查清单
 
@@ -451,7 +451,7 @@ cargo clippy --workspace -- -D warnings
 # 从模板复制
 cp version-test-template.sh version-test-vX.X.0.sh
 chmod +x version-test-vX.X.0.sh
-```
+```text
 
 #### 步骤 2: 编辑测试脚本
 
@@ -476,7 +476,7 @@ test_new_features() {
     echo "🔍 测试功能点 2..."
     # ... 添加更多测试
 }
-```
+```text
 
 **测试脚本模板**：
 
@@ -497,13 +497,13 @@ if [ "$VALUE" = "expected" ]; then
 else
     record_test "测试名称" "FAIL" "期望 expected, 实际 $VALUE"
 fi
-```
+```text
 
 #### 步骤 3: 编写测试用例文档
 
 ```bash
 cp docs/releases/TEMPLATE_TEST_CASES.md docs/releases/vX.X.0/TEST_CASES.md
-```
+```text
 
 填写 `TEST_CASES.md`：
 
@@ -527,7 +527,7 @@ cp docs/releases/TEMPLATE_TEST_CASES.md docs/releases/vX.X.0/TEST_CASES.md
 
 # 停止服务
 ./scripts/build/dev.sh stop
-```
+```text
 
 **测试模式**：
 
@@ -542,7 +542,7 @@ cp docs/releases/TEMPLATE_TEST_CASES.md docs/releases/vX.X.0/TEST_CASES.md
 
 ```bash
 make release-test
-```
+```text
 
 **发布验证包含**：
 1. 代码质量检查（fmt + clippy）
@@ -554,7 +554,7 @@ make release-test
 7. 清理
 
 **预期输出**：
-```
+```text
 测试总结
   总计: 14 项
   通过: 14
@@ -564,13 +564,13 @@ make release-test
 
 ✅ 所有测试通过，可以发布！
 📄 测试报告已生成: RELEASE_TEST_REPORT.md
-```
+```text
 
 #### 步骤 6: 查看测试报告
 
 ```bash
 cat RELEASE_TEST_REPORT.md
-```
+```text
 
 ### 检查清单
 
@@ -611,7 +611,7 @@ cat RELEASE_TEST_REPORT.md
 
 ```bash
 cp docs/releases/TEMPLATE_RELEASE_CHECKLIST.md docs/releases/vX.X.0/RELEASE_CHECKLIST.md
-```
+```text
 
 逐项检查并填写 `RELEASE_CHECKLIST.md`：
 
@@ -630,7 +630,7 @@ cp docs/releases/TEMPLATE_RELEASE_CHECKLIST.md docs/releases/vX.X.0/RELEASE_CHEC
 [package]
 name = "subhuti-app"
 version = "X.X.0"  # 更新版本号
-```
+```text
 
 #### 步骤 3: 最终验证
 
@@ -643,7 +643,7 @@ make release-test
 
 # 运行版本测试
 ./scripts/test/version-test-vX.X.0.sh full
-```
+```text
 
 #### 步骤 4: 提交并打标签
 
@@ -682,7 +682,7 @@ git push origin vX.X.0        # 推送标签到 GitHub
 
 # 提示：GitHub 会自动创建 Release 页面
 # 访问：https://github.com/<user>/<repo>/releases/tag/vX.X.0
-```
+```text
 
 **方式 B：自动发布（推荐）**
 
@@ -702,7 +702,7 @@ git push origin vX.X.0        # 推送标签到 GitHub
 # ✅ 推送到远程 ← 最后一步
 #    ↓
 # 线上 CI/CD 自动触发构建和部署
-```
+```text
 
 **标签命名规范**：
 - 格式：`vMAJOR.MINOR.PATCH`（语义化版本）
@@ -739,7 +739,7 @@ docker images subhuti
 # 可选：推送到 Docker Hub
 # docker tag subhuti:$VERSION your-username/subhuti:$VERSION
 # docker push your-username/subhuti:$VERSION
-```
+```text
 
 **Docker 镜像标签规范**：
 - 正式版本：`subhuti:v0.2.0`
@@ -764,7 +764,7 @@ curl http://localhost:8080/subhuti/api/v1/health
 
 # 运行快速测试
 ./scripts/test/version-test-vX.X.0.sh quick
-```
+```text
 
 #### 步骤 7: 监控和回滚
 
@@ -778,7 +778,7 @@ curl http://localhost:8080/subhuti/api/v1/health
 
 # 查看健康检查
 curl http://localhost:8080/subhuti/api/v1/health/detailed
-```
+```text
 
 **回滚**（如需要）：
 ```bash
@@ -788,7 +788,7 @@ docker rm subhuti-app
 
 # 启动上一版本
 docker run -d --name subhuti-app -p 8080:8080 subhuti:vX-1.X.0
-```
+```text
 
 ### 检查清单
 
@@ -832,18 +832,18 @@ make docker             # Docker 部署
 git commit -m "feat: ..."     # 提交代码
 git tag -a vX.X.0 -m "..."    # 打标签
 git push origin vX.X.0        # 推送标签
-```
+```text
 
 ### 文档模板路径
 
-```
+```text
 docs/releases/
 ├── TEMPLATE_REQUIREMENTS.md      # 需求规格模板
 ├── TEMPLATE_DESIGN.md            # 概要设计模板
 ├── TEMPLATE_TEST_CASES.md        # 测试用例模板
 ├── TEMPLATE_RELEASE_CHECKLIST.md # 发布清单模板
 └── VERSION_WORKFLOW.md           # 版本迭代流程
-```
+```text
 
 ### 版本测试脚本
 
@@ -858,7 +858,7 @@ vim version-test-vX.X.0.sh  # 修改 test_new_features()
 # 运行
 ./scripts/test/version-test-vX.X.0.sh quick
 ./scripts/test/version-test-vX.X.0.sh full
-```
+```text
 
 ---
 
@@ -889,12 +889,12 @@ vim version-test-vX.X.0.sh  # 修改 test_new_features()
 ### Q4: 如何管理多个版本的文档？
 
 **A**: 
-```
+```text
 docs/releases/
 ├── v0.1.0/  # 初始版本
 ├── v0.2.0/  # 下一个版本
 └── v0.3.0/  # 未来版本
-```
+```text
 每个版本独立文件夹，互不干扰。
 
 ### Q5: Clippy 检查失败怎么办？
@@ -910,7 +910,7 @@ cargo clippy --workspace -- -D warnings
 # 3. 手动修复后重新检查
 cargo fmt --all
 cargo clippy --workspace -- -D warnings
-```
+```text
 
 ### Q6: 发布验证失败怎么办？
 
@@ -930,7 +930,7 @@ cargo clippy --workspace -- -D warnings
 ```bash
 # 仅用于紧急修复
 git commit --no-verify -m "hotfix: urgent fix"
-```
+```text
 
 ---
 
@@ -975,13 +975,13 @@ git commit --no-verify -m "hotfix: urgent fix"
 
 ### 提交信息规范
 
-```
+```text
 <type>: <subject>
 
 <body>
 
 <footer>
-```
+```text
 
 **type**:
 - `feat`: 新功能
@@ -993,7 +993,7 @@ git commit --no-verify -m "hotfix: urgent fix"
 - `chore`: 构建/工具
 
 **示例**：
-```
+```text
 feat: add log query time range filter
 
 - Add start/end time parameters to logs API
@@ -1002,7 +1002,7 @@ feat: add log query time range filter
 - Update API documentation
 
 Closes #123
-```
+```text
 
 ### 版本号规范
 

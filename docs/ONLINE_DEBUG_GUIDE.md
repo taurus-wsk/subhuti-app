@@ -44,7 +44,7 @@ docker logs --tail 100 subhuti-app
 
 # 查看最近 10 分钟的日志
 docker logs --since 10m subhuti-app
-```
+```text
 
 ### 1.2 通过 API 查询日志
 
@@ -66,7 +66,7 @@ curl http://localhost:8080/subhuti/api/v1/logs?page=1&page_size=100
 
 # 关键词搜索
 curl http://localhost:8080/subhuti/api/v1/logs?keyword=error
-```
+```text
 
 ### 1.3 日志级别
 
@@ -87,7 +87,7 @@ docker cp subhuti-app:/app/logs/ ./logs/
 
 # 查看日志文件
 docker exec subhuti-app tail -f /app/logs/subhuti.log
-```
+```text
 
 ---
 
@@ -124,7 +124,7 @@ curl http://localhost:8080/subhuti/api/v1/traces | python3 -m json.tool
     ],
     "total": 1
 }
-```
+```text
 
 ### 2.2 查看 Trace 详情
 
@@ -134,7 +134,7 @@ curl http://localhost:8080/subhuti/api/v1/traces/<trace_id> | python3 -m json.to
 
 # 示例：
 curl http://localhost:8080/subhuti/api/v1/traces/f1003e43-1d19-49aa-811b-d07b5bc12536 | python3 -m json.tool
-```
+```text
 
 **返回内容**：
 - 完整的输入输出
@@ -151,10 +151,10 @@ curl http://localhost:8080/subhuti/api/v1/traces/<trace_id>/tree | python3 -m js
 
 # 示例：
 curl http://localhost:8080/subhuti/api/v1/traces/f1003e43-1d19-49aa-811b-d07b5bc12536/tree | python3 -m json.tool
-```
+```text
 
 **Span 树结构**：
-```
+```text
 Trace (request_id)
   ├── Span: request (请求开始)
   ├── Span: skill_match (Skill 匹配)
@@ -163,7 +163,7 @@ Trace (request_id)
   │   ├── prompt_tokens: 51
   │   └── completion_tokens: 87
   └── Span: response (响应生成)
-```
+```text
 
 ### 2.4 Trace 数据结构
 
@@ -201,7 +201,7 @@ Trace (request_id)
     }
   }
 }
-```
+```text
 
 ### 2.5 Span 类型
 
@@ -228,7 +228,7 @@ docker exec subhuti-app ls -la /app/traces/
 
 # 复制 Trace 到本地
 docker cp subhuti-app:/app/traces/ ./traces/
-```
+```text
 
 ---
 
@@ -245,7 +245,7 @@ curl http://localhost:8080/subhuti/api/v1/health
     "status": "ok",
     "timestamp": "2026-06-28 16:12:05"
 }
-```
+```text
 
 ### 3.2 详细健康检查
 
@@ -270,7 +270,7 @@ curl http://localhost:8080/subhuti/api/v1/health/detailed | python3 -m json.tool
         }
     ]
 }
-```
+```text
 
 ---
 
@@ -290,7 +290,7 @@ docker logs -f subhuti-app
 
 # 4. 查看详细健康检查
 curl http://localhost:8080/subhuti/api/v1/health/detailed
-```
+```text
 
 ### 场景 2：请求响应慢
 
@@ -308,7 +308,7 @@ curl http://localhost:8080/subhuti/api/v1/traces/<slow_trace_id> | python3 -m js
 
 # 3. 查看调用链，找出瓶颈
 curl http://localhost:8080/subhuti/api/v1/traces/<slow_trace_id>/tree | python3 -m json.tool
-```
+```text
 
 ### 场景 3：AI 回答错误
 
@@ -327,7 +327,7 @@ curl http://localhost:8080/subhuti/api/v1/traces/<trace_id> | python3 -m json.to
 # - tools_used: 使用了哪些工具
 # - token_usage: Token 消耗
 # - spans: 每个步骤的输入输出
-```
+```text
 
 ### 场景 4：工具调用失败
 
@@ -352,7 +352,7 @@ for span_id, span in trace['spans'].items():
     if span.get('error'):
         print(f\"Span {span_id} ({span['kind']}): {span['error']}\")
 "
-```
+```text
 
 ---
 
@@ -369,7 +369,7 @@ docker exec subhuti-app netstat -tlnp | grep 8080
 
 # 3. 检查数据库连接
 curl http://localhost:8080/subhuti/api/v1/health/detailed
-```
+```text
 
 ### Q2: LLM 调用失败
 
@@ -394,7 +394,7 @@ for span_id, span in trace['spans'].items():
     if span['kind'] == 'llm_call' and span.get('error'):
         print(f\"LLM Error: {span['error']}\")
 "
-```
+```text
 
 ### Q3: Skill 匹配错误
 
@@ -415,7 +415,7 @@ for span_id, span in trace['spans'].items():
     if span['kind'] == 'skill_match':
         print(f\"Matched: {span['output']}\")
 "
-```
+```text
 
 ### Q4: 数据库连接失败
 
@@ -430,7 +430,7 @@ for comp in health['components']:
 
 # 2. 查看数据库相关日志
 curl http://localhost:8080/subhuti/api/v1/logs?keyword=database
-```
+```text
 
 ---
 
@@ -445,14 +445,14 @@ apt-get install jq  # Linux
 
 # 使用 jq
 curl http://localhost:8080/subhuti/api/v1/traces | jq .
-```
+```text
 
 ### 技巧 2：实时监控 Trace
 
 ```bash
 # 每 5 秒刷新一次 Trace 列表
 watch -n 5 'curl -s http://localhost:8080/subhuti/api/v1/traces | jq ".total"'
-```
+```text
 
 ### 技巧 3：导出 Trace 分析
 
@@ -469,7 +469,7 @@ print(f\"平均耗时: {sum(durations)/len(durations):.0f}ms\")
 print(f\"最慢: {max(durations)}ms\")
 print(f\"最快: {min(durations)}ms\")
 "
-```
+```text
 
 ### 技巧 4：查找特定请求
 
@@ -483,7 +483,7 @@ for t in traces:
     if keyword in t['input']:
         print(f\"{t['trace_id']}: {t['input'][:50]}\")
 "
-```
+```text
 
 ---
 
