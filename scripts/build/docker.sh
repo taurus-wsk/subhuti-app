@@ -7,7 +7,9 @@ set -e
 
 IMAGE_NAME="subhuti"
 CONTAINER_NAME="subhuti-app"
-PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# 项目根目录（脚本在 scripts/build/ 下，需要上两级）
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 build() {
     echo "🔨 构建 Docker 镜像..."

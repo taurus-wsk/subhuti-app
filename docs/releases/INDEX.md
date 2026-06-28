@@ -13,6 +13,7 @@
 |------|------|------|------|
 | **标准流程手册** | `docs/releases/STANDARD_WORKFLOW.md` | 完整的五阶段开发流程 | 所有开发者、AI |
 | **AI 快速参考** | `docs/releases/AI_QUICK_REFERENCE.md` | AI Assistant 快速指令卡 | AI Assistant |
+| **标签管理指南** | `docs/releases/TAG_MANAGEMENT.md` | Git 标签使用规范 | 所有开发者 |
 | **版本迭代指南** | `docs/releases/README.md` | 快速上手指引 | 新成员 |
 
 ### 文档模板
@@ -73,7 +74,9 @@ scripts/
 | 脚本 | 用途 | 使用场景 |
 |------|------|---------|
 | **release-test.sh** | 发布验证（14 项） | 每次发版本前 |
+| **auto-release.sh** | 自动发布（测试+提交+推送） | 测试通过后自动推送 |
 | **version-test-template.sh** | 版本测试模板 | 创建新版本时复制 |
+| **version-test-enhanced.sh** | 增强版版本测试（自动获取标签） | 推荐使用的版本测试 |
 | **version-test-v0.2.0.sh** | v0.2.0 版本测试 | v0.2.0 专属 |
 | **test_expert.sh** | 专家插件测试 | 测试专家系统 |
 | **test_expert_v2.sh** | 专家 V2 测试 | 测试专家 V2 |
@@ -115,6 +118,15 @@ docs/releases/v0.2.0/
 ├── TEST_CASES.md             # 测试用例
 ├── PROCESS_VERIFICATION.md   # 流程验证报告
 └── RELEASE_CHECKLIST.md      # 发布清单（待填写）
+```
+
+### v0.3.0（多Agent协调编排）
+
+```
+docs/releases/v0.3.0/
+├── REQUIREMENTS.md           # 需求规格（16 项需求）
+├── DESIGN.md                 # 概要设计（8 个模块、5 种策略、4 个 API）
+└── TEST_CASES.md             # 测试用例（52 个单元测试 + 4 个集成测试）
 ```
 
 ---

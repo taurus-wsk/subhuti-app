@@ -28,6 +28,7 @@ pub mod extension;
 pub mod flow;
 pub mod memory;
 pub mod observe; // 可观测性系统 - Trace 追踪
+pub mod orchestrator; // 多Agent协调编排层
 pub mod runtime; // 包含 llm 和 tools 子模块
 pub mod skill; // Skill 层 - 类似 HTTP 路由的技能系统
 pub mod soul; // 心灵层 - 动态角色养成系统 // 调试工具模块
@@ -43,6 +44,11 @@ pub use expert::{ExpertInfo, ExpertPersona, ExpertPlugin, KnowledgeEntry};
 pub use extension::{Extension, ExtensionManager, Hook};
 pub use flow::{Flow, FlowConfig, FlowManager, FlowStep, FlowType, ReactFlow};
 pub use memory::{DatabaseStore, Memory, MemoryConfig, MemoryStore, SemanticSearchResult};
+pub use observe::session::SessionRecordParams;
+pub use orchestrator::{
+    DispatchStrategy, ExpertAgent, ExpertPerformance, OrchestrationResult, Orchestrator,
+    OrchestratorConfig, TaskComplexityLevel, TaskDomain, TaskProfile,
+};
 pub use runtime::{
     LLMClient, LLMConfig, LLMProvider, LLMResponse, Message, MockLLM, Role, Runtime, RuntimeConfig,
     Session, SessionConfig, Tool, ToolInfo, ToolResult, LLM,
@@ -118,6 +124,9 @@ pub struct Subhuti {
     db: Option<Arc<Database>>,
     /// 专家插件管理（使用增强版 PluginManager）
     experts: Mutex<expert::PluginManager>,
+    /// 多Agent协调编排器（内部可变性，支持动态注册专家）
+    /// 使用 tokio::sync::Mutex 以支持在 async 上下文中持有锁
+    orchestrator: tokio::sync::Mutex<Orchestrator>,
 }
 
 impl Subhuti {
@@ -128,8 +137,11 @@ impl Subhuti {
 
     /// 使用配置创建
     pub fn with_config(config: SubhutiConfig) -> Self {
-        let runtime =
-            Runtime::with_config_and_llm(config.runtime.clone(), &config.llm, config.provider);
+        let runtime = Arc::new(Runtime::with_config_and_llm(
+            config.runtime.clone(),
+            &config.llm,
+            config.provider,
+        ));
         let flow_config = config.flow.clone();
         let memory_config = config.memory.clone();
 
@@ -156,17 +168,25 @@ impl Subhuti {
         skill_manager.register(CodeExecutionSkill);
         skill_manager.register(ReminderSkill);
 
+        // 创建共享 Skill 管理器（tokio RwLock 用于编排器）
+        let shared_skills = Arc::new(tokio::sync::RwLock::new(SkillManager::new()));
+
+        // 创建多Agent协调编排器
+        let orchestrator =
+            Orchestrator::with_defaults(shared_skills, memory.clone(), runtime.clone());
+
         Self {
             config,
             memory,
             memory_palace,
-            runtime: Arc::new(runtime),
+            runtime,
             flow: FlowManager::with_config(flow_config),
             extensions: ExtensionManager::new(),
             skills: Mutex::new(skill_manager),
             soul: Mutex::new(soul),
             db: None,
             experts: Mutex::new(expert::PluginManager::new()),
+            orchestrator: tokio::sync::Mutex::new(orchestrator),
         }
     }
 
@@ -389,6 +409,72 @@ impl Subhuti {
             .unwrap()
             .match_expert(input)
             .map(|p| p.info())
+    }
+
+    // ── 多Agent协调编排 ──────────────────────────────────
+
+    /// 注册专家到编排器
+    pub async fn register_orchestrator_expert(&self, agent: ExpertAgent) {
+        self.orchestrator.lock().await.register_expert(agent);
+    }
+
+    /// 从插件注册专家到编排器
+    pub async fn register_orchestrator_expert_from_plugin(&self, plugin: Arc<dyn ExpertPlugin>) {
+        self.orchestrator
+            .lock()
+            .await
+            .register_expert_from_plugin(plugin);
+    }
+
+    /// 设置编排器通用专家
+    pub async fn set_orchestrator_general_expert(&self, expert_id: &str) {
+        self.orchestrator.lock().await.set_general_expert(expert_id);
+    }
+
+    /// 使用编排器分析任务
+    pub async fn analyze_task(&self, input: &str) -> TaskProfile {
+        self.orchestrator.lock().await.analyze_task(input)
+    }
+
+    /// 使用编排器执行任务（自动选择策略）
+    pub async fn run_orchestrated(
+        &self,
+        input: &str,
+        user_id: &str,
+    ) -> Result<OrchestrationResult> {
+        let orch = self.orchestrator.lock().await;
+        orch.execute(input, user_id).await
+    }
+
+    /// 使用编排器执行任务（指定策略）
+    pub async fn run_orchestrated_with_strategy(
+        &self,
+        input: &str,
+        user_id: &str,
+        strategy: DispatchStrategy,
+    ) -> Result<OrchestrationResult> {
+        let orch = self.orchestrator.lock().await;
+        orch.execute_with_strategy(input, user_id, strategy).await
+    }
+
+    /// 获取编排器专家列表
+    pub async fn list_orchestrator_experts(&self) -> Vec<ExpertInfo> {
+        self.orchestrator.lock().await.list_experts()
+    }
+
+    /// 获取编排器专家数量
+    pub async fn orchestrator_expert_count(&self) -> usize {
+        self.orchestrator.lock().await.expert_count()
+    }
+
+    /// 匹配编排器专家
+    pub async fn match_orchestrator_experts(
+        &self,
+        input: &str,
+    ) -> Vec<orchestrator::ExpertMatchResult> {
+        let orch = self.orchestrator.lock().await;
+        let profile = orch.analyze_task(input);
+        orch.match_experts(&profile, 5)
     }
 
     /// 执行钩子链

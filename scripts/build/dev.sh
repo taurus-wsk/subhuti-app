@@ -5,7 +5,9 @@
 # ============================================================
 set -e
 
-PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# 项目根目录（脚本在 scripts/build/ 下，需要上两级）
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BINARY="$PROJECT_DIR/target/release/http_server"
 PID_FILE="$PROJECT_DIR/.http_server.pid"
 LOG_DIR="$PROJECT_DIR/logs"

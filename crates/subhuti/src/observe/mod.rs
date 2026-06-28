@@ -39,9 +39,12 @@
 //! let tree = observer.get_span_tree(&trace_id);
 //! ```
 
+pub mod session;
 pub mod trace;
 
 pub use trace::{
     Span, SpanKind, SpanStatus, SpanTreeNode, TokenUsage, Trace, TraceId, TraceObserver,
     TraceStatus, TraceStore, TraceSummary,
 };
+
+pub use session::{SessionObserver, SessionRecord, SessionRecordParams, SessionRequest};

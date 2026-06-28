@@ -47,7 +47,8 @@ use serde_json::Value;
 use subhuti::{
     runtime::tools::{Tool, ToolInfo, ToolResult},
     skill::{CalculatorSkill, DefaultChatSkill, FlowTemplate, SearchLongMemorySkill, WeatherSkill},
-    FlowConfig, LLMConfig, LLMProvider, MemoryConfig, RuntimeConfig, Subhuti, SubhutiConfig,
+    DispatchStrategy, FlowConfig, LLMConfig, LLMProvider, MemoryConfig, RuntimeConfig,
+    SessionRecordParams, Subhuti, SubhutiConfig,
 };
 
 // ============================================================
@@ -362,6 +363,59 @@ pub struct ErrorResponse {
     pub code: u16,
 }
 
+// ── 编排器 API 类型 ──────────────────────────────────────
+
+/// 编排器执行请求
+#[derive(Debug, Deserialize)]
+pub struct OrchestrateRequest {
+    pub message: String,
+    pub user_id: Option<String>,
+    /// 强制使用指定的调度策略
+    pub strategy: Option<String>,
+}
+
+/// 编排器执行响应
+#[derive(Debug, Serialize)]
+pub struct OrchestrateResponse {
+    pub success: bool,
+    pub output: String,
+    pub strategy: String,
+    pub expert_chain: Vec<String>,
+    pub expert_outputs: std::collections::HashMap<String, String>,
+    pub duration_ms: u64,
+    pub critique_rounds: usize,
+}
+
+/// 任务分析响应
+#[derive(Debug, Serialize)]
+pub struct TaskAnalysisResponse {
+    pub success: bool,
+    pub domains: Vec<String>,
+    pub complexity: String,
+    pub needs_collaboration: bool,
+    pub has_dependencies: bool,
+    pub needs_review: bool,
+    pub user_intent: String,
+    pub suggested_strategy: String,
+}
+
+/// 专家匹配响应
+#[derive(Debug, Serialize)]
+pub struct ExpertMatchResponse {
+    pub success: bool,
+    pub matches: Vec<ExpertMatchItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExpertMatchItem {
+    pub expert_id: String,
+    pub expert_name: String,
+    pub domain_match: f32,
+    pub capability_coverage: f32,
+    pub historical_score: f32,
+    pub overall_score: f32,
+}
+
 // ============================================================
 // 第七部分：Axum Handler 实现
 // ============================================================
@@ -371,6 +425,7 @@ pub struct ErrorResponse {
 struct AppState {
     subhuti: Arc<Subhuti>,
     trace_observer: Arc<subhuti::observe::TraceObserver>,
+    session_observer: Arc<subhuti::observe::SessionObserver>,
 }
 
 /// 统一响应枚举
@@ -456,6 +511,20 @@ async fn chat_handler(State(state): State<AppState>, Json(req): Json<ChatRequest
 
             // 存储 Trace
             state.trace_observer.store_trace(trace);
+
+            // 记录 Session
+            let token_usage_str = format!("{{\"total_tokens\": {}}}", tokens.total_tokens);
+            state.session_observer.record_request(&SessionRecordParams {
+                session_id: &session_id,
+                user_id: &user_id,
+                trace_id: &trace_id,
+                input: &req.message,
+                output: Some(&response),
+                duration_ms: Some(duration_ms),
+                matched_skill: skill_used.as_deref(),
+                token_usage: Some(token_usage_str),
+                status: "Success",
+            });
 
             tracing::info!(
                 "Chat response: session={}, skill_used={:?}, duration={}ms, tokens={}, trace_id={}",
@@ -986,8 +1055,27 @@ async fn experts_disable_handler(
 // ── Trace 追踪 API ──────────────────────────────────────
 
 /// 获取 Trace 列表（摘要）
-async fn traces_list_handler(State(state): State<AppState>) -> impl IntoResponse {
+async fn traces_list_handler(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
     let summaries = state.trace_observer.list_summaries();
+
+    // 检查是否请求 HTML
+    let format = params.get("format").map(|s| s.as_str()).unwrap_or("json");
+
+    if format == "html" {
+        // 返回 HTML 页面
+        let html = generate_traces_list_html(&summaries);
+        return (
+            StatusCode::OK,
+            [("Content-Type", "text/html; charset=utf-8")],
+            html,
+        )
+            .into_response();
+    }
+
+    // 默认返回 JSON
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -996,28 +1084,52 @@ async fn traces_list_handler(State(state): State<AppState>) -> impl IntoResponse
             "total": summaries.len(),
         })),
     )
+        .into_response()
 }
 
 /// 获取单个 Trace 详情
 async fn traces_get_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     match state.trace_observer.get_trace(&id) {
-        Some(trace) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "success": true,
-                "data": trace,
-            })),
-        ),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "success": false,
-                "message": "Trace not found",
-            })),
-        ),
+        Some(trace) => {
+            // 检查是否请求 HTML
+            let format = params.get("format").map(|s| s.as_str()).unwrap_or("json");
+
+            if format == "html" {
+                // 返回 HTML 页面
+                let html = generate_trace_detail_html(&trace);
+                return (
+                    StatusCode::OK,
+                    [("Content-Type", "text/html; charset=utf-8")],
+                    html,
+                )
+                    .into_response();
+            }
+
+            // 默认返回 JSON
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "success": true,
+                    "data": trace,
+                })),
+            )
+                .into_response()
+        }
+        None => {
+            let response: axum::response::Response = (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "success": false,
+                    "message": "Trace not found",
+                })),
+            )
+                .into_response();
+            response
+        }
     }
 }
 
@@ -1041,6 +1153,213 @@ async fn traces_tree_handler(
                 "message": "Trace not found",
             })),
         ),
+    }
+}
+
+// ── Session 查询 API ──────────────────────────────────────
+
+/// 获取 Session 列表
+async fn sessions_list_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let sessions = state.session_observer.list_sessions();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "success": true,
+            "data": sessions,
+            "total": sessions.len(),
+        })),
+    )
+}
+
+/// 获取 Session 详情
+async fn sessions_get_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.session_observer.get_session(&id) {
+        Some(session) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "success": true,
+                "data": session,
+            })),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "success": false,
+                "message": "Session not found",
+            })),
+        ),
+    }
+}
+
+// ── 编排器 API Handler ──────────────────────────────────
+
+/// 编排器执行入口
+async fn orchestrate_handler(
+    State(state): State<AppState>,
+    Json(req): Json<OrchestrateRequest>,
+) -> axum::response::Response {
+    let start_time = std::time::Instant::now();
+    let user_id = req.user_id.unwrap_or_else(|| "anonymous".to_string());
+
+    tracing::info!(
+        "Orchestrate request: user={}, message={}, strategy={:?}",
+        user_id,
+        req.message,
+        req.strategy
+    );
+
+    let strategy = req.strategy.as_deref().map(parse_dispatch_strategy);
+
+    let result = match strategy {
+        Some(strat) => {
+            state
+                .subhuti
+                .run_orchestrated_with_strategy(&req.message, &user_id, strat)
+                .await
+        }
+        None => state.subhuti.run_orchestrated(&req.message, &user_id).await,
+    };
+
+    match result {
+        Ok(orchestration_result) => {
+            let duration_ms = start_time.elapsed().as_millis() as u64;
+
+            tracing::info!(
+                "Orchestrate completed: strategy={:?}, experts={}, duration={}ms",
+                orchestration_result.strategy,
+                orchestration_result.expert_chain.len(),
+                duration_ms
+            );
+
+            let body = Json(serde_json::json!({
+                "success": true,
+                "output": orchestration_result.output,
+                "strategy": format!("{:?}", orchestration_result.strategy),
+                "expert_chain": orchestration_result.expert_chain,
+                "expert_outputs": orchestration_result.expert_outputs,
+                "duration_ms": duration_ms,
+                "critique_rounds": orchestration_result.critique_records.len(),
+                "critique_records": orchestration_result.critique_records.iter().map(|c| {
+                    serde_json::json!({
+                        "reviewer": c.reviewer,
+                        "round": c.round,
+                        "feedback": c.feedback,
+                    })
+                }).collect::<Vec<_>>(),
+            }));
+            (StatusCode::OK, body).into_response()
+        }
+        Err(e) => {
+            let duration_ms = start_time.elapsed().as_millis() as u64;
+            tracing::error!("Orchestrate error: {}, duration={}ms", e, duration_ms);
+
+            let body = Json(serde_json::json!({
+                "success": false,
+                "error": e.to_string(),
+                "duration_ms": duration_ms,
+            }));
+            (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
+        }
+    }
+}
+
+/// 任务分析
+async fn orchestrate_analyze_handler(
+    State(state): State<AppState>,
+    Json(req): Json<OrchestrateRequest>,
+) -> axum::response::Response {
+    let profile = state.subhuti.analyze_task(&req.message).await;
+
+    let domains: Vec<String> = profile.domains.iter().map(|d| format!("{:?}", d)).collect();
+
+    let complexity = match profile.complexity {
+        subhuti::TaskComplexityLevel::Simple => "简单",
+        subhuti::TaskComplexityLevel::Medium => "中等",
+        subhuti::TaskComplexityLevel::Complex => "复杂",
+        subhuti::TaskComplexityLevel::VeryComplex => "非常复杂",
+    };
+
+    // 推断建议策略
+    let suggested = if profile.domains.len() == 1
+        && profile.complexity == subhuti::TaskComplexityLevel::Simple
+    {
+        "SimpleDispatch"
+    } else if profile.domains.len() > 1 && profile.has_dependencies {
+        "Pipeline"
+    } else if profile.domains.len() > 1 && !profile.has_dependencies {
+        "MapReduce"
+    } else if profile.complexity == subhuti::TaskComplexityLevel::VeryComplex {
+        "ManagerWorker"
+    } else {
+        "SimpleDispatch"
+    };
+
+    let body = Json(serde_json::json!({
+        "success": true,
+        "domains": domains,
+        "complexity": complexity,
+        "needs_collaboration": profile.needs_collaboration,
+        "has_dependencies": profile.has_dependencies,
+        "needs_review": profile.needs_review,
+        "user_intent": profile.user_intent,
+        "suggested_strategy": suggested,
+    }));
+    (StatusCode::OK, body).into_response()
+}
+
+/// 专家匹配
+async fn orchestrate_match_handler(
+    State(state): State<AppState>,
+    Json(req): Json<OrchestrateRequest>,
+) -> axum::response::Response {
+    let matches = state.subhuti.match_orchestrator_experts(&req.message).await;
+
+    let items: Vec<serde_json::Value> = matches
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "expert_id": m.expert_id,
+                "expert_name": m.expert_info.name,
+                "domain_match": m.domain_match,
+                "capability_coverage": m.capability_coverage,
+                "historical_score": m.historical_score,
+                "overall_score": m.overall_score,
+            })
+        })
+        .collect();
+
+    let body = Json(serde_json::json!({
+        "success": true,
+        "matches": items,
+        "total": items.len(),
+    }));
+    (StatusCode::OK, body).into_response()
+}
+
+/// 编排器专家列表
+async fn orchestrate_experts_handler(State(state): State<AppState>) -> axum::response::Response {
+    let experts = state.subhuti.list_orchestrator_experts().await;
+
+    let body = Json(serde_json::json!({
+        "success": true,
+        "data": experts,
+        "total": experts.len(),
+    }));
+    (StatusCode::OK, body).into_response()
+}
+
+/// 解析调度策略字符串
+fn parse_dispatch_strategy(s: &str) -> DispatchStrategy {
+    match s.to_lowercase().as_str() {
+        "simple" | "simple_dispatch" | "simpledispatch" => DispatchStrategy::SimpleDispatch,
+        "pipeline" => DispatchStrategy::Pipeline,
+        "mapreduce" | "map_reduce" | "map-reduce" => DispatchStrategy::MapReduce,
+        "manager" | "manager_worker" | "manager-worker" => DispatchStrategy::ManagerWorker,
+        "critique" | "critique_revise" | "critique-revise" => DispatchStrategy::CritiqueRevise,
+        _ => DispatchStrategy::SimpleDispatch,
     }
 }
 
@@ -1466,7 +1785,195 @@ async fn skill_execute_stream_handler(
 }
 
 // ============================================================
-// 第八部分：主函数
+// 第八部分：HTML 生成函数
+// ============================================================
+
+/// 生成 Trace 列表 HTML
+fn generate_traces_list_html(summaries: &[subhuti::observe::TraceSummary]) -> String {
+    let mut html = String::from(
+        r#"<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trace 列表 - Subhuti</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 40px; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+        h1 { color: #333; border-bottom: 3px solid #4CAF50; padding-bottom: 10px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background: #4CAF50; color: white; }
+        tr:hover { background: #f5f5f5; }
+        a { color: #4CAF50; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        .badge { padding: 4px 8px; border-radius: 4px; font-size: 12px; }
+        .success { background: #4CAF50; color: white; }
+        .error { background: #f44336; color: white; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔍 Trace 列表</h1>"#,
+    );
+
+    html.push_str(&format!("<p>共 {} 个 Trace</p>", summaries.len()));
+    html.push_str("<table>");
+    html.push_str("<tr><th>Trace ID</th><th>输入</th><th>耗时</th><th>Skill</th><th>Tokens</th><th>状态</th></tr>");
+
+    for summary in summaries {
+        let status_class = if matches!(summary.status, subhuti::observe::TraceStatus::Success) {
+            "success"
+        } else {
+            "error"
+        };
+        let status_text = format!("{:?}", summary.status);
+        let duration = summary
+            .duration_ms
+            .map(|d| format!("{}ms", d))
+            .unwrap_or_else(|| "-".to_string());
+        let tokens = summary
+            .token_usage
+            .as_ref()
+            .map(|t| t.total_tokens.to_string())
+            .unwrap_or_else(|| "-".to_string());
+
+        html.push_str(&format!(
+            "<tr>
+                <td><a href='/subhuti/api/v1/traces/{}?format=html'>{}</a></td>
+                <td>{}</td>
+                <td>{}</td>
+                <td>{}</td>
+                <td>{}</td>
+                <td><span class='badge {}'>{}</span></td>
+            </tr>",
+            summary.trace_id,
+            &summary.trace_id[..8],
+            summary.input.chars().take(50).collect::<String>(),
+            duration,
+            summary.matched_skill.as_deref().unwrap_or("-"),
+            tokens,
+            status_class,
+            status_text
+        ));
+    }
+
+    html.push_str("</table></div></body></html>");
+    html
+}
+
+/// 生成 Trace 详情 HTML
+fn generate_trace_detail_html(trace: &subhuti::observe::Trace) -> String {
+    let mut html = String::from(
+        r#"<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trace 详情 - Subhuti</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 40px; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+        h1 { color: #333; border-bottom: 3px solid #4CAF50; padding-bottom: 10px; }
+        h2 { color: #555; margin-top: 30px; }
+        .info { background: #e8f5e9; padding: 15px; border-radius: 5px; margin: 15px 0; }
+        .info p { margin: 8px 0; }
+        .tree { background: #f9f9f9; padding: 20px; border-radius: 5px; font-family: monospace; }
+        .span { margin: 10px 0; padding: 10px; background: white; border-left: 3px solid #4CAF50; }
+        .badge { padding: 4px 8px; border-radius: 4px; font-size: 12px; }
+        .success { background: #4CAF50; color: white; }
+        .error { background: #f44336; color: white; }
+        pre { background: #f5f5f5; padding: 15px; border-radius: 5px; overflow-x: auto; }
+        a { color: #4CAF50; text-decoration: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔍 Trace 详情</h1>"#,
+    );
+
+    // 基本信息
+    html.push_str("<div class='info'>");
+    html.push_str(&format!("<p><strong>Trace ID:</strong> {}</p>", trace.id.0));
+    html.push_str(&format!(
+        "<p><strong>用户输入:</strong> {}</p>",
+        trace.input
+    ));
+
+    let duration_text = trace
+        .total_duration_ms
+        .map(|d| format!("{}ms ({:.1}秒)", d, d as f64 / 1000.0))
+        .unwrap_or_else(|| "-".to_string());
+    html.push_str(&format!(
+        "<p><strong>总耗时:</strong> {}</p>",
+        duration_text
+    ));
+
+    let status_class = if matches!(trace.status, subhuti::observe::TraceStatus::Success) {
+        "success"
+    } else {
+        "error"
+    };
+    let status_text = format!("{:?}", trace.status);
+    html.push_str(&format!(
+        "<p><strong>状态:</strong> <span class='badge {}'>{}</span></p>",
+        status_class, status_text
+    ));
+
+    if let Some(output) = &trace.output {
+        html.push_str(&format!(
+            "<p><strong>输出:</strong> {}</p>",
+            output.chars().take(100).collect::<String>()
+        ));
+    }
+
+    if let Some(ref tokens) = trace.token_usage {
+        html.push_str("<p><strong>Token 使用:</strong> ");
+        html.push_str(&format!(
+            "prompt={}, completion={}, total={}",
+            tokens.prompt_tokens, tokens.completion_tokens, tokens.total_tokens
+        ));
+        html.push_str("</p>");
+    }
+
+    html.push_str("</div>");
+
+    // 调用链
+    html.push_str("<h2>调用链</h2>");
+    html.push_str("<div class='tree'>");
+
+    // 简单的树形显示
+    for (span_id, span) in &trace.spans {
+        html.push_str("<div class='span'>");
+        html.push_str(&format!(
+            "<strong>{}</strong> ({}) - {}ms<br>",
+            span.name,
+            span.kind,
+            span.duration_ms
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        ));
+
+        if let Some(output) = &span.output {
+            if let Some(obj) = output.as_object() {
+                for (key, value) in obj {
+                    html.push_str(&format!("&nbsp;&nbsp;{}: {}<br>", key, value));
+                }
+            }
+        }
+
+        html.push_str(&format!("<small>ID: {}</small>", span_id));
+        html.push_str("</div>");
+    }
+
+    html.push_str("</div>");
+    html.push_str("<p><a href='/subhuti/api/v1/traces?format=html'>← 返回 Trace 列表</a></p>");
+    html.push_str("</div></body></html>");
+    html
+}
+
+// ============================================================
+// 第九部分：主函数
 // ============================================================
 
 #[tokio::main]
@@ -1606,10 +2113,27 @@ async fn main() -> Result<()> {
             post(experts_disable_handler),
         )
         .route("/subhuti/api/v1/experts/match", post(experts_match_handler))
+        // 多Agent协调编排
+        .route("/subhuti/api/v1/orchestrate", post(orchestrate_handler))
+        .route(
+            "/subhuti/api/v1/orchestrate/analyze",
+            post(orchestrate_analyze_handler),
+        )
+        .route(
+            "/subhuti/api/v1/orchestrate/match",
+            post(orchestrate_match_handler),
+        )
+        .route(
+            "/subhuti/api/v1/orchestrate/experts",
+            get(orchestrate_experts_handler),
+        )
         // Trace 追踪（可观测性）
         .route("/subhuti/api/v1/traces", get(traces_list_handler))
         .route("/subhuti/api/v1/traces/:id", get(traces_get_handler))
         .route("/subhuti/api/v1/traces/:id/tree", get(traces_tree_handler))
+        // Session 查询
+        .route("/subhuti/api/v1/sessions", get(sessions_list_handler))
+        .route("/subhuti/api/v1/sessions/:id", get(sessions_get_handler))
         // 测试页面（静态文件）
         .nest_service("/subhuti/test", ServeDir::new("static"))
         // 中间件（注册顺序从内到外，执行顺序从外到内）
@@ -1625,6 +2149,7 @@ async fn main() -> Result<()> {
         .with_state(AppState {
             subhuti,
             trace_observer: Arc::new(subhuti::observe::TraceObserver::new()),
+            session_observer: Arc::new(subhuti::observe::SessionObserver::new()),
         });
 
     // 6. 启动服务器

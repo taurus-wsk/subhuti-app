@@ -647,6 +647,8 @@ make release-test
 
 #### 步骤 4: 提交并打标签
 
+**方式 A：手动操作**
+
 ```bash
 # 提交所有更改
 git add .
@@ -656,26 +658,93 @@ git commit -m "chore: release vX.X.0
 - Add release documentation
 - Update CHANGELOG"
 
-# 打标签
-git tag -a vX.X.0 -m "Release vX.X.0: Feature description"
+# 打标签（附注标签，推荐）
+# 格式：git tag -a <version> -m "<详细说明>"
+git tag -a vX.X.0 -m "Release vX.X.0: Feature description
+
+## 新增功能
+- 功能 1：描述
+- 功能 2：描述
+
+## 修复问题
+- 修复 1：描述
+
+## 技术改进
+- 改进 1：描述"
+
+# 验证标签
+git tag -l                    # 查看本地标签列表
+git show vX.X.0               # 查看标签详情
 
 # 推送到远程
 git push origin main
-git push origin vX.X.0
+git push origin vX.X.0        # 推送标签到 GitHub
+
+# 提示：GitHub 会自动创建 Release 页面
+# 访问：https://github.com/<user>/<repo>/releases/tag/vX.X.0
 ```
+
+**方式 B：自动发布（推荐）**
+
+```bash
+# 使用自动发布脚本
+# 格式：./scripts/release/auto-release.sh <version> [message]
+./scripts/release/auto-release.sh vX.X.0 "功能描述"
+
+# 示例：
+./scripts/release/auto-release.sh v0.2.0 "日志查询 API 增强"
+
+# 自动完成：
+# ✅ 运行发布验证（release-test.sh）
+# ✅ 运行版本测试（version-test-enhanced.sh）
+# ✅ 提交代码
+# ✅ 创建标签
+# ✅ 推送到远程 ← 最后一步
+#    ↓
+# 线上 CI/CD 自动触发构建和部署
+```
+
+**标签命名规范**：
+- 格式：`vMAJOR.MINOR.PATCH`（语义化版本）
+- 示例：`v0.1.0`, `v0.2.0`, `v1.0.0`
+- MAJOR：不兼容的 API 修改
+- MINOR：向下兼容的功能新增
+- PATCH：向下兼容的问题修正
+
+**标签说明编写建议**：
+- 第一行：简短描述（50 字符内）
+- 空一行
+- 后续：详细变更列表（分类列出）
+- 使用 Markdown 格式（GitHub 会渲染）
 
 #### 步骤 5: 构建 Docker 镜像
 
 ```bash
-# 构建镜像
-docker build -t subhuti:vX.X.0 .
+# 获取版本号（从 Git 标签）
+VERSION=$(git describe --tags --exact-match 2>/dev/null || git describe --tags --abbrev=0 2>/dev/null || echo "dev")
+echo "📦 构建版本: $VERSION"
 
-# 标记 latest
-docker tag subhuti:vX.X.0 subhuti:latest
+# 构建镜像（使用版本号）
+docker build -t subhuti:$VERSION .
+
+# 标记 latest（仅正式版本）
+if [[ $VERSION == v* ]]; then
+    docker tag subhuti:$VERSION subhuti:latest
+    echo "✅ 已标记 latest"
+fi
 
 # 验证镜像
 docker images subhuti
+
+# 可选：推送到 Docker Hub
+# docker tag subhuti:$VERSION your-username/subhuti:$VERSION
+# docker push your-username/subhuti:$VERSION
 ```
+
+**Docker 镜像标签规范**：
+- 正式版本：`subhuti:v0.2.0`
+- 最新版本：`subhuti:latest`
+- 开发版本：`subhuti:dev`
 
 #### 步骤 6: 部署到生产环境
 
