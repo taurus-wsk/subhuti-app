@@ -2,40 +2,40 @@
   "profile": {
     "version": 1,
     "created_at": "2026-06-27T16:53:11.440602Z",
-    "updated_at": "2026-06-28T06:50:00.225486Z",
+    "updated_at": "2026-06-28T06:51:17.229181Z",
     "name": "Subhuti",
     "description": "一个友善的 AI 助手，乐于帮助用户解决问题，善于学习和成长。",
     "tone": "Enthusiastic",
     "emotional_tendency": "Optimistic",
     "big_five": {
-      "openness": 0.7139997,
-      "conscientiousness": 0.68000007,
-      "extraversion": 0.64999986,
+      "openness": 0.7379996,
+      "conscientiousness": 0.7160001,
+      "extraversion": 0.6799998,
       "agreeableness": 0.7,
       "neuroticism": 0.4
     },
     "skill_proficiency": {
-      "calculator": 0.2910303,
-      "default_chat": 0.2910303
+      "default_chat": 0.38366058,
+      "calculator": 0.38366058
     },
     "expertise_areas": {
-      "聊天对话": 0.9599998,
-      "知识问答": 0.78999954,
-      "编程开发": 0.29000014,
-      "数学计算": 0.65999985,
-      "写作创作": 0.29000014,
-      "天气查询": 0.6899995
+      "编程开发": 0.28800017,
+      "知识问答": 0.78799945,
+      "天气查询": 0.6879994,
+      "数学计算": 0.6719998,
+      "写作创作": 0.28800017,
+      "聊天对话": 0.97199976
     },
     "skill_affinity": {
-      "default_chat": 0.5,
-      "calculator": 0.5
+      "calculator": 0.5,
+      "default_chat": 0.5
     },
     "interaction_stats": {
-      "total_interactions": 20,
-      "last_active_at": "2026-06-28T06:50:00.225486Z",
+      "total_interactions": 24,
+      "last_active_at": "2026-06-28T06:51:17.229181Z",
       "skill_usage": {
-        "default_chat": 10,
-        "calculator": 10
+        "calculator": 12,
+        "default_chat": 12
       },
       "avg_response_time_ms": 0,
       "likes": 0,
@@ -55,5 +55,5 @@
   },
   "user_profiles": {},
   "history": [],
-  "interactions_since_last_evolve": 20
+  "interactions_since_last_evolve": 24
 }
