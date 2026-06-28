@@ -1,4 +1,98 @@
+# ============================================================
+# Subhuti .gitignore
+# ============================================================
+
+# Rust 构建产物
 /target
+Cargo.lock
+
+# 二进制文件
 http_server_bin
+*.exe
+*.dll
+*.so
+*.dylib
+
+# 日志文件
 *.log
 /logs/
+logs/
+
+# macOS 系统文件
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE 和编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.settings/
+.classpath
+
+# 环境变量（包含敏感信息）
+.env
+.env.local
+.env.*.local
+
+# 临时文件
+*.tmp
+*.temp
+*.bak
+*.pid
+
+# 测试覆盖率
+*.gcno
+*.gcda
+coverage/
+tarpaulin-report.html
+
+# 文档生成
+*.pdf
+*.html
+docs/releases/v*/
+!docs/releases/TEMPLATE_*.md
+!docs/releases/README.md
+!docs/releases/STANDARD_WORKFLOW.md
+!docs/releases/AI_QUICK_REFERENCE.md
+!docs/releases/INDEX.md
+!docs/releases/VERSION_WORKFLOW.md
+!docs/releases/SCRIPT_REFACTOR.md
+
+# Docker
+docker-compose.override.yml
+
+# 发布报告（每次生成）
+RELEASE_TEST_REPORT.md
+release-test-output.log
+
+# 性能分析
+*.profraw
+*.profdata
+perf.data
+perf.data.old
+
+# Node.js（如果有前端）
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Python（如果有脚本）
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.env
+
+# 备份文件
+*.backup
+*.orig
