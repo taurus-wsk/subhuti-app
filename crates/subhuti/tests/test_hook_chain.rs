@@ -230,12 +230,14 @@ impl ExpertPlugin for RecordingPlugin {
 }
 
 /// 阻断型插件 - 返回 block
+#[allow(dead_code)]
 struct BlockingPlugin {
     id: String,
     block_at: HookPoint,
     call_log: Arc<AtomicUsize>,
 }
 
+#[allow(dead_code)]
 impl BlockingPlugin {
     fn new(id: &str, block_at: HookPoint) -> Self {
         Self {
@@ -273,11 +275,13 @@ impl ExpertPlugin for BlockingPlugin {
 }
 
 /// 修改型插件 - 修改输入或响应
+#[allow(dead_code)]
 struct ModifyingPlugin {
     id: String,
     hooks: Vec<HookPoint>,
 }
 
+#[allow(dead_code)]
 impl ModifyingPlugin {
     fn new(id: &str, hooks: Vec<HookPoint>) -> Self {
         Self {

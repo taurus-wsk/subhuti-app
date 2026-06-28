@@ -6,9 +6,7 @@
 
 use std::time::Instant;
 use subhuti::runtime::llm::ToolCall;
-use subhuti::{
-    CalculatorSkill, DefaultChatSkill, Message, MockLLM, Subhuti, TestTracker, WeatherSkill, LLM,
-};
+use subhuti::{CalculatorSkill, DefaultChatSkill, Message, MockLLM, Subhuti, TestTracker, LLM};
 
 fn main() {
     run_tests();
