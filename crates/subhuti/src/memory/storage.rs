@@ -1,4 +1,4 @@
-//! # 数据库模块
+//! # 存储层 - memory 的内部实现
 //!
 //! PostgreSQL 数据库集成，支持 pgvector 扩展。
 
@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use std::collections::HashMap;
 
-/// 数据库配置
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DbConfig {
     pub host: String,
@@ -41,7 +40,6 @@ impl DbConfig {
     }
 }
 
-/// 数据库连接池
 #[derive(Debug, Clone)]
 pub struct Database {
     pool: PgPool,
@@ -66,15 +64,12 @@ impl Database {
         &self.pool
     }
 
-    /// 初始化表结构
     pub async fn init_tables(&self) -> Result<()> {
-        // 启用 pgvector 扩展
         sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
             .execute(&self.pool)
             .await?;
         tracing::info!("Database: pgvector extension enabled");
 
-        // persona_profiles 表
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS persona_profiles (
@@ -107,7 +102,6 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        // persona_history 表
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS persona_history (
@@ -123,7 +117,6 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        // user_feedbacks 表
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS user_feedbacks (
@@ -139,7 +132,6 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        // memories 表（支持向量存储）
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS memories (
@@ -159,10 +151,8 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        // 迁移：确保 memories 表有新字段（在创建索引之前）
         self.migrate_memories_table().await?;
 
-        // 索引
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_memories_user_id ON memories(user_id)")
             .execute(&self.pool)
             .await?;
@@ -183,9 +173,7 @@ impl Database {
         Ok(())
     }
 
-    /// 迁移 memories 表，添加缺失的列
     async fn migrate_memories_table(&self) -> Result<()> {
-        // 添加 session_id 列
         let result =
             sqlx::query("ALTER TABLE memories ADD COLUMN IF NOT EXISTS session_id VARCHAR(255)")
                 .execute(&self.pool)
@@ -194,7 +182,6 @@ impl Database {
             tracing::debug!("Migration: session_id column may already exist: {}", e);
         }
 
-        // 添加 layer 列
         let result = sqlx::query(
             "ALTER TABLE memories ADD COLUMN IF NOT EXISTS layer VARCHAR(20) NOT NULL DEFAULT 'short_term'"
         )
@@ -204,7 +191,6 @@ impl Database {
             tracing::debug!("Migration: layer column may already exist: {}", e);
         }
 
-        // 添加 embedding 列
         let result =
             sqlx::query("ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding vector(1024)")
                 .execute(&self.pool)
@@ -213,8 +199,6 @@ impl Database {
             tracing::debug!("Migration: embedding column may already exist: {}", e);
         }
 
-        // 如果 embedding 列存在但维度不对，尝试修改维度（需要先删除再重建，因为 pgvector 不支持 ALTER TYPE）
-        // 这里只打印警告，实际生产中应该用更安全的迁移方式
         let check_result = sqlx::query(
             "SELECT atttypmod FROM pg_attribute WHERE attname = 'embedding' AND attrelid = 'memories'::regclass"
         )
@@ -224,9 +208,6 @@ impl Database {
         if let Ok(Some(row)) = check_result {
             let typmod: i32 = row.get("atttypmod");
             if typmod > 0 {
-                // typmod 中存储了维度信息
-                // pgvector 的 typmod 编码：(dimensions << 16) + (typmod & 0xFFFF)
-                // 简化处理：如果维度不是 1024，删除后重建
                 let dims = (typmod >> 16) & 0xFFFF;
                 if dims != 0 && dims != 1024 {
                     tracing::warn!("Embedding dimension mismatch: found {}d, expected 1024d. Recreating column...", dims);
@@ -244,8 +225,6 @@ impl Database {
         tracing::info!("Database: Memories table migration completed");
         Ok(())
     }
-
-    // ── Persona CRUD ──────────────────────────────────────────
 
     pub async fn get_persona(&self, user_id: &str) -> Result<Option<PersonaRow>> {
         let row = sqlx::query(
@@ -377,8 +356,6 @@ impl Database {
         Ok(())
     }
 
-    // ── Feedback CRUD ──────────────────────────────────────────
-
     pub async fn add_feedback(
         &self,
         user_id: &str,
@@ -402,49 +379,23 @@ impl Database {
         Ok(())
     }
 
-    pub async fn get_feedbacks(&self, user_id: &str, limit: i32) -> Result<Vec<FeedbackRow>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, user_id, feedback_type, content, skill_name, created_at
-            FROM user_feedbacks
-            WHERE user_id = $1
-            ORDER BY created_at DESC
-            LIMIT $2
-            "#,
-        )
-        .bind(user_id)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(rows
-            .into_iter()
-            .map(|r| FeedbackRow {
-                id: r.get("id"),
-                user_id: r.get("user_id"),
-                feedback_type: r.get("feedback_type"),
-                content: r.get("content"),
-                skill_name: r.get("skill_name"),
-                created_at: r.get("created_at"),
-            })
-            .collect())
-    }
-
-    // ── Memory CRUD ──────────────────────────────────────────
-
+    #[allow(clippy::too_many_arguments)]
     pub async fn add_memory(
         &self,
         user_id: &str,
         session_id: Option<&str>,
         role: &str,
         content: &str,
+        metadata: &serde_json::Value,
         layer: &str,
-        metadata: Option<&serde_json::Value>,
+        embedding: Option<&[f32]>,
     ) -> Result<i64> {
+        let embedding_bytes = embedding.map(|e| sqlx::types::Json(e.to_vec()));
+
         let row = sqlx::query(
             r#"
-            INSERT INTO memories (user_id, session_id, role, content, layer, metadata)
-            VALUES ($1, $2, $3, $4, $5, COALESCE($6, '{}'::jsonb))
+            INSERT INTO memories (user_id, session_id, role, content, metadata, layer, embedding)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             RETURNING id
             "#,
         )
@@ -452,143 +403,110 @@ impl Database {
         .bind(session_id)
         .bind(role)
         .bind(content)
-        .bind(layer)
         .bind(metadata)
+        .bind(layer)
+        .bind(embedding_bytes)
         .fetch_one(&self.pool)
         .await?;
 
-        Ok(row.get::<i64, _>("id"))
+        let id: i64 = row.get("id");
+        Ok(id)
     }
 
-    pub async fn get_recent_memories(
-        &self,
-        user_id: &str,
-        layer: &str,
-        limit: i32,
-    ) -> Result<Vec<MemoryRow>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, user_id, session_id, role, content, metadata, layer, archived, created_at
-            FROM memories
-            WHERE user_id = $1 AND layer = $2 AND archived = FALSE
-            ORDER BY created_at DESC
-            LIMIT $3
-            "#,
-        )
-        .bind(user_id)
-        .bind(layer)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(rows
-            .into_iter()
-            .map(|r| MemoryRow {
-                id: r.get("id"),
-                user_id: r.get("user_id"),
-                session_id: r.get("session_id"),
-                role: r.get("role"),
-                content: r.get("content"),
-                metadata: r.get("metadata"),
-                layer: r.get("layer"),
-                archived: r.get("archived"),
-                created_at: r.get("created_at"),
-            })
-            .collect())
-    }
-
-    pub async fn archive_memories_by_session(
-        &self,
-        user_id: &str,
-        session_id: &str,
-    ) -> Result<u64> {
-        let result = sqlx::query(
-            r#"
-            UPDATE memories
-            SET archived = TRUE, layer = 'archive'
-            WHERE user_id = $1 AND session_id = $2 AND layer = 'short_term'
-            "#,
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(result.rows_affected())
-    }
-
-    pub async fn search_memories_text(
-        &self,
-        user_id: &str,
-        query: &str,
-        limit: i32,
-    ) -> Result<Vec<MemoryRow>> {
-        let search_pattern = format!("%{}%", query);
-        let rows = sqlx::query(
-            r#"
-            SELECT id, user_id, session_id, role, content, metadata, layer, archived, created_at
-            FROM memories
-            WHERE user_id = $1 AND content ILIKE $2
-            ORDER BY created_at DESC
-            LIMIT $3
-            "#,
-        )
-        .bind(user_id)
-        .bind(search_pattern)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(rows
-            .into_iter()
-            .map(|r| MemoryRow {
-                id: r.get("id"),
-                user_id: r.get("user_id"),
-                session_id: r.get("session_id"),
-                role: r.get("role"),
-                content: r.get("content"),
-                metadata: r.get("metadata"),
-                layer: r.get("layer"),
-                archived: r.get("archived"),
-                created_at: r.get("created_at"),
-            })
-            .collect())
-    }
-
-    pub async fn count_memories(&self, user_id: &str, layer: &str) -> Result<i64> {
-        let row = sqlx::query(
-            r#"
-            SELECT COUNT(*) as count
-            FROM memories
-            WHERE user_id = $1 AND layer = $2 AND archived = FALSE
-            "#,
-        )
-        .bind(user_id)
-        .bind(layer)
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(row.get::<i64, _>("count"))
-    }
-
-    /// 更新记忆的 embedding 向量
     pub async fn update_embedding(&self, memory_id: i64, embedding_str: &str) -> Result<()> {
         sqlx::query(
             r#"
             UPDATE memories
-            SET embedding = $1::vector
-            WHERE id = $2
+            SET embedding = $2
+            WHERE id = $1
             "#,
         )
-        .bind(embedding_str)
         .bind(memory_id)
+        .bind(embedding_str)
         .execute(&self.pool)
         .await?;
 
         Ok(())
     }
 
-    /// 向量相似度搜索（余弦距离，值越小越相似）
+    pub async fn search_memories(
+        &self,
+        user_id: &str,
+        query: &str,
+        limit: i32,
+    ) -> Result<Vec<MemoryRow>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, user_id, session_id, role, content, metadata, layer, embedding, created_at
+            FROM memories
+            WHERE user_id = $1 AND content LIKE $2
+            ORDER BY created_at DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(user_id)
+        .bind(format!("%{}%", query))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(MemoryRow {
+                id: row.get("id"),
+                user_id: row.get("user_id"),
+                session_id: row.get("session_id"),
+                role: row.get("role"),
+                content: row.get("content"),
+                metadata: row.get("metadata"),
+                layer: row.get("layer"),
+                embedding: row.get("embedding"),
+                created_at: row.get("created_at"),
+            });
+        }
+
+        Ok(result)
+    }
+
+    pub async fn get_memories_by_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        limit: i32,
+    ) -> Result<Vec<MemoryRow>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, user_id, session_id, role, content, metadata, layer, embedding, created_at
+            FROM memories
+            WHERE user_id = $1 AND session_id = $2
+            ORDER BY created_at DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(MemoryRow {
+                id: row.get("id"),
+                user_id: row.get("user_id"),
+                session_id: row.get("session_id"),
+                role: row.get("role"),
+                content: row.get("content"),
+                metadata: row.get("metadata"),
+                layer: row.get("layer"),
+                embedding: row.get("embedding"),
+                created_at: row.get("created_at"),
+            });
+        }
+
+        Ok(result)
+    }
+
     pub async fn search_semantic(
         &self,
         user_id: &str,
@@ -622,7 +540,7 @@ impl Database {
                     content: r.get("content"),
                     metadata: r.get("metadata"),
                     layer: r.get("layer"),
-                    archived: r.get("archived"),
+                    embedding: r.get("embedding"),
                     created_at: r.get("created_at"),
                 };
                 let similarity: f64 = r.get("similarity");
@@ -640,32 +558,7 @@ impl Database {
     }
 }
 
-// ─── 数据结构定义 ──────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PersonaData {
-    pub version: i32,
-    pub name: String,
-    pub description: String,
-    pub tone: String,
-    pub emotional_tendency: String,
-    pub openness: f32,
-    pub conscientiousness: f32,
-    pub extraversion: f32,
-    pub agreeableness: f32,
-    pub neuroticism: f32,
-    pub traits: Vec<String>,
-    pub skill_proficiency: HashMap<String, f32>,
-    pub expertise_areas: HashMap<String, f32>,
-    pub skill_affinity: HashMap<String, f32>,
-    pub total_interactions: i32,
-    pub likes: i32,
-    pub dislikes: i32,
-    pub avg_response_time_ms: i64,
-    pub skill_usage: HashMap<String, i32>,
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PersonaRow {
     pub id: i32,
     pub user_id: String,
@@ -692,35 +585,58 @@ pub struct PersonaRow {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone)]
-pub struct HistoryRow {
-    pub id: i32,
-    pub user_id: String,
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PersonaData {
     pub version: i32,
-    pub profile_snapshot: String,
-    pub reason: String,
-    pub created_at: DateTime<Utc>,
+    pub name: String,
+    pub description: String,
+    pub tone: String,
+    pub emotional_tendency: String,
+    pub openness: f32,
+    pub conscientiousness: f32,
+    pub extraversion: f32,
+    pub agreeableness: f32,
+    pub neuroticism: f32,
+    pub traits: Vec<String>,
+    pub skill_proficiency: HashMap<String, f32>,
+    pub expertise_areas: HashMap<String, f32>,
+    pub skill_affinity: HashMap<String, f32>,
+    pub total_interactions: i32,
+    pub likes: i32,
+    pub dislikes: i32,
+    pub avg_response_time_ms: i64,
+    pub skill_usage: HashMap<String, i32>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FeedbackRow {
     pub id: i32,
     pub user_id: String,
     pub feedback_type: String,
-    pub content: Option<String>,
+    pub content: String,
     pub skill_name: String,
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HistoryRow {
+    pub id: i32,
+    pub user_id: String,
+    pub version: i32,
+    pub profile_snapshot: serde_json::Value,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MemoryRow {
-    pub id: i64,
+    pub id: i32,
     pub user_id: String,
     pub session_id: Option<String>,
     pub role: String,
     pub content: String,
     pub metadata: serde_json::Value,
     pub layer: String,
-    pub archived: bool,
+    pub embedding: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
 }
