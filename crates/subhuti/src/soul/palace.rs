@@ -21,10 +21,9 @@
 //! - 情感记忆室
 //! - 任务记忆室
 
-use crate::db::Database;
 use crate::memory::{
-    EmbeddingService, Memory, MemoryConfig, MemoryItem, MemoryLayer, MemoryStats, SearchResult,
-    SemanticSearchResult,
+    storage::Database, EmbeddingService, Memory, MemoryConfig, MemoryItem, MemoryLayer,
+    MemoryStats, SearchResult, SemanticSearchResult,
 };
 use anyhow::Result;
 use chrono::{DateTime, Utc};

@@ -36,7 +36,7 @@ pub use palace::{
     PalaceStats,
 };
 
-use crate::{db::Database, memory::Memory, runtime::Runtime, Result};
+use crate::{memory::storage::Database, memory::Memory, runtime::Runtime, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1630,7 +1630,7 @@ fn emotion_to_str(emotion: &EmotionalTendency) -> &str {
 // ─── 数据转换函数 ──────────────────────────────────────────────
 
 /// 将 PersonaRow (数据库行) 转换为 PersonaProfile
-fn persona_row_to_profile(row: &crate::db::PersonaRow) -> PersonaProfile {
+fn persona_row_to_profile(row: &crate::memory::storage::PersonaRow) -> PersonaProfile {
     // 解析 JSON 字段
     let traits: Vec<String> = serde_json::from_value(row.traits.clone()).unwrap_or_default();
     let skill_proficiency: HashMap<String, f32> =
@@ -1694,7 +1694,7 @@ fn persona_row_to_profile(row: &crate::db::PersonaRow) -> PersonaProfile {
 }
 
 /// 将 PersonaProfile 转换为 PersonaData (用于数据库存储)
-fn profile_to_persona_data(profile: &PersonaProfile) -> crate::db::PersonaData {
+fn profile_to_persona_data(profile: &PersonaProfile) -> crate::memory::storage::PersonaData {
     // 转换 skill_usage 的类型: u32 -> i32
     let skill_usage: HashMap<String, i32> = profile
         .interaction_stats
@@ -1703,7 +1703,7 @@ fn profile_to_persona_data(profile: &PersonaProfile) -> crate::db::PersonaData {
         .map(|(k, v)| (k.clone(), *v as i32))
         .collect();
 
-    crate::db::PersonaData {
+    crate::memory::storage::PersonaData {
         version: profile.version as i32,
         name: profile.name.clone(),
         description: profile.description.clone(),

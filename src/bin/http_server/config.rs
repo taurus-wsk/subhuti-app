@@ -15,6 +15,8 @@ pub struct AppConfig {
     pub logging: LoggingConfig,
     pub memory: MemoryConfig,
     pub soul: SoulConfig,
+    /// 测试模式配置
+    pub test_mode: TestModeConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -60,6 +62,16 @@ pub struct MemoryConfig {
 pub struct SoulConfig {
     pub evolve_interval: usize,
     pub importance_threshold: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TestModeConfig {
+    /// 是否启用测试模式
+    pub enabled: bool,
+    /// Mock 响应延迟（毫秒）
+    pub mock_delay_ms: u64,
+    /// Mock 响应数据文件路径
+    pub mock_responses_path: String,
 }
 
 impl AppConfig {
@@ -183,6 +195,11 @@ pub fn default_config() -> AppConfig {
         soul: SoulConfig {
             evolve_interval: 50,
             importance_threshold: 0.6,
+        },
+        test_mode: TestModeConfig {
+            enabled: true,
+            mock_delay_ms: 3000,
+            mock_responses_path: "config/mock_responses.json".to_string(),
         },
     }
 }

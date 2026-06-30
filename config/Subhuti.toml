@@ -42,3 +42,11 @@ archive_threshold = 100
 evolve_interval = 50
 # 重要性阈值
 importance_threshold = 0.6
+
+[test_mode]
+# 是否启用测试模式（启用后使用 Mock LLM 替代真实 LLM）
+enabled = true
+# Mock 响应延迟（毫秒），模拟 LLM 调用耗时
+mock_delay_ms = 3000
+# Mock 响应数据文件路径
+mock_responses_path = "config/mock_responses.json"

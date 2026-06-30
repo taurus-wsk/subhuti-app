@@ -12,11 +12,15 @@ mod embedding;
 mod knowledge;
 mod long_term;
 mod short_term;
+pub mod storage;
 
 pub use embedding::{EmbeddingConfig, EmbeddingService};
 pub use knowledge::KnowledgeMemory;
 pub use long_term::LongTermMemory;
 pub use short_term::ShortTermMemory;
+pub use storage::{
+    Database, DbConfig, FeedbackRow, HistoryRow, MemoryRow, PersonaData, PersonaRow,
+};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -24,8 +28,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
-
-use crate::db::Database;
 
 /// 记忆配置
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -287,6 +289,7 @@ impl Memory {
                         Some(&session),
                         "user",
                         &content_clone,
+                        &serde_json::json!({}),
                         "short_term",
                         None,
                     )
@@ -377,6 +380,7 @@ impl Memory {
                         Some(&session),
                         "assistant",
                         &content,
+                        &serde_json::json!({}),
                         "archive",
                         None,
                     )

@@ -21,33 +21,33 @@
 
 // 四层架构模块
 pub mod context; // 统一上下文层
-pub mod db; // 数据库模块 - PostgreSQL 支持
 pub mod debug;
 pub mod expert; // 专家插件系统 - 领域专家扩展
-pub mod extension;
 pub mod flow;
-pub mod memory;
+pub mod memory; // 记忆层 - 包含存储实现（数据库作为内部基础设施）
 pub mod observe; // 可观测性系统 - Trace 追踪
 pub mod orchestrator; // 多Agent协调编排层
 pub mod runtime; // 包含 llm 和 tools 子模块
 pub mod skill; // Skill 层 - 类似 HTTP 路由的技能系统
-pub mod soul; // 心灵层 - 动态角色养成系统 // 调试工具模块
+pub mod soul; // 心灵层 - 动态角色养成系统
 
-// Re-exports - 从 runtime 导出 LLM 和 Tools
+// Re-exports - 从 runtime 导出 LLM 和 Tools，从 memory 导出数据库类型
 pub use context::{RunContext, TokenStats};
-pub use db::{Database, DbConfig, FeedbackRow, HistoryRow, MemoryRow, PersonaData, PersonaRow};
 pub use debug::{
     assert_with_context, debug_print, diagnose_value, measure_time, HealthReport, HealthStatus,
     LockDetector, Profiler, TestTracker,
 };
 pub use expert::{ExpertInfo, ExpertPersona, ExpertPlugin, KnowledgeEntry};
-pub use extension::{Extension, ExtensionManager, Hook};
 pub use flow::{Flow, FlowConfig, FlowManager, FlowStep, FlowType, ReactFlow};
-pub use memory::{DatabaseStore, Memory, MemoryConfig, MemoryStore, SemanticSearchResult};
+pub use memory::{
+    Database, DatabaseStore, DbConfig, FeedbackRow, HistoryRow, Memory, MemoryConfig, MemoryRow,
+    MemoryStore, PersonaData, PersonaRow, SemanticSearchResult,
+};
 pub use observe::session::SessionRecordParams;
 pub use orchestrator::{
-    DispatchStrategy, ExpertAgent, ExpertPerformance, OrchestrationResult, Orchestrator,
-    OrchestratorConfig, TaskComplexityLevel, TaskDomain, TaskProfile,
+    AgentMeta, CollaborationResult, ContextData, ContextStore, CtxId, DispatchStrategy, Expert,
+    ExpertAgent, ExpertMatchResult, ExpertPerformance, OrchestrationResult, Orchestrator,
+    OrchestratorConfig, RuleEngine, Step, TaskProfile,
 };
 pub use runtime::{
     LLMClient, LLMConfig, LLMProvider, LLMResponse, Message, MockLLM, Role, Runtime, RuntimeConfig,
@@ -69,6 +69,7 @@ pub use anyhow::Result;
 pub use thiserror::Error;
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// Subhuti 全局配置
@@ -114,8 +115,6 @@ pub struct Subhuti {
     runtime: Arc<Runtime>,
     /// 流程管理器
     flow: FlowManager,
-    /// 扩展管理器
-    extensions: ExtensionManager,
     /// Skill 管理器（内部可变性，支持动态注册）
     skills: Mutex<SkillManager>,
     /// 心灵层（动态角色养成，内部可变性）
@@ -169,11 +168,40 @@ impl Subhuti {
         skill_manager.register(ReminderSkill);
 
         // 创建共享 Skill 管理器（tokio RwLock 用于编排器）
-        let shared_skills = Arc::new(tokio::sync::RwLock::new(SkillManager::new()));
+        let _shared_skills = Arc::new(tokio::sync::RwLock::new(SkillManager::new()));
 
-        // 创建多Agent协调编排器
-        let orchestrator =
-            Orchestrator::with_defaults(shared_skills, memory.clone(), runtime.clone());
+        // 创建多Agent协调编排器并注册内置专家
+        let mut orchestrator = Orchestrator::with_defaults();
+
+        let coding_expert = orchestrator::DefaultExpert::new(
+            "coding".to_string(),
+            "编程专家".to_string(),
+            vec![
+                "编程".into(),
+                "代码".into(),
+                "rust".into(),
+                "开发".into(),
+                "bug".into(),
+            ],
+            10,
+            "资深 Rust 开发专家".to_string(),
+            "10年 Rust 开发经验，精通系统编程".to_string(),
+            "帮助用户解决编程问题".to_string(),
+            runtime.clone(),
+        );
+        orchestrator.register_agent(Arc::new(coding_expert));
+
+        let weather_expert = orchestrator::DefaultExpert::new(
+            "weather".to_string(),
+            "天气专家".to_string(),
+            vec!["天气".into(), "气象".into(), "温度".into(), "下雨".into()],
+            5,
+            "气象预报专家".to_string(),
+            "专业气象分析师".to_string(),
+            "提供准确的天气预报".to_string(),
+            runtime.clone(),
+        );
+        orchestrator.register_agent(Arc::new(weather_expert));
 
         Self {
             config,
@@ -181,7 +209,6 @@ impl Subhuti {
             memory_palace,
             runtime,
             flow: FlowManager::with_config(flow_config),
-            extensions: ExtensionManager::new(),
             skills: Mutex::new(skill_manager),
             soul: Mutex::new(soul),
             db: None,
@@ -249,12 +276,6 @@ impl Subhuti {
         &self.config
     }
 
-    /// 添加扩展
-    pub fn use_extension<E: Extension + 'static>(self, extension: E) -> Self {
-        self.extensions.register_blocking(extension);
-        self
-    }
-
     /// 注册 Skill
     pub fn register_skill<S: Skill>(&self, skill: S) {
         self.skills.lock().unwrap().register(skill);
@@ -305,6 +326,30 @@ impl Subhuti {
         }
 
         tracing::info!("Subhuti: Registered expert: {}", info.name);
+    }
+
+    /// 同步专家到编排器（异步方法）
+    pub async fn sync_experts_to_orchestrator(&self) {
+        let plugins = self.experts.lock().unwrap().list_plugins();
+
+        let mut orch = self.orchestrator.lock().await;
+
+        for plugin_meta in plugins {
+            if let Some(plugin) = self
+                .experts
+                .lock()
+                .unwrap()
+                .get_plugin(&plugin_meta.manifest.id)
+            {
+                let agent = Arc::new(ExpertPluginAdapter::new(plugin, self.runtime.clone()));
+                orch.register_agent(agent);
+            }
+        }
+
+        tracing::info!(
+            "Subhuti: Synced {} experts to orchestrator",
+            orch.list_agents().len()
+        );
     }
 
     /// 激活指定专家
@@ -414,16 +459,14 @@ impl Subhuti {
     // ── 多Agent协调编排 ──────────────────────────────────
 
     /// 注册专家到编排器
-    pub async fn register_orchestrator_expert(&self, agent: ExpertAgent) {
-        self.orchestrator.lock().await.register_expert(agent);
+    pub async fn register_orchestrator_expert(&self, agent: Arc<dyn ExpertAgent>) {
+        self.orchestrator.lock().await.register_agent(agent);
     }
 
     /// 从插件注册专家到编排器
     pub async fn register_orchestrator_expert_from_plugin(&self, plugin: Arc<dyn ExpertPlugin>) {
-        self.orchestrator
-            .lock()
-            .await
-            .register_expert_from_plugin(plugin);
+        let agent = Arc::new(ExpertPluginAdapter::new(plugin, self.runtime.clone()));
+        self.orchestrator.lock().await.register_agent(agent);
     }
 
     /// 设置编排器通用专家
@@ -433,7 +476,14 @@ impl Subhuti {
 
     /// 使用编排器分析任务
     pub async fn analyze_task(&self, input: &str) -> TaskProfile {
-        self.orchestrator.lock().await.analyze_task(input)
+        let mut orch = self.orchestrator.lock().await;
+        match orch.schedule(input) {
+            Ok((_, _, profile)) => profile,
+            Err(_) => TaskProfile {
+                input: input.to_string(),
+                ..Default::default()
+            },
+        }
     }
 
     /// 使用编排器执行任务（自动选择策略）
@@ -442,8 +492,8 @@ impl Subhuti {
         input: &str,
         user_id: &str,
     ) -> Result<OrchestrationResult> {
-        let orch = self.orchestrator.lock().await;
-        orch.execute(input, user_id).await
+        let mut orch = self.orchestrator.lock().await;
+        orch.run_orchestrated(input, user_id).await
     }
 
     /// 使用编排器执行任务（指定策略）
@@ -451,30 +501,28 @@ impl Subhuti {
         &self,
         input: &str,
         user_id: &str,
-        strategy: DispatchStrategy,
+        _strategy: DispatchStrategy,
     ) -> Result<OrchestrationResult> {
-        let orch = self.orchestrator.lock().await;
-        orch.execute_with_strategy(input, user_id, strategy).await
+        let mut orch = self.orchestrator.lock().await;
+        orch.run_orchestrated(input, user_id).await
     }
 
     /// 获取编排器专家列表
     pub async fn list_orchestrator_experts(&self) -> Vec<ExpertInfo> {
-        self.orchestrator.lock().await.list_experts()
+        Vec::new()
     }
 
     /// 获取编排器专家数量
     pub async fn orchestrator_expert_count(&self) -> usize {
-        self.orchestrator.lock().await.expert_count()
+        self.orchestrator.lock().await.list_agents().len()
     }
 
     /// 匹配编排器专家
     pub async fn match_orchestrator_experts(
         &self,
-        input: &str,
+        _input: &str,
     ) -> Vec<orchestrator::ExpertMatchResult> {
-        let orch = self.orchestrator.lock().await;
-        let profile = orch.analyze_task(input);
-        orch.match_experts(&profile, 5)
+        Vec::new()
     }
 
     /// 执行钩子链
@@ -917,10 +965,12 @@ impl Subhuti {
         skill_name: Option<&str>,
         flow_template: Option<FlowTemplate>,
     ) -> Result<(String, Option<String>, TokenStats)> {
-        // 1. Extension: before_prompt
-        self.extensions
-            .call_before_prompt(&mut run_ctx.session, input)
-            .await?;
+        // 1. Before prompt logging
+        tracing::info!(
+            "[BeforePrompt] Session: {}, Input: {}",
+            run_ctx.session.id,
+            input
+        );
 
         // 2. 确定使用哪个 Skill
         let skill_match = {
@@ -1003,10 +1053,8 @@ impl Subhuti {
             )?;
         }
 
-        // 6. Extension: after_complete
-        self.extensions
-            .call_after_complete(&mut run_ctx.session)
-            .await?;
+        // 6. After complete logging
+        tracing::info!("[AfterComplete] Session: {}", run_ctx.session.id);
 
         // 7. 心灵层：记录本次互动（统计分析轨道）
         let skill_used_name = response
@@ -1047,10 +1095,12 @@ impl Subhuti {
         input: &str,
         callback: Box<dyn Fn(String) + Send>,
     ) -> Result<String> {
-        // 1. Extension: before_prompt
-        self.extensions
-            .call_before_prompt(&mut run_ctx.session, input)
-            .await?;
+        // 1. Before prompt logging
+        tracing::info!(
+            "[BeforePrompt] Session: {}, Input: {}",
+            run_ctx.session.id,
+            input
+        );
 
         // 2. Skill 路由匹配
         let matched = {
@@ -1133,10 +1183,8 @@ impl Subhuti {
             )?;
         }
 
-        // 5. Extension: after_complete
-        self.extensions
-            .call_after_complete(&mut run_ctx.session)
-            .await?;
+        // 5. After complete logging
+        tracing::info!("[AfterComplete] Session: {}", run_ctx.session.id);
 
         Ok(response)
     }
@@ -1163,6 +1211,98 @@ impl Subhuti {
     /// 获取 Skill 数量
     pub fn skill_count(&self) -> usize {
         self.skills.lock().unwrap().get_skills().len()
+    }
+}
+
+struct ExpertPluginAdapter {
+    plugin: std::sync::Arc<dyn expert::ExpertPlugin>,
+    runtime: Arc<Runtime>,
+    id: String,
+    name: String,
+    priority: u32,
+}
+
+impl std::fmt::Debug for ExpertPluginAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExpertPluginAdapter")
+            .field("id", &self.id)
+            .finish()
+    }
+}
+
+impl ExpertPluginAdapter {
+    fn new(plugin: std::sync::Arc<dyn expert::ExpertPlugin>, runtime: Arc<Runtime>) -> Self {
+        Self {
+            plugin: plugin.clone(),
+            runtime,
+            id: plugin.manifest().id,
+            name: plugin.info().name,
+            priority: 0,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ExpertAgent for ExpertPluginAdapter {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn tags(&self) -> Vec<String> {
+        self.plugin.manifest().keywords.clone()
+    }
+
+    fn priority(&self) -> u32 {
+        self.priority
+    }
+
+    async fn run(&self, ctx_id: &str, store: &mut ContextStore) -> Result<CtxId> {
+        let context = store
+            .get(ctx_id)
+            .ok_or_else(|| anyhow::anyhow!("Context not found: {}", ctx_id))?;
+
+        let persona = self.plugin.persona();
+        let prompt = format!(
+            r#"你是 {}。
+角色背景：{}
+目标：{}
+
+当前任务：{}
+
+请直接回答这个任务。"#,
+            persona.name, persona.description, persona.name, context.content
+        );
+
+        let messages = vec![
+            Message {
+                role: Role::System,
+                content: format!(
+                    "你是 {}。角色背景：{}。目标：{}",
+                    persona.name, persona.description, persona.name
+                ),
+                tool_call_id: None,
+            },
+            Message {
+                role: Role::User,
+                content: prompt,
+                tool_call_id: None,
+            },
+        ];
+
+        let response = self.runtime.call_llm(messages).await?;
+
+        Ok(store.put(ContextData {
+            content: response,
+            metadata: HashMap::new(),
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        }))
     }
 }
 

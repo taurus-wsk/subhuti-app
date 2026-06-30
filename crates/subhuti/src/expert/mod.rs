@@ -1059,6 +1059,11 @@ impl PluginManager {
         self.plugins.get(id).map(|p| p.plugin.clone())
     }
 
+    /// 获取指定 ID 的插件
+    pub fn get_plugin(&self, id: &str) -> Option<Arc<dyn ExpertPlugin>> {
+        self.plugins.get(id).map(|p| p.plugin.clone())
+    }
+
     /// 获取插件元数据
     pub fn get_metadata(&self, id: &str) -> Option<PluginMetadata> {
         self.plugins.get(id).map(|p| p.metadata.clone())

@@ -8,7 +8,7 @@
 mod client;
 mod retry;
 
-pub use client::{DoubaoClient, LLMClient, MockLLM, OllamaClient, OpenAIClient};
+pub use client::{DoubaoClient, LLMClient, MockLLM, MockLlmClient, OllamaClient, OpenAIClient};
 pub use retry::{chat_stream_with_retry, chat_with_retry, with_retry, RetryConfig, RetryResult};
 
 use crate::runtime::tools::Tool;

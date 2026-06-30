@@ -138,6 +138,7 @@ impl Runtime {
             llm::LLMClient::OpenAI(c) => Arc::new(c),
             llm::LLMClient::Ollama(c) => Arc::new(c),
             llm::LLMClient::Doubao(c) => Arc::new(c),
+            llm::LLMClient::Mock(c) => Arc::new(c),
         };
         *self.llm.write().unwrap() = Some(arc_llm);
     }

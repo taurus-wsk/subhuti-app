@@ -1082,11 +1082,140 @@ fn uuid_simple() -> String {
     )
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct MockResponseConfig {
+    responses: Vec<MockResponseItem>,
+    default_response: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MockResponseItem {
+    patterns: Vec<String>,
+    response: String,
+}
+
+/// 生产环境使用的 Mock LLM 客户端
+/// 支持从 JSON 文件加载预设响应，根据关键词匹配返回
+#[derive(Debug, Clone)]
+pub struct MockLlmClient {
+    config: LLMConfig,
+    responses: Vec<MockResponseItem>,
+    default_response: String,
+    delay_ms: u64,
+}
+
+impl MockLlmClient {
+    /// 创建新的 MockLlmClient
+    pub fn new(config: LLMConfig, mock_config_path: &str, delay_ms: u64) -> Self {
+        let (responses, default_response) = match Self::load_mock_config(mock_config_path) {
+            Ok(c) => (c.responses, c.default_response),
+            Err(e) => {
+                eprintln!("⚠️  加载 Mock 配置失败: {}，使用默认响应", e);
+                (Vec::new(), "[MockLLM] default response".to_string())
+            }
+        };
+
+        Self {
+            config,
+            responses,
+            default_response,
+            delay_ms,
+        }
+    }
+
+    /// 从 JSON 文件加载 mock 配置
+    fn load_mock_config(path: &str) -> Result<MockResponseConfig> {
+        let content = std::fs::read_to_string(path)?;
+        let config: MockResponseConfig = serde_json::from_str(&content)?;
+        Ok(config)
+    }
+
+    /// 根据消息内容匹配响应
+    fn match_response(&self, messages: &[Message]) -> String {
+        let user_message = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
+
+        for item in &self.responses {
+            for pattern in &item.patterns {
+                if user_message.contains(pattern) {
+                    return item.response.clone();
+                }
+            }
+        }
+
+        self.default_response.clone()
+    }
+
+    /// 模拟延迟
+    async fn simulate_delay(&self) {
+        if self.delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+        }
+    }
+}
+
+#[async_trait]
+impl LLM for MockLlmClient {
+    fn provider(&self) -> LLMProvider {
+        LLMProvider::Custom
+    }
+
+    fn config(&self) -> &LLMConfig {
+        &self.config
+    }
+
+    async fn chat(&self, messages: Vec<Message>) -> Result<String> {
+        self.simulate_delay().await;
+        let response = self.match_response(&messages);
+        Ok(response)
+    }
+
+    async fn chat_with_tools(
+        &self,
+        messages: Vec<Message>,
+        _tools: Vec<ToolInfo>,
+    ) -> Result<LLMResponse> {
+        self.simulate_delay().await;
+        let content = self.match_response(&messages);
+
+        Ok(LLMResponse {
+            content,
+            tool_call: None,
+            model: Some("mock-llm".to_string()),
+            prompt_tokens: Some(10),
+            completion_tokens: Some(5),
+            total_tokens: Some(15),
+        })
+    }
+
+    async fn chat_streaming(
+        &self,
+        messages: Vec<Message>,
+        callback: Box<dyn Fn(String) + Send>,
+    ) -> Result<()> {
+        self.simulate_delay().await;
+        let response = self.match_response(&messages);
+        for word in response.split_whitespace() {
+            callback(format!("{} ", word));
+        }
+        Ok(())
+    }
+
+    async fn health_check(&self) -> Result<bool> {
+        Ok(true)
+    }
+}
+
 /// LLM 客户端工厂
 pub enum LLMClient {
     OpenAI(OpenAIClient),
     Ollama(OllamaClient),
     Doubao(DoubaoClient),
+    Mock(MockLlmClient),
 }
 
 impl LLMClient {
@@ -1107,6 +1236,7 @@ impl LLMClient {
             LLMClient::OpenAI(c) => c,
             LLMClient::Ollama(c) => c,
             LLMClient::Doubao(c) => c,
+            LLMClient::Mock(c) => c,
         }
     }
 }

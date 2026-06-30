@@ -370,6 +370,7 @@ pub struct ErrorResponse {
 pub struct OrchestrateRequest {
     pub message: String,
     pub user_id: Option<String>,
+    pub session_id: Option<String>,
     /// 强制使用指定的调度策略
     pub strategy: Option<String>,
 }
@@ -379,6 +380,8 @@ pub struct OrchestrateRequest {
 pub struct OrchestrateResponse {
     pub success: bool,
     pub output: String,
+    pub session_id: String,
+    pub trace_id: String,
     pub strategy: String,
     pub expert_chain: Vec<String>,
     pub expert_outputs: std::collections::HashMap<String, String>,
@@ -1203,13 +1206,21 @@ async fn orchestrate_handler(
 ) -> axum::response::Response {
     let start_time = std::time::Instant::now();
     let user_id = req.user_id.unwrap_or_else(|| "anonymous".to_string());
+    let session_id = req.session_id.unwrap_or_else(uuid_v4);
 
     tracing::info!(
-        "Orchestrate request: user={}, message={}, strategy={:?}",
+        "Orchestrate request: user={}, session={}, message={}, strategy={:?}",
         user_id,
+        session_id,
         req.message,
         req.strategy
     );
+
+    // 创建 Trace
+    let mut trace = state
+        .trace_observer
+        .create_trace(&user_id, &session_id, &req.message);
+    let trace_id = trace.id.0.clone();
 
     let strategy = req.strategy.as_deref().map(parse_dispatch_strategy);
 
@@ -1228,26 +1239,52 @@ async fn orchestrate_handler(
             let duration_ms = start_time.elapsed().as_millis() as u64;
 
             tracing::info!(
-                "Orchestrate completed: strategy={:?}, experts={}, duration={}ms",
+                "Orchestrate completed: strategy={:?}, experts={}, duration={}ms, trace_id={}",
                 orchestration_result.strategy,
                 orchestration_result.expert_chain.len(),
-                duration_ms
+                duration_ms,
+                trace_id
             );
+
+            // 记录专家链到 Trace
+            for expert_id in &orchestration_result.expert_chain {
+                trace.record_expert(expert_id);
+            }
+
+            // 完成 Trace
+            trace.complete(orchestration_result.output.clone());
+            state.trace_observer.store_trace(trace);
+
+            // 记录 Session
+            let token_usage = orchestration_result.tokens.total_tokens;
+            let token_usage_str = format!("{{\"total_tokens\": {}}}", token_usage);
+            state.session_observer.record_request(&SessionRecordParams {
+                session_id: &session_id,
+                user_id: &user_id,
+                trace_id: &trace_id,
+                input: &req.message,
+                output: Some(&orchestration_result.output),
+                duration_ms: Some(duration_ms),
+                matched_skill: orchestration_result
+                    .expert_chain
+                    .first()
+                    .map(|s| s.as_str()),
+                token_usage: Some(token_usage_str),
+                status: "Success",
+            });
 
             let body = Json(serde_json::json!({
                 "success": true,
                 "output": orchestration_result.output,
+                "session_id": session_id,
+                "trace_id": trace_id,
                 "strategy": format!("{:?}", orchestration_result.strategy),
                 "expert_chain": orchestration_result.expert_chain,
                 "expert_outputs": orchestration_result.expert_outputs,
                 "duration_ms": duration_ms,
                 "critique_rounds": orchestration_result.critique_records.len(),
-                "critique_records": orchestration_result.critique_records.iter().map(|c| {
-                    serde_json::json!({
-                        "reviewer": c.reviewer,
-                        "round": c.round,
-                        "feedback": c.feedback,
-                    })
+                "critique_records": orchestration_result.critique_records.iter().map(|_c| {
+                    serde_json::json!({})
                 }).collect::<Vec<_>>(),
             }));
             (StatusCode::OK, body).into_response()
@@ -1256,9 +1293,19 @@ async fn orchestrate_handler(
             let duration_ms = start_time.elapsed().as_millis() as u64;
             tracing::error!("Orchestrate error: {}, duration={}ms", e, duration_ms);
 
+            // 失败的 Span
+            let span_id = trace.create_span(
+                subhuti::observe::SpanKind::Response,
+                "error_response".to_string(),
+            );
+            trace.fail_span(&span_id, e.to_string());
+            state.trace_observer.store_trace(trace);
+
             let body = Json(serde_json::json!({
                 "success": false,
                 "error": e.to_string(),
+                "session_id": session_id,
+                "trace_id": trace_id,
                 "duration_ms": duration_ms,
             }));
             (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
@@ -1266,75 +1313,34 @@ async fn orchestrate_handler(
     }
 }
 
-/// 任务分析
+/// 任务分析（简化版）
 async fn orchestrate_analyze_handler(
     State(state): State<AppState>,
     Json(req): Json<OrchestrateRequest>,
 ) -> axum::response::Response {
     let profile = state.subhuti.analyze_task(&req.message).await;
 
-    let domains: Vec<String> = profile.domains.iter().map(|d| format!("{:?}", d)).collect();
-
-    let complexity = match profile.complexity {
-        subhuti::TaskComplexityLevel::Simple => "简单",
-        subhuti::TaskComplexityLevel::Medium => "中等",
-        subhuti::TaskComplexityLevel::Complex => "复杂",
-        subhuti::TaskComplexityLevel::VeryComplex => "非常复杂",
-    };
-
-    // 推断建议策略
-    let suggested = if profile.domains.len() == 1
-        && profile.complexity == subhuti::TaskComplexityLevel::Simple
-    {
-        "SimpleDispatch"
-    } else if profile.domains.len() > 1 && profile.has_dependencies {
-        "Pipeline"
-    } else if profile.domains.len() > 1 && !profile.has_dependencies {
-        "MapReduce"
-    } else if profile.complexity == subhuti::TaskComplexityLevel::VeryComplex {
-        "ManagerWorker"
-    } else {
-        "SimpleDispatch"
-    };
-
+    // 简化版：只返回基本信息
     let body = Json(serde_json::json!({
         "success": true,
-        "domains": domains,
-        "complexity": complexity,
-        "needs_collaboration": profile.needs_collaboration,
-        "has_dependencies": profile.has_dependencies,
-        "needs_review": profile.needs_review,
-        "user_intent": profile.user_intent,
-        "suggested_strategy": suggested,
+        "input": profile.input,
+        "target_expert": profile.target_expert,
+        "suggested_strategy": "SimpleDispatch",
     }));
     (StatusCode::OK, body).into_response()
 }
 
-/// 专家匹配
+/// 专家匹配（简化版）
 async fn orchestrate_match_handler(
     State(state): State<AppState>,
-    Json(req): Json<OrchestrateRequest>,
+    Json(_req): Json<OrchestrateRequest>,
 ) -> axum::response::Response {
-    let matches = state.subhuti.match_orchestrator_experts(&req.message).await;
-
-    let items: Vec<serde_json::Value> = matches
-        .iter()
-        .map(|m| {
-            serde_json::json!({
-                "expert_id": m.expert_id,
-                "expert_name": m.expert_info.name,
-                "domain_match": m.domain_match,
-                "capability_coverage": m.capability_coverage,
-                "historical_score": m.historical_score,
-                "overall_score": m.overall_score,
-            })
-        })
-        .collect();
+    let experts = state.subhuti.list_orchestrator_experts().await;
 
     let body = Json(serde_json::json!({
         "success": true,
-        "matches": items,
-        "total": items.len(),
+        "matches": experts,
+        "total": experts.len(),
     }));
     (StatusCode::OK, body).into_response()
 }
@@ -1356,9 +1362,6 @@ fn parse_dispatch_strategy(s: &str) -> DispatchStrategy {
     match s.to_lowercase().as_str() {
         "simple" | "simple_dispatch" | "simpledispatch" => DispatchStrategy::SimpleDispatch,
         "pipeline" => DispatchStrategy::Pipeline,
-        "mapreduce" | "map_reduce" | "map-reduce" => DispatchStrategy::MapReduce,
-        "manager" | "manager_worker" | "manager-worker" => DispatchStrategy::ManagerWorker,
-        "critique" | "critique_revise" | "critique-revise" => DispatchStrategy::CritiqueRevise,
         _ => DispatchStrategy::SimpleDispatch,
     }
 }
@@ -2003,11 +2006,15 @@ async fn main() -> Result<()> {
             temperature: app_config.llm.temperature as f32,
             max_tokens: app_config.llm.max_tokens,
         },
-        provider: match app_config.llm.provider.as_str() {
-            "openai" => LLMProvider::OpenAI,
-            "ollama" => LLMProvider::Ollama,
-            "doubao" => LLMProvider::Doubao,
-            _ => LLMProvider::Doubao,
+        provider: if app_config.test_mode.enabled {
+            LLMProvider::Custom
+        } else {
+            match app_config.llm.provider.as_str() {
+                "openai" => LLMProvider::OpenAI,
+                "ollama" => LLMProvider::Ollama,
+                "doubao" => LLMProvider::Doubao,
+                _ => LLMProvider::Doubao,
+            }
         },
         runtime: RuntimeConfig::default(),
         memory: MemoryConfig::default(),
@@ -2016,18 +2023,41 @@ async fn main() -> Result<()> {
     };
 
     tracing::info!(
-        "LLM Config: provider={}, model={}",
+        "LLM Config: provider={}, model={}, test_mode={}",
         match config.provider {
             LLMProvider::OpenAI => "OpenAI",
             LLMProvider::Ollama => "Ollama",
             LLMProvider::Doubao => "Doubao",
-            LLMProvider::Custom => "Custom",
+            LLMProvider::Custom => "MockLLM",
         },
-        config.llm.model
+        config.llm.model,
+        app_config.test_mode.enabled
     );
 
     // 4. 创建 Agent（使用框架配置）
     let mut subhuti = create_agent(config);
+
+    // 如果启用测试模式，设置 Mock LLM
+    if app_config.test_mode.enabled {
+        let mock_client = subhuti::runtime::llm::MockLlmClient::new(
+            subhuti::runtime::llm::LLMConfig {
+                model: "mock-llm".to_string(),
+                api_url: "mock://local".to_string(),
+                api_key: None,
+                temperature: 0.0,
+                max_tokens: 1024,
+            },
+            &app_config.test_mode.mock_responses_path,
+            app_config.test_mode.mock_delay_ms,
+        );
+        subhuti
+            .runtime()
+            .set_llm(subhuti::runtime::llm::LLMClient::Mock(mock_client));
+        tracing::info!(
+            "✅ 测试模式已启用，使用 Mock LLM (延迟: {}ms)",
+            app_config.test_mode.mock_delay_ms
+        );
+    }
 
     // 5. 初始化数据库
     let db_config = subhuti::DbConfig {
@@ -2043,6 +2073,9 @@ async fn main() -> Result<()> {
         Ok(_) => tracing::info!("Database initialized successfully"),
         Err(e) => tracing::warn!("Database initialization failed (using file storage): {}", e),
     }
+
+    // 同步专家到编排器
+    subhuti.sync_experts_to_orchestrator().await;
 
     let subhuti = Arc::new(subhuti);
     tracing::info!(
