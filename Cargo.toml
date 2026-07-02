@@ -9,6 +9,7 @@ resolver = "2"
 name = "subhuti-app"
 version = "0.1.0"
 edition = "2021"
+default-run = "subhuti"
 
 [[bin]]
 name = "sync_test"
@@ -17,6 +18,10 @@ path = "src/bin/sync_test.rs"
 [[bin]]
 name = "subhuti"
 path = "src/bin/main.rs"
+
+[[bin]]
+name = "subhuti-app"
+path = "src/bin/subhuti_app.rs"
 
 [dependencies]
 subhuti = { path = "crates/subhuti" }
