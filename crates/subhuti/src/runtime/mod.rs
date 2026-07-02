@@ -10,6 +10,7 @@
 //! - **Session**: 所有状态归 Session，Runtime 无状态
 
 // 子模块
+pub mod error;
 pub mod llm;
 pub mod tools;
 
@@ -18,6 +19,13 @@ pub use session::{Session, SessionConfig, SessionState};
 
 mod constraints;
 pub use constraints::Constraints;
+
+// 导出错误处理相关类型
+pub use error::{
+    business_codes, llm_codes, network_codes, system_codes, tool_codes, CircuitBreakerConfig,
+    ErrorCategory, ErrorCode, ErrorHandlingConfig, ErrorLogger, ErrorResponse, FallbackConfig,
+    RetryStrategy, SubhutiError,
+};
 
 // 从子模块导出
 pub use llm::{
@@ -170,7 +178,10 @@ impl Runtime {
         if let Some(llm) = llm_arc {
             llm.chat(messages).await
         } else {
-            Err(anyhow::anyhow!("No LLM client configured"))
+            Err(
+                SubhutiError::llm(llm_codes::CLIENT_NOT_CONFIGURED, "LLM 客户端未配置", false)
+                    .to_error(),
+            )
         }
     }
 
@@ -188,7 +199,10 @@ impl Runtime {
         if let Some(llm) = llm_arc {
             llm.chat_with_tools(messages, vec![]).await
         } else {
-            Err(anyhow::anyhow!("No LLM client configured"))
+            Err(
+                SubhutiError::llm(llm_codes::CLIENT_NOT_CONFIGURED, "LLM 客户端未配置", false)
+                    .to_error(),
+            )
         }
     }
 
@@ -209,7 +223,10 @@ impl Runtime {
         if let Some(llm) = llm_arc {
             llm.chat_streaming(messages, callback).await
         } else {
-            Err(anyhow::anyhow!("No LLM client configured"))
+            Err(
+                SubhutiError::llm(llm_codes::CLIENT_NOT_CONFIGURED, "LLM 客户端未配置", false)
+                    .to_error(),
+            )
         }
     }
 
@@ -241,7 +258,10 @@ impl Runtime {
 
             llm.chat_with_tools(messages, tools).await
         } else {
-            Err(anyhow::anyhow!("No LLM client configured"))
+            Err(
+                SubhutiError::llm(llm_codes::CLIENT_NOT_CONFIGURED, "LLM 客户端未配置", false)
+                    .to_error(),
+            )
         }
     }
 
@@ -275,7 +295,12 @@ impl Runtime {
         if let Some(tool) = tool_arc {
             tool.run(params).await
         } else {
-            Err(anyhow::anyhow!("Tool not found: {}", name))
+            Err(SubhutiError::tool(
+                tool_codes::TOOL_NOT_FOUND,
+                format!("工具不存在: {}", name),
+                Some(name.to_string()),
+            )
+            .to_error())
         }
     }
 

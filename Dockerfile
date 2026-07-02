@@ -46,6 +46,7 @@ RUN apt-get update && apt-get install -y \
     libssl3 \
     ca-certificates \
     curl \
+    tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -66,7 +67,8 @@ ENV DB_HOST=postgres \
     DB_PASSWORD=123456 \
     DB_MAX_CONN=10 \
     HTTP_ADDR=0.0.0.0:8080 \
-    RUST_LOG=info
+    RUST_LOG=info \
+    TZ=Asia/Shanghai
 
 EXPOSE 8080
 

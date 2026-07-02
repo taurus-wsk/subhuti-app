@@ -173,9 +173,9 @@ where
 
 /// 初始化日志系统
 ///
-/// 同时输出到控制台和文件
-/// - 控制台：彩色、简洁
-/// - 文件：JSON 格式、详细信息
+/// 分层输出：
+/// - 控制台：彩色、带 span 层级、自动关联 trace_id
+/// - 文件：JSON 格式、详细信息、便于 grep/jq 过滤，保留 7 天
 ///
 /// 返回的 guard 必须在整个程序生命周期内保持，
 /// 否则日志写入可能会丢失
@@ -185,30 +185,62 @@ pub fn init_logging() -> impl Drop {
     use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::{fmt, EnvFilter, Registry};
 
-    // 日志文件配置
+    // 日志文件配置：按天滚动，保留 7 天
     let file_appender = tracing_appender::rolling::daily("./logs", "subhuti.log");
     let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
 
-    // 控制台格式化
+    // 启动后台线程清理 7 天前的日志文件
+    std::thread::spawn(|| {
+        let seven_days_ago = chrono::Utc::now() - chrono::Duration::days(7);
+        if let Ok(files) = std::fs::read_dir("./logs") {
+            for entry in files.flatten() {
+                if let Ok(metadata) = entry.metadata() {
+                    if let Ok(file_time) = metadata.modified() {
+                        let file_time: chrono::DateTime<chrono::Utc> = file_time.into();
+                        if file_time < seven_days_ago {
+                            let _ = std::fs::remove_file(entry.path());
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // 使用东八区时间格式
+    let time_format = time::format_description::parse_borrowed::<2>(
+        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:6]+08:00",
+    )
+    .unwrap();
+    let utc_offset = time::UtcOffset::from_hms(8, 0, 0).unwrap();
+
+    // 控制台格式化：开发期友好，带 span 层级和字段
     let console_layer = fmt::layer()
         .with_target(true)
         .with_thread_ids(false)
-        .with_file(false)
-        .with_line_number(false)
-        .with_span_events(FmtSpan::NONE)
-        .compact();
+        .with_file(true)
+        .with_line_number(true)
+        .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
+        .with_timer(tracing_subscriber::fmt::time::OffsetTime::new(
+            utc_offset,
+            time_format.clone(),
+        ))
+        .pretty();
 
-    // 文件格式化（JSON）
+    // 文件格式化（JSON）：生产期便于 grep/jq 过滤
     let file_layer = fmt::layer()
         .json()
         .with_target(true)
         .with_thread_ids(true)
         .with_file(true)
         .with_line_number(true)
-        .with_span_events(FmtSpan::CLOSE)
+        .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
+        .with_timer(tracing_subscriber::fmt::time::OffsetTime::new(
+            utc_offset,
+            time_format,
+        ))
         .with_writer(file_writer);
 
-    // 日志级别过滤
+    // 日志级别过滤：支持 RUST_LOG 环境变量
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,tower_http=off,hyper=off,reqwest=off"));
 

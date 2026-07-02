@@ -7,6 +7,7 @@ use serde::Deserialize;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct AppConfig {
     pub llm: LlmConfig,
     pub database: DatabaseConfig,
@@ -14,6 +15,8 @@ pub struct AppConfig {
     pub logging: LoggingConfig,
     pub memory: MemoryConfig,
     pub soul: SoulConfig,
+    /// 测试模式配置
+    pub test_mode: TestModeConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -41,21 +44,34 @@ pub struct HttpConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct LoggingConfig {
     pub level: String,
     pub dir: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct MemoryConfig {
     pub short_term_limit: usize,
     pub archive_threshold: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct SoulConfig {
     pub evolve_interval: usize,
     pub importance_threshold: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TestModeConfig {
+    /// 是否启用测试模式
+    pub enabled: bool,
+    /// Mock 响应延迟（毫秒）
+    pub mock_delay_ms: u64,
+    /// Mock 响应数据文件路径
+    pub mock_responses_path: String,
 }
 
 impl AppConfig {
@@ -113,7 +129,7 @@ fn apply_env_overrides(config: &mut AppConfig) {
     if let Ok(val) = std::env::var("LLM_API_URL") {
         config.llm.api_url = val;
     }
-    if let Ok(val) = std::env::var("DOUBAO_API_KEY") {
+    if let Ok(_val) = std::env::var("DOUBAO_API_KEY") {
         // API key 通过 .env 加载，不需要特殊处理
     }
 
@@ -148,7 +164,7 @@ fn apply_env_overrides(config: &mut AppConfig) {
 }
 
 /// 默认配置（当找不到配置文件时使用）
-fn default_config() -> AppConfig {
+pub fn default_config() -> AppConfig {
     AppConfig {
         llm: LlmConfig {
             provider: "doubao".to_string(),
@@ -179,6 +195,11 @@ fn default_config() -> AppConfig {
         soul: SoulConfig {
             evolve_interval: 50,
             importance_threshold: 0.6,
+        },
+        test_mode: TestModeConfig {
+            enabled: true,
+            mock_delay_ms: 3000,
+            mock_responses_path: "config/mock_responses.json".to_string(),
         },
     }
 }

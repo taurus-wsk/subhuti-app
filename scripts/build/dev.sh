@@ -1,14 +1,23 @@
 #!/bin/bash
 # ============================================================
 # Subhuti 开发环境启动脚本
-# 用法: ./dev.sh [build|start|stop|restart|status|logs|test]
+# 用法: ./dev.sh [build|start|stop|restart|status|logs|test] [debug|release]
 # ============================================================
 set -e
 
 # 项目根目录（脚本在 scripts/build/ 下，需要上两级）
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BINARY="$PROJECT_DIR/target/release/http_server"
+BUILD_MODE="${2:-release}"
+
+if [ "$BUILD_MODE" = "debug" ]; then
+    BINARY="$PROJECT_DIR/target/debug/subhuti"
+    RUST_LOG_DEFAULT="debug,tower_http=off,hyper=off,reqwest=off,sqlx=off"
+else
+    BINARY="$PROJECT_DIR/target/release/subhuti"
+    RUST_LOG_DEFAULT="info,tower_http=off,hyper=off,reqwest=off,sqlx=off"
+fi
+
 PID_FILE="$PROJECT_DIR/.http_server.pid"
 LOG_DIR="$PROJECT_DIR/logs"
 
@@ -20,7 +29,7 @@ export DB_USERNAME="${DB_USERNAME:-postgres}"
 export DB_PASSWORD="${DB_PASSWORD:-123456}"
 export DB_MAX_CONN="${DB_MAX_CONN:-10}"
 export HTTP_ADDR="${HTTP_ADDR:-0.0.0.0:8080}"
-export RUST_LOG="${RUST_LOG:-info}"
+export RUST_LOG="${RUST_LOG:-$RUST_LOG_DEFAULT}"
 
 # 加载 .env（API key 等）
 if [ -f "$PROJECT_DIR/.env" ]; then
@@ -32,7 +41,7 @@ fi
 build() {
     echo "🔨 编译 release 版本..."
     cd "$PROJECT_DIR"
-    cargo build --release --bin http_server
+    cargo build --release --bin subhuti
     echo "✅ 编译完成: $BINARY"
 }
 
@@ -56,7 +65,7 @@ start() {
     echo "   数据库: $DB_HOST:$DB_PORT/$DB_DATABASE"
     echo "   日志: $LOG_DIR/"
 
-    nohup "$BINARY" >> "$LOG_DIR/subhuti.log" 2>&1 &
+    nohup "$BINARY" serve >> "$LOG_DIR/subhuti.log" 2>&1 &
     echo $! > "$PID_FILE"
 
     # 等待启动

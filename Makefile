@@ -23,7 +23,8 @@ help:
 	@echo "  build          编译 release 版本"
 	@echo "  test           运行所有测试"
 	@echo "  test-watch     监控文件变化自动测试"
-	@echo "  serve          启动 HTTP 服务器 (localhost:8080)"
+	@echo "  serve          启动 HTTP 服务器 (release)"
+	@echo "  serve-debug    启动 HTTP 服务器 (debug模式，日志更详细)"
 	@echo "  serve-status   查看服务状态"
 	@echo "  serve-logs     查看服务日志"
 	@echo "  serve-stop     停止服务"
@@ -40,7 +41,27 @@ help:
 	@echo ""
 	@echo "$(GREEN)调试命令:$(NC)"
 	@echo "  trace ID=<id>  格式化 Trace 调用链"
-	@echo "  debug [cmd]    线上调试工具 (traces/logs/health)" 
+	@echo "  debug [cmd]    线上调试工具 (traces/logs/health)"
+	@echo ""
+	@echo "$(GREEN)🎯 核心调试 (Orchestrate) - 单/多 Agent 调用:$(NC)"
+	@echo "  orchestrate MESSAGE=<msg>       调用编排接口"
+	@echo "  orchestrate MESSAGE=<msg> CHAIN=<chain>  指定策略链"
+	@echo "  orchestrate MESSAGE=<msg> USER=<user>    指定用户"
+	@echo "  orchestrate-debug MESSAGE=<msg>          debug模式调用"
+	@echo ""
+	@echo "$(GREEN)CLI 工具:$(NC)"
+	@echo "  subhuti serve           启动 HTTP 服务"
+	@echo "  subhuti doctor          环境诊断"
+	@echo "  subhuti log-stream      实时日志流查看器"
+	@echo "  subhuti db              数据库操作"
+	@echo "  subhuti api             API 测试客户端"
+	@echo "  subhuti flame           性能火焰图"
+	@echo ""
+	@echo "$(GREEN)日志查询:$(NC)"
+	@echo "  log-trace ID=<trace_id>    按 trace_id 查日志"
+	@echo "  log-user ID=<user_id>      按用户 ID 查日志"
+	@echo "  log-recent [N=20]          查看最近 N 条日志"
+	@echo "  log-errors                 查看错误日志" 
 	@echo ""
 	@echo "$(GREEN)维护命令:$(NC)"
 	@echo "  clean          清理构建产物"
@@ -56,7 +77,7 @@ help:
 
 build:
 	@echo "$(GREEN)🔨 编译 release...$(NC)"
-	cargo build --release --bin http_server
+	cargo build --release --bin subhuti
 
 test:
 	@echo "$(GREEN)🧪 运行测试...$(NC)"
@@ -66,9 +87,15 @@ test-watch:
 	@echo "$(GREEN)👀 监控测试 (文件变化自动重新运行)...$(NC)"
 	cargo watch -x test
 
+BUILD_MODE ?= release
+
 serve:
-	@echo "$(GREEN)🚀 启动 HTTP 服务器...$(NC)"
-	./scripts/build/dev.sh start
+	@echo "$(GREEN)🚀 启动 HTTP 服务器 ($(BUILD_MODE))...$(NC)"
+	./scripts/build/dev.sh start $(BUILD_MODE)
+
+serve-debug:
+	@echo "$(GREEN)🚀 启动 HTTP 服务器 (debug)...$(NC)"
+	BUILD_MODE=debug ./scripts/build/dev.sh start debug
 
 serve-status:
 	@echo "$(GREEN)📊 服务状态...$(NC)"
@@ -83,8 +110,8 @@ serve-stop:
 	./scripts/build/dev.sh stop
 
 serve-restart:
-	@echo "$(GREEN)🔄 重启服务...$(NC)"
-	./scripts/build/dev.sh restart
+	@echo "$(GREEN)🔄 重启服务 ($(BUILD_MODE))...$(NC)"
+	./scripts/build/dev.sh restart $(BUILD_MODE)
 
 fmt:
 	@echo "$(GREEN)📝 格式化代码...$(NC)"
@@ -170,3 +197,146 @@ trace:
 # 线上调试工具
 debug:
 	@./scripts/debug/online-debug.sh $(CMD) $(ID)
+
+# ============================================================
+# CLI 工具
+# ============================================================
+
+cli-build:
+	@echo "$(GREEN)🔨 编译 CLI 工具...$(NC)"
+	cargo build --release --bin subhuti
+
+cli-install: cli-build
+	@echo "$(GREEN)📦 安装 CLI 工具...$(NC)"
+	cp target/release/subhuti /usr/local/bin/subhuti
+
+# 实时日志流
+log-stream:
+	@echo "$(GREEN)📡 实时日志流查看器$(NC)"
+	@cargo run --bin subhuti -- log-stream $(ARGS)
+
+# 数据库查询
+db-query:
+	@echo "$(GREEN)🔌 数据库查询$(NC)"
+	@cargo run --bin subhuti -- db query $(ARGS)
+
+db-tables:
+	@echo "$(GREEN)📋 数据库表列表$(NC)"
+	@cargo run --bin subhuti -- db list-tables
+
+db-schema:
+	@echo "$(GREEN)📋 表结构$(NC)"
+	@cargo run --bin subhuti -- db schema $(ARGS)
+
+db-stats:
+	@echo "$(GREEN)📊 数据库统计$(NC)"
+	@cargo run --bin subhuti -- db stats
+
+# ============================================================
+# 🎯 核心调试 - Orchestrate (单/多 Agent 调用)
+# ============================================================
+
+MESSAGE ?=
+CHAIN ?=
+USER ?= test_user
+
+orchestrate:
+	@if [ -z "$(MESSAGE)" ]; then \
+		echo "$(RED)❌ 请指定 MESSAGE 参数$(NC)"; \
+		echo "用法: make orchestrate MESSAGE='你的问题'"; \
+		echo "示例: make orchestrate MESSAGE='分析这个心理问题'"; \
+		exit 1; \
+	fi
+	@echo "$(GREEN)🎯 Orchestrate - 编排调用单/多 Agent$(NC)"
+	@echo "─────────────────────────────────────────────────────────────"
+	@echo "Message: $(MESSAGE)"
+	@if [ ! -z "$(CHAIN)" ]; then echo "Chain: $(CHAIN)"; fi
+	@if [ ! -z "$(USER)" ]; then echo "User: $(USER)"; fi
+	@echo ""
+	@cargo run --bin subhuti -- api orchestrate \
+		--message "$(MESSAGE)" \
+		$(if $(CHAIN),--chain $(CHAIN),) \
+		$(if $(USER),--user-id $(USER),)
+
+orchestrate-debug:
+	@if [ -z "$(MESSAGE)" ]; then \
+		echo "$(RED)❌ 请指定 MESSAGE 参数$(NC)"; \
+		echo "用法: make orchestrate-debug MESSAGE='你的问题'"; \
+		exit 1; \
+	fi
+	@echo "$(GREEN)🎯 Orchestrate - Debug 模式$(NC)"
+	@echo "─────────────────────────────────────────────────────────────"
+	@echo "Message: $(MESSAGE)"
+	@echo ""
+	@RUST_LOG=debug,tower_http=off,hyper=off,reqwest=off,sqlx=off \
+	cargo run --bin subhuti -- api orchestrate \
+		--message "$(MESSAGE)" \
+		$(if $(CHAIN),--chain $(CHAIN),) \
+		$(if $(USER),--user-id $(USER),)
+
+# ============================================================
+# API 测试
+# ============================================================
+
+api-chat:
+	@echo "$(GREEN)💬 API Chat$(NC)"
+	@cargo run --bin subhuti -- api chat $(ARGS)
+
+api-health:
+	@echo "$(GREEN)🏥 API Health$(NC)"
+	@cargo run --bin subhuti -- api health
+
+api-skills:
+	@echo "$(GREEN)🎯 API Skills$(NC)"
+	@cargo run --bin subhuti -- api skills
+
+api-experts:
+	@echo "$(GREEN)🧑‍🔬 API Experts$(NC)"
+	@cargo run --bin subhuti -- api experts
+
+api-persona:
+	@echo "$(GREEN)💎 API Persona$(NC)"
+	@cargo run --bin subhuti -- api persona
+
+# 火焰图
+flame:
+	@echo "$(GREEN)🔥 性能火焰图$(NC)"
+	@cargo run --bin subhuti -- flame $(ARGS)
+
+# ============================================================
+# 日志查询
+# ============================================================
+
+LOG_FILE := $(shell ls -1 logs/subhuti.log.* 2>/dev/null | sort -r | head -1 || echo "logs/subhuti.log")
+
+log-trace:
+	@if [ -z "$(ID)" ]; then \
+		echo "$(RED)❌ 错误：请指定 trace_id$(NC)"; \
+		echo "用法: make log-trace ID=<trace_id>"; \
+		exit 1; \
+	fi
+	@echo "$(GREEN)📋 查询 trace_id: $(ID)$(NC)"
+	@echo "─────────────────────────────────────────────────────────────"
+	@jq "select(.span != null and .span.trace_id == \"$(ID)\")" $(LOG_FILE)
+
+log-user:
+	@if [ -z "$(ID)" ]; then \
+		echo "$(RED)❌ 错误：请指定 user_id$(NC)"; \
+		echo "用法: make log-user ID=<user_id>"; \
+		exit 1; \
+	fi
+	@echo "$(GREEN)📋 查询 user_id: $(ID)$(NC)"
+	@echo "─────────────────────────────────────────────────────────────"
+	@grep "$(ID)" $(LOG_FILE) | jq "select(.span != null)" | \
+		jq '{timestamp, level, target, span: .span.name, trace_id: .span.trace_id, session_id: .span.session_id, message: .fields.message}'
+
+log-recent:
+	@echo "$(GREEN)📋 最近 $(or $(N),20) 条日志$(NC)"
+	@echo "─────────────────────────────────────────────────────────────"
+	@tail -$(or $(N),20) $(LOG_FILE) | jq "select(.span != null)" | \
+		jq '{timestamp, level, target, span: .span.name, message: .fields.message}'
+
+log-errors:
+	@echo "$(GREEN)📋 错误日志$(NC)"
+	@echo "─────────────────────────────────────────────────────────────"
+	@grep '"level":"ERROR"' $(LOG_FILE) | jq '{timestamp, target, message: .fields.message, file: .filename, line: .line_number}'

@@ -1,29 +1,29 @@
 //! # 多 Agent 协作层 (Orchestrator)
 //!
 //! ## 核心架构
-//! 调度器负责：注册专家、调度排序、责任链串行执行
+//! 注册式预定义链路架构（类似 Rust 的函数签名）：
+//! - 每个链路是显式注册的，步骤和条件都是写死的
+//! - 约束层是纯 predicate（输入校验、输出校验）
+//! - AI 只在新增链路时介入：生成符合规范的新链代码
 //!
-//! ## 核心流程
-//! 用户任务 → 任务理解 → 调度策略 → 执行监控 → 结果
-//!
-//! ## 规则引擎三层架构（每层内置全局约束）
-//! 1. TaskAnalysisRule: 任务理解（内置输入长度、黑名单约束）
-//! 2. DispatchRule: 调度策略（内置专家数量、专家白黑名单约束）
-//! 3. ExecutionRule: 执行监控（内置超时、步骤数约束）
+//! ## 调度流程（完全确定性，零 AI 调用）
+//! match_condition(input) → 找到 Chain → validate(input) → execute chain steps → validate_output(result) → return
 
 use crate::context::TokenStats;
+use crate::observe::Trace;
 use crate::runtime::{Message, Role, Runtime};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use uuid::Uuid;
 
 // ─── 类型别名 ──────────────────────────────────────────────
 
 pub type AgentId = String;
 pub type CtxId = String;
+pub type ChainName = String;
 
 // ─── 上下文存储（享元模式）──────────────────────────────────
 
@@ -59,68 +59,378 @@ impl ContextStore {
     }
 }
 
-// ─── 任务画像（结构化任务理解结果）─────────────────────────
+// ─── 预定义链路步骤 ────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, Default)]
-pub enum TaskType {
-    Create,
-    Query,
-    Analyze,
-    Optimize,
-    Debug,
-    Learn,
-    Consult,
-    #[default]
-    Other,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct TaskProfile {
-    pub input: String,
-    pub domain_tags: Vec<String>,
-    pub task_type: TaskType,
-    pub subject: Option<String>,
-    pub predicate: Option<String>,
-    pub object: Option<String>,
-    pub target_expert: Option<String>,
-}
-
-// ─── 全局规则配置 ──────────────────────────────────────────
-
-#[derive(Debug, Clone, Default)]
-pub struct RuleConfig {
-    pub max_task_length: usize,
-    pub max_expert_count: usize,
-    pub max_execution_time_ms: u64,
-    pub max_steps: usize,
-    pub per_step_timeout_ms: u64,
-    pub blacklist_keywords: Vec<String>,
-    pub allowed_agents: Vec<AgentId>,
-    pub denied_agents: Vec<AgentId>,
-    pub pipeline_threshold: usize,
+#[derive(Debug, Clone)]
+pub struct ChainStep {
+    pub agent_id: AgentId,
     pub pass_full_context: bool,
-    pub continue_on_failure: bool,
-    pub result_strategy: ResultStrategy,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ResultStrategy {
-    #[default]
-    TakeLast,
-    MergeAll,
-    TakeFirst,
+// ─── 链路匹配条件 ──────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct MatchCondition {
+    pub keywords: Vec<String>,
+    pub domain_tags: Vec<String>,
+    pub exact_match: Option<String>,
+    pub priority: u32,
 }
 
-// ─── 第一层：任务理解规则 (TaskAnalysisRule) ────────────────
+impl MatchCondition {
+    pub fn matches(&self, input: &str, domain_tags: &[String]) -> bool {
+        let input_lower = input.to_lowercase();
 
-pub trait TaskAnalysisRule: Send + Sync + std::fmt::Debug {
-    fn analyze(&self, input: &str, config: &RuleConfig) -> Result<TaskProfile>;
+        if let Some(exact) = &self.exact_match {
+            if input_lower == exact.to_lowercase() {
+                return true;
+            }
+        }
+
+        for keyword in &self.keywords {
+            if input_lower.contains(&keyword.to_lowercase()) {
+                return true;
+            }
+        }
+
+        for tag in &self.domain_tags {
+            if domain_tags.contains(tag) {
+                return true;
+            }
+        }
+
+        false
+    }
 }
 
-#[derive(Debug)]
-pub struct KeywordBasedTaskAnalysisRule;
+// ─── 链路约束（纯 predicate）───────────────────────────────
 
-impl KeywordBasedTaskAnalysisRule {
+pub type InputValidator = Box<dyn Fn(&str) -> bool + Send + Sync>;
+pub type OutputValidator = Box<dyn Fn(&str) -> bool + Send + Sync>;
+
+pub struct ChainConstraint {
+    pub input_validator: Option<InputValidator>,
+    pub output_validator: Option<OutputValidator>,
+    pub max_input_length: usize,
+    pub max_output_length: usize,
+    pub timeout_ms: u64,
+}
+
+impl Clone for ChainConstraint {
+    fn clone(&self) -> Self {
+        Self {
+            input_validator: None,
+            output_validator: None,
+            max_input_length: self.max_input_length,
+            max_output_length: self.max_output_length,
+            timeout_ms: self.timeout_ms,
+        }
+    }
+}
+
+impl Default for ChainConstraint {
+    fn default() -> Self {
+        Self {
+            input_validator: None,
+            output_validator: None,
+            max_input_length: 10000,
+            max_output_length: 50000,
+            timeout_ms: 300000,
+        }
+    }
+}
+
+impl ChainConstraint {
+    pub fn validate_input(&self, input: &str) -> Result<()> {
+        if input.len() > self.max_input_length {
+            return Err(anyhow!(
+                "输入长度超过限制: {} > {}",
+                input.len(),
+                self.max_input_length
+            ));
+        }
+
+        if let Some(validator) = &self.input_validator {
+            if !validator(input) {
+                return Err(anyhow!("输入不符合约束条件"));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn validate_output(&self, output: &str) -> Result<()> {
+        if output.len() > self.max_output_length {
+            return Err(anyhow!(
+                "输出长度超过限制: {} > {}",
+                output.len(),
+                self.max_output_length
+            ));
+        }
+
+        if let Some(validator) = &self.output_validator {
+            if !validator(output) {
+                return Err(anyhow!("输出不符合约束条件"));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// ─── 预定义链路 ────────────────────────────────────────────
+
+#[derive(Clone)]
+pub struct PredefinedChain {
+    pub name: ChainName,
+    pub description: String,
+    pub condition: MatchCondition,
+    pub steps: Vec<ChainStep>,
+    pub constraint: ChainConstraint,
+}
+
+// ─── 链路注册中心 ──────────────────────────────────────────
+
+#[derive(Default)]
+pub struct ChainRegistry {
+    chains: HashMap<ChainName, PredefinedChain>,
+    default_chain: Option<ChainName>,
+}
+
+impl ChainRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register_chain(&mut self, chain: PredefinedChain) {
+        self.chains.insert(chain.name.clone(), chain);
+    }
+
+    pub fn set_default_chain(&mut self, name: &str) {
+        if self.chains.contains_key(name) {
+            self.default_chain = Some(name.to_string());
+        }
+    }
+
+    pub fn find_matching_chain(
+        &self,
+        input: &str,
+        domain_tags: &[String],
+    ) -> Option<&PredefinedChain> {
+        let mut matched: Vec<&PredefinedChain> = self
+            .chains
+            .values()
+            .filter(|chain| chain.condition.matches(input, domain_tags))
+            .collect();
+
+        matched.sort_by_key(|b| std::cmp::Reverse(b.condition.priority));
+
+        matched.first().copied()
+    }
+
+    pub fn get_chain(&self, name: &str) -> Option<&PredefinedChain> {
+        self.chains.get(name)
+    }
+
+    pub fn get_default_chain(&self) -> Option<&PredefinedChain> {
+        self.default_chain
+            .as_ref()
+            .and_then(|name| self.chains.get(name))
+    }
+
+    pub fn list_chains(&self) -> Vec<ChainName> {
+        self.chains.keys().cloned().collect()
+    }
+}
+
+// ─── 专家 Agent 接口 ──────────────────────────────────────
+
+#[async_trait::async_trait]
+pub trait ExpertAgent: Send + Sync {
+    fn id(&self) -> &str;
+    fn name(&self) -> &str;
+    fn tags(&self) -> &[String];
+    fn priority(&self) -> u32 {
+        0
+    }
+    async fn run(&self, input_ctx_id: &str, context_store: &mut ContextStore) -> Result<CtxId>;
+}
+
+// ─── 专家注册中心 ──────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct AgentMeta {
+    pub id: AgentId,
+    pub name: String,
+    pub tags: Vec<String>,
+    pub priority: u32,
+}
+
+pub struct AgentRegistry {
+    agents: HashMap<AgentId, Arc<dyn ExpertAgent>>,
+    meta: HashMap<AgentId, AgentMeta>,
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for AgentRegistry {
+    fn default() -> Self {
+        Self {
+            agents: HashMap::new(),
+            meta: HashMap::new(),
+        }
+    }
+}
+
+impl AgentRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&mut self, agent: Arc<dyn ExpertAgent>) {
+        let id = agent.id().to_string();
+        let meta = AgentMeta {
+            id: id.clone(),
+            name: agent.name().to_string(),
+            tags: agent.tags().to_vec(),
+            priority: 10,
+        };
+        self.agents.insert(id, agent);
+        self.meta.insert(meta.id.clone(), meta);
+    }
+
+    pub fn get(&self, id: &str) -> Option<Arc<dyn ExpertAgent>> {
+        self.agents.get(id).cloned()
+    }
+
+    pub fn get_meta(&self, id: &str) -> Option<&AgentMeta> {
+        self.meta.get(id)
+    }
+
+    pub fn list(&self) -> Vec<&AgentMeta> {
+        self.meta.values().collect()
+    }
+
+    pub fn find_matching_experts(
+        &self,
+        input: &str,
+        domain_tags: &[String],
+    ) -> Vec<Arc<dyn ExpertAgent>> {
+        let input_lower = input.to_lowercase();
+        let mut matched: Vec<(Arc<dyn ExpertAgent>, u32)> = Vec::new();
+
+        for agent in self.agents.values() {
+            let mut score = 0;
+
+            for tag in agent.tags() {
+                if input_lower.contains(&tag.to_lowercase()) {
+                    score += 1;
+                }
+            }
+
+            for tag in domain_tags {
+                if agent
+                    .tags()
+                    .iter()
+                    .any(|t| t.to_lowercase() == tag.to_lowercase())
+                {
+                    score += 2;
+                }
+            }
+
+            if score > 0 {
+                matched.push((agent.clone(), score));
+            }
+        }
+
+        matched.sort_by_key(|b| std::cmp::Reverse(b.1));
+        matched.into_iter().map(|(a, _)| a).collect()
+    }
+}
+
+// ─── 内部通用专家（兜底专家）─────────────────────────────────
+
+/// 内部通用专家，当没有匹配到任何插件专家时使用
+///
+/// 这是一个纯 LLM 调用的兜底实现，不注入任何领域知识，作为最后的 fallback
+#[derive(Debug, Clone)]
+pub struct DefaultExpert {
+    runtime: Arc<Runtime>,
+}
+
+impl DefaultExpert {
+    pub fn new(runtime: Arc<Runtime>) -> Self {
+        Self { runtime }
+    }
+}
+
+#[async_trait::async_trait]
+impl ExpertAgent for DefaultExpert {
+    fn id(&self) -> &str {
+        "default"
+    }
+
+    fn name(&self) -> &str {
+        "通用专家"
+    }
+
+    fn tags(&self) -> &[String] {
+        &[]
+    }
+
+    async fn run(&self, ctx_id: &str, store: &mut ContextStore) -> Result<CtxId> {
+        let span = tracing::info_span!(
+            "default_expert_run",
+            expert_id = %self.id(),
+            expert_name = %self.name(),
+        );
+        let _enter = span.enter();
+
+        let context = store
+            .get(ctx_id)
+            .ok_or_else(|| anyhow!("Context not found: {}", ctx_id))?;
+
+        tracing::debug!(
+            "DefaultExpert: 处理请求, content_len={}",
+            context.content.len()
+        );
+
+        let messages = vec![
+            Message {
+                role: Role::System,
+                content: "你是一个友好的 AI 助手，可以回答各种问题。请直接给出简洁、准确的回答。"
+                    .to_string(),
+                tool_call_id: None,
+            },
+            Message {
+                role: Role::User,
+                content: context.content.clone(),
+                tool_call_id: None,
+            },
+        ];
+
+        let response = self.runtime.call_llm(messages).await?;
+
+        tracing::debug!(
+            "DefaultExpert: LLM 调用完成, response_len={}",
+            response.len()
+        );
+
+        Ok(store.put(ContextData {
+            content: response,
+            metadata: HashMap::new(),
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        }))
+    }
+}
+
+// ─── 领域关键词提取（纯规则，无 AI）─────────────────────────
+
+pub struct DomainExtractor;
+
+impl DomainExtractor {
     const DOMAIN_KEYWORDS: &'static [(&'static str, &'static str)] = &[
         ("编程", "tech"),
         ("代码", "tech"),
@@ -161,1059 +471,433 @@ impl KeywordBasedTaskAnalysisRule {
         ("报表", "data"),
     ];
 
-    const TASK_TYPE_KEYWORDS: &'static [(&'static str, TaskType)] = &[
-        ("创建", TaskType::Create),
-        ("制作", TaskType::Create),
-        ("生成", TaskType::Create),
-        ("写", TaskType::Create),
-        ("做", TaskType::Create),
-        ("构建", TaskType::Create),
-        ("查", TaskType::Query),
-        ("查询", TaskType::Query),
-        ("搜索", TaskType::Query),
-        ("看看", TaskType::Query),
-        ("了解", TaskType::Query),
-        ("分析", TaskType::Analyze),
-        ("评估", TaskType::Analyze),
-        ("判断", TaskType::Analyze),
-        ("检查", TaskType::Analyze),
-        ("优化", TaskType::Optimize),
-        ("改进", TaskType::Optimize),
-        ("提升", TaskType::Optimize),
-        ("增强", TaskType::Optimize),
-        ("修复", TaskType::Debug),
-        ("调试", TaskType::Debug),
-        ("解决", TaskType::Debug),
-        ("排除", TaskType::Debug),
-        ("学习", TaskType::Learn),
-        ("教我", TaskType::Learn),
-        ("教程", TaskType::Learn),
-        ("入门", TaskType::Learn),
-        ("咨询", TaskType::Consult),
-        ("建议", TaskType::Consult),
-        ("意见", TaskType::Consult),
-        ("帮忙", TaskType::Consult),
-    ];
-}
-
-impl TaskAnalysisRule for KeywordBasedTaskAnalysisRule {
-    fn analyze(&self, input: &str, config: &RuleConfig) -> Result<TaskProfile> {
-        tracing::info!("═══════════════════════════════════════════");
-        tracing::info!("【任务理解·Layer 1】开始分析任务");
-        tracing::info!("【任务理解·Layer 1】原始输入: {}", input);
-        tracing::info!(
-            "【任务理解·Layer 1】全局约束: max_task_length={}, blacklist_keywords={:?}",
-            config.max_task_length,
-            config.blacklist_keywords
-        );
-
-        tracing::info!("【任务理解·1/5】长度校验开始");
-        if input.len() > config.max_task_length {
-            tracing::error!(
-                "【任务理解·1/5】长度校验失败: {} > {}",
-                input.len(),
-                config.max_task_length
-            );
-            return Err(anyhow!(
-                "任务长度超过限制: {} > {}",
-                input.len(),
-                config.max_task_length
-            ));
-        }
-        tracing::info!(
-            "【任务理解·1/5】长度校验通过: {} <= {}",
-            input.len(),
-            config.max_task_length
-        );
-
+    pub fn extract_domain_tags(input: &str) -> Vec<String> {
         let input_lower = input.to_lowercase();
-        tracing::info!("【任务理解·2/5】黑名单校验开始");
-        for keyword in &config.blacklist_keywords {
-            if input_lower.contains(&keyword.to_lowercase()) {
-                tracing::error!("【任务理解·2/5】黑名单校验失败: 命中关键词 '{}'", keyword);
-                return Err(anyhow!("任务包含禁用关键词: {}", keyword));
-            }
-        }
-        tracing::info!("【任务理解·2/5】黑名单校验通过: 未命中任何禁用词");
-
-        let mut profile = TaskProfile {
-            input: input.to_string(),
-            ..Default::default()
-        };
-
-        tracing::info!("【任务理解·3/5】领域标签提取开始");
-        let mut domain_tags = Vec::new();
+        let mut tags = Vec::new();
         for (keyword, tag) in Self::DOMAIN_KEYWORDS {
             if input_lower.contains(keyword) {
-                domain_tags.push(tag.to_string());
-                tracing::debug!("【任务理解·3/5】匹配领域关键词: '{}' -> {}", keyword, tag);
+                tags.push(tag.to_string());
             }
         }
-        profile.domain_tags = domain_tags;
-        tracing::info!(
-            "【任务理解·3/5】领域标签提取完成: {:?} (共{}个)",
-            profile.domain_tags,
-            profile.domain_tags.len()
-        );
-
-        tracing::info!("【任务理解·4/5】任务类型识别开始");
-        for (keyword, task_type) in Self::TASK_TYPE_KEYWORDS {
-            if input_lower.contains(keyword) {
-                profile.task_type = *task_type;
-                tracing::info!(
-                    "【任务理解·4/5】匹配任务类型: 关键词 '{}' -> {:?}",
-                    keyword,
-                    task_type
-                );
-                break;
-            }
-        }
-        tracing::info!("【任务理解·4/5】任务类型识别结果: {:?}", profile.task_type);
-
-        tracing::info!("【任务理解·5/5】主谓宾提取开始");
-        let (subject, predicate, object) = Self::extract_spo(input);
-        profile.subject = subject;
-        profile.predicate = predicate;
-        profile.object = object;
-        tracing::info!(
-            "【任务理解·5/5】主谓宾提取结果: subject={:?}, predicate={:?}, object={:?}",
-            profile.subject,
-            profile.predicate,
-            profile.object
-        );
-
-        tracing::info!("【任务理解·Layer 1】分析完成 ✓");
-        tracing::info!("  domain_tags: {:?}", profile.domain_tags);
-        tracing::info!("  task_type:   {:?}", profile.task_type);
-        tracing::info!("  subject:     {:?}", profile.subject);
-        tracing::info!("  predicate:   {:?}", profile.predicate);
-        tracing::info!("  object:      {:?}", profile.object);
-        tracing::info!("═══════════════════════════════════════════");
-
-        Ok(profile)
+        tags
     }
 }
 
-impl KeywordBasedTaskAnalysisRule {
-    fn extract_spo(input: &str) -> (Option<String>, Option<String>, Option<String>) {
-        let mut subject = None;
-        let mut predicate = None;
-        let mut object = None;
-
-        let words: Vec<&str> = input
-            .split(|c: char| c.is_whitespace() || c == '，' || c == '。' || c == '？' || c == '！')
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        if words.is_empty() {
-            return (subject, predicate, object);
-        }
-
-        if words.len() >= 2 {
-            predicate = Some(words[1].to_string());
-        }
-
-        if words.len() >= 3 {
-            object = Some(words[2..].join(""));
-        }
-
-        if !words.is_empty() {
-            subject = Some(words[0].to_string());
-        }
-
-        (subject, predicate, object)
-    }
-}
-
-// ─── 第二层：调度策略规则 (DispatchRule) ────────────────────
-
-pub trait DispatchRule: Send + Sync + std::fmt::Debug {
-    fn decide_strategy(
-        &self,
-        profile: &TaskProfile,
-        matched_count: usize,
-        config: &RuleConfig,
-    ) -> DispatchStrategy;
-    fn filter_and_limit(
-        &self,
-        agent_ids: Vec<AgentId>,
-        profile: &TaskProfile,
-        config: &RuleConfig,
-    ) -> Vec<AgentId>;
-}
-
-#[derive(Debug)]
-pub struct DomainBasedDispatchRule;
-
-impl DispatchRule for DomainBasedDispatchRule {
-    fn decide_strategy(
-        &self,
-        profile: &TaskProfile,
-        matched_count: usize,
-        config: &RuleConfig,
-    ) -> DispatchStrategy {
-        tracing::info!("═══════════════════════════════════════════");
-        tracing::info!("【调度策略·Layer 2】开始策略决策");
-        tracing::info!(
-            "【调度策略·Layer 2】全局约束: pipeline_threshold={}, max_expert_count={}",
-            config.pipeline_threshold,
-            config.max_expert_count
-        );
-        tracing::info!(
-            "【调度策略·Layer 2】输入参数: matched_count={}, domain_tags={:?}",
-            matched_count,
-            profile.domain_tags
-        );
-
-        let reason = if matched_count >= config.pipeline_threshold {
-            format!(
-                "匹配专家数 {} >= 阈值 {}",
-                matched_count, config.pipeline_threshold
-            )
-        } else if profile.domain_tags.len() >= 2 {
-            format!("领域标签数 {} >= 2", profile.domain_tags.len())
-        } else {
-            format!(
-                "匹配专家数 {} < 阈值 {} 且领域标签数 {} < 2",
-                matched_count,
-                config.pipeline_threshold,
-                profile.domain_tags.len()
-            )
-        };
-
-        let strategy =
-            if matched_count >= config.pipeline_threshold || profile.domain_tags.len() >= 2 {
-                DispatchStrategy::Pipeline
-            } else {
-                DispatchStrategy::SimpleDispatch
-            };
-
-        tracing::info!("【调度策略·Layer 2】决策结果: {:?}", strategy);
-        tracing::info!("【调度策略·Layer 2】决策原因: {}", reason);
-        tracing::info!("═══════════════════════════════════════════");
-
-        strategy
-    }
-
-    fn filter_and_limit(
-        &self,
-        agent_ids: Vec<AgentId>,
-        _profile: &TaskProfile,
-        config: &RuleConfig,
-    ) -> Vec<AgentId> {
-        tracing::info!("═══════════════════════════════════════════");
-        tracing::info!("【调度策略·专家过滤】开始过滤专家");
-        tracing::info!("【调度策略·专家过滤】全局约束: allowed_agents={:?}, denied_agents={:?}, max_expert_count={}",
-            config.allowed_agents, config.denied_agents, config.max_expert_count);
-        tracing::info!(
-            "【调度策略·专家过滤】待过滤专家列表: {:?} (共{}个)",
-            agent_ids,
-            agent_ids.len()
-        );
-
-        let original_count = agent_ids.len();
-        let mut filtered = Vec::new();
-        for id in agent_ids {
-            if config.denied_agents.contains(&id) {
-                tracing::warn!(
-                    "【调度策略·专家过滤】专家 '{}' 被拒绝（在denied_agents黑名单中）",
-                    id
-                );
-                continue;
-            }
-            if !config.allowed_agents.is_empty() && !config.allowed_agents.contains(&id) {
-                tracing::warn!(
-                    "【调度策略·专家过滤】专家 '{}' 被拒绝（不在allowed_agents白名单中）",
-                    id
-                );
-                continue;
-            }
-            tracing::info!("【调度策略·专家过滤】专家 '{}' 通过过滤", id);
-            filtered.push(id);
-            if filtered.len() >= config.max_expert_count {
-                tracing::warn!(
-                    "【调度策略·专家过滤】已达到最大专家数量限制 {}，停止过滤",
-                    config.max_expert_count
-                );
-                break;
-            }
-        }
-        tracing::info!(
-            "【调度策略·专家过滤】过滤结果: {} -> {} 个专家",
-            original_count,
-            filtered.len()
-        );
-        tracing::info!("【调度策略·专家过滤】最终专家列表: {:?}", filtered);
-        tracing::info!("═══════════════════════════════════════════");
-        filtered
-    }
-}
-
-// ─── 第三层：执行监控规则 (ExecutionRule) ───────────────────
-
-#[async_trait::async_trait]
-pub trait ExecutionRule: Send + Sync + std::fmt::Debug {
-    async fn check_timeout(&self, elapsed: Duration, config: &RuleConfig) -> Result<()>;
-    async fn check_step_timeout(&self, elapsed: Duration, config: &RuleConfig) -> Result<()>;
-    fn should_continue(&self, step_result: Result<CtxId>, config: &RuleConfig) -> bool;
-    fn merge_results(&self, results: Vec<&ContextData>, config: &RuleConfig) -> String;
-    fn check_max_steps(&self, current_step: usize, config: &RuleConfig) -> Result<()>;
-}
-
-#[derive(Debug)]
-pub struct DefaultExecutionRule;
-
-#[async_trait::async_trait]
-impl ExecutionRule for DefaultExecutionRule {
-    async fn check_timeout(&self, elapsed: Duration, config: &RuleConfig) -> Result<()> {
-        let elapsed_ms = elapsed.as_millis();
-        tracing::debug!(
-            "【执行监控·总超时检查】已执行 {}ms / 限制 {}ms",
-            elapsed_ms,
-            config.max_execution_time_ms
-        );
-        if elapsed_ms > config.max_execution_time_ms as u128 {
-            tracing::error!(
-                "【执行监控·总超时检查】失败: {}ms > {}ms",
-                elapsed_ms,
-                config.max_execution_time_ms
-            );
-            Err(anyhow!(
-                "总执行超时: {}ms > {}ms",
-                elapsed_ms,
-                config.max_execution_time_ms
-            ))
-        } else {
-            tracing::debug!(
-                "【执行监控·总超时检查】通过: {}ms <= {}ms",
-                elapsed_ms,
-                config.max_execution_time_ms
-            );
-            Ok(())
-        }
-    }
-
-    async fn check_step_timeout(&self, elapsed: Duration, config: &RuleConfig) -> Result<()> {
-        let elapsed_ms = elapsed.as_millis();
-        tracing::debug!(
-            "【执行监控·单步超时检查】已执行 {}ms / 限制 {}ms",
-            elapsed_ms,
-            config.per_step_timeout_ms
-        );
-        if elapsed_ms > config.per_step_timeout_ms as u128 {
-            tracing::error!(
-                "【执行监控·单步超时检查】失败: {}ms > {}ms",
-                elapsed_ms,
-                config.per_step_timeout_ms
-            );
-            Err(anyhow!(
-                "步骤执行超时: {}ms > {}ms",
-                elapsed_ms,
-                config.per_step_timeout_ms
-            ))
-        } else {
-            tracing::debug!(
-                "【执行监控·单步超时检查】通过: {}ms <= {}ms",
-                elapsed_ms,
-                config.per_step_timeout_ms
-            );
-            Ok(())
-        }
-    }
-
-    fn should_continue(&self, step_result: Result<CtxId>, config: &RuleConfig) -> bool {
-        let is_err = step_result.is_err();
-        let decision = !is_err || config.continue_on_failure;
-
-        if is_err {
-            tracing::warn!(
-                "【执行监控·失败处理】步骤执行失败, continue_on_failure={}, 决策: {}",
-                config.continue_on_failure,
-                if decision {
-                    "继续执行"
-                } else {
-                    "中断执行"
-                }
-            );
-        } else {
-            tracing::debug!("【执行监控·失败处理】步骤执行成功, 继续执行");
-        }
-
-        decision
-    }
-
-    fn merge_results(&self, results: Vec<&ContextData>, config: &RuleConfig) -> String {
-        tracing::info!("═══════════════════════════════════════════");
-        tracing::info!("【执行监控·结果聚合】开始聚合结果");
-        tracing::info!(
-            "【执行监控·结果聚合】策略: {:?}, 结果数: {}",
-            config.result_strategy,
-            results.len()
-        );
-
-        let output = match config.result_strategy {
-            ResultStrategy::TakeLast => {
-                let result = results
-                    .last()
-                    .map(|d| d.content.clone())
-                    .unwrap_or_default();
-                tracing::info!(
-                    "【执行监控·结果聚合】TakeLast策略: 取最后一个结果 (长度: {})",
-                    result.len()
-                );
-                result
-            }
-            ResultStrategy::TakeFirst => {
-                let result = results
-                    .first()
-                    .map(|d| d.content.clone())
-                    .unwrap_or_default();
-                tracing::info!(
-                    "【执行监控·结果聚合】TakeFirst策略: 取第一个结果 (长度: {})",
-                    result.len()
-                );
-                result
-            }
-            ResultStrategy::MergeAll => {
-                let merged = results
-                    .iter()
-                    .enumerate()
-                    .map(|(i, d)| format!("【步骤 {}】\n{}", i + 1, d.content))
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
-                tracing::info!(
-                    "【执行监控·结果聚合】MergeAll策略: 合并{}个结果 (总长度: {})",
-                    results.len(),
-                    merged.len()
-                );
-                merged
-            }
-        };
-
-        tracing::info!("【执行监控·结果聚合】聚合完成，输出长度: {}", output.len());
-        tracing::info!("═══════════════════════════════════════════");
-        output
-    }
-
-    fn check_max_steps(&self, current_step: usize, config: &RuleConfig) -> Result<()> {
-        tracing::debug!(
-            "【执行监控·步骤数检查】当前步骤: {} / 最大: {}",
-            current_step,
-            config.max_steps
-        );
-        if current_step > config.max_steps {
-            tracing::error!(
-                "【执行监控·步骤数检查】失败: {} > {}",
-                current_step,
-                config.max_steps
-            );
-            Err(anyhow!(
-                "超过最大步骤数: {} > {}",
-                current_step,
-                config.max_steps
-            ))
-        } else {
-            tracing::debug!(
-                "【执行监控·步骤数检查】通过: {} <= {}",
-                current_step,
-                config.max_steps
-            );
-            Ok(())
-        }
-    }
-}
-
-// ─── 规则引擎 ──────────────────────────────────────────────
-
-#[derive(Debug)]
-pub struct RuleEngine {
-    analysis_rule: Box<dyn TaskAnalysisRule>,
-    dispatch_rule: Box<dyn DispatchRule>,
-    execution_rule: Box<dyn ExecutionRule>,
-    config: RuleConfig,
-}
-
-impl RuleEngine {
-    pub fn new(config: RuleConfig) -> Self {
-        Self {
-            analysis_rule: Box::new(KeywordBasedTaskAnalysisRule),
-            dispatch_rule: Box::new(DomainBasedDispatchRule),
-            execution_rule: Box::new(DefaultExecutionRule),
-            config,
-        }
-    }
-
-    pub fn with_defaults() -> Self {
-        Self::new(RuleConfig {
-            max_task_length: 10000,
-            max_expert_count: 10,
-            max_execution_time_ms: 300_000,
-            max_steps: 10,
-            per_step_timeout_ms: 60_000,
-            blacklist_keywords: vec!["暴力".into(), "攻击".into(), "色情".into()],
-            allowed_agents: Vec::new(),
-            denied_agents: Vec::new(),
-            pipeline_threshold: 2,
-            pass_full_context: false,
-            continue_on_failure: false,
-            result_strategy: ResultStrategy::TakeLast,
-        })
-    }
-
-    pub fn analyze_task(&self, input: &str) -> Result<TaskProfile> {
-        self.analysis_rule.analyze(input, &self.config)
-    }
-
-    pub fn decide_strategy(&self, profile: &TaskProfile, matched_count: usize) -> DispatchStrategy {
-        let strategy = self
-            .dispatch_rule
-            .decide_strategy(profile, matched_count, &self.config);
-        tracing::info!(
-            "【调度策略】领域标签数={}, 匹配专家数={}, 选择策略={:?}",
-            profile.domain_tags.len(),
-            matched_count,
-            strategy
-        );
-        strategy
-    }
-
-    pub fn filter_and_limit_agents(
-        &self,
-        agent_ids: Vec<AgentId>,
-        profile: &TaskProfile,
-    ) -> Vec<AgentId> {
-        self.dispatch_rule
-            .filter_and_limit(agent_ids, profile, &self.config)
-    }
-
-    pub async fn check_timeout(&self, elapsed: Duration) -> Result<()> {
-        self.execution_rule
-            .check_timeout(elapsed, &self.config)
-            .await
-    }
-
-    pub async fn check_step_timeout(&self, elapsed: Duration) -> Result<()> {
-        self.execution_rule
-            .check_step_timeout(elapsed, &self.config)
-            .await
-    }
-
-    pub fn should_continue(&self, step_result: Result<CtxId>) -> bool {
-        self.execution_rule
-            .should_continue(step_result, &self.config)
-    }
-
-    pub fn merge_results(&self, results: Vec<&ContextData>) -> String {
-        self.execution_rule.merge_results(results, &self.config)
-    }
-
-    pub fn check_max_steps(&self, current_step: usize) -> Result<()> {
-        self.execution_rule
-            .check_max_steps(current_step, &self.config)
-    }
-
-    pub fn config(&self) -> &RuleConfig {
-        &self.config
-    }
-
-    pub fn set_analysis_rule(&mut self, rule: Box<dyn TaskAnalysisRule>) {
-        self.analysis_rule = rule;
-    }
-
-    pub fn set_dispatch_rule(&mut self, rule: Box<dyn DispatchRule>) {
-        self.dispatch_rule = rule;
-    }
-
-    pub fn set_execution_rule(&mut self, rule: Box<dyn ExecutionRule>) {
-        self.execution_rule = rule;
-    }
-}
-
-// ─── 调度策略 ──────────────────────────────────────────────
+// ─── 调度结果 ──────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
-pub enum DispatchStrategy {
-    SimpleDispatch,
-    Pipeline,
+pub struct ExecutionResult {
+    pub output: String,
+    pub agent_chain: Vec<AgentId>,
+    pub tokens: TokenStats,
+    pub duration_ms: u64,
+    pub chain_name: ChainName,
 }
-
-// ─── Agent 元信息（注册中心）───────────────────────────────
 
 #[derive(Debug, Clone)]
-pub struct AgentMeta {
-    pub id: AgentId,
-    pub name: String,
-    pub tags: Vec<String>,
-    pub priority: u32,
+pub struct OrchestrationResult {
+    pub success: bool,
+    pub output: String,
+    pub session_id: String,
+    pub trace_id: String,
+    pub strategy: String,
+    pub expert_chain: Vec<String>,
+    pub expert_outputs: HashMap<String, String>,
+    pub duration_ms: u64,
+    pub critique_rounds: usize,
+    pub critique_records: Vec<serde_json::Value>,
+    pub tokens: TokenStats,
 }
 
-// ─── 专家抽象（模板方法模式）───────────────────────────────
-
-#[async_trait::async_trait]
-pub trait ExpertAgent: Send + Sync + std::fmt::Debug {
-    fn id(&self) -> &str;
-    fn name(&self) -> &str;
-    fn tags(&self) -> Vec<String>;
-    fn priority(&self) -> u32 {
-        0
-    }
-
-    async fn run(&self, ctx_id: &str, store: &mut ContextStore) -> Result<CtxId>;
-}
-
-// ─── 线性链路（责任链模式）─────────────────────────────────
-
-#[derive(Debug, Clone)]
-pub struct Step {
-    pub agent_id: AgentId,
-    pub input_ctx_id: CtxId,
-}
-
-// ─── 顶层调度器 ────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-pub struct OrchestratorConfig {
-    pub max_rounds: u32,
-}
-
-impl Default for OrchestratorConfig {
-    fn default() -> Self {
-        Self { max_rounds: 5 }
-    }
-}
+// ─── Orchestrator 调度器 ──────────────────────────────────
 
 pub struct Orchestrator {
-    config: OrchestratorConfig,
-    agent_registry: HashMap<AgentId, Arc<dyn ExpertAgent>>,
-    meta_registry: HashMap<AgentId, AgentMeta>,
+    agent_registry: AgentRegistry,
+    chain_registry: ChainRegistry,
     context_store: ContextStore,
-    rule_engine: RuleEngine,
-    default_expert_id: AgentId,
+    global_constraint: ChainConstraint,
 }
 
 impl std::fmt::Debug for Orchestrator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Orchestrator")
-            .field("config", &self.config)
-            .field("agent_count", &self.agent_registry.len())
+            .field("agent_count", &self.agent_registry.list().len())
             .finish()
     }
 }
 
 impl Orchestrator {
-    pub fn new(config: OrchestratorConfig) -> Self {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Default for Orchestrator {
+    fn default() -> Self {
         Self {
-            config,
-            agent_registry: HashMap::new(),
-            meta_registry: HashMap::new(),
+            agent_registry: AgentRegistry::new(),
+            chain_registry: ChainRegistry::new(),
             context_store: ContextStore::new(),
-            rule_engine: RuleEngine::with_defaults(),
-            default_expert_id: String::new(),
+            global_constraint: ChainConstraint {
+                max_input_length: 10000,
+                max_output_length: 50000,
+                timeout_ms: 300000,
+                input_validator: Some(Box::new(|input| {
+                    let blacklist = ["暴力", "攻击", "色情"];
+                    !blacklist.iter().any(|kw| input.contains(kw))
+                })),
+                output_validator: None,
+            },
         }
     }
+}
 
-    pub fn with_defaults() -> Self {
-        Self::new(OrchestratorConfig::default())
-    }
-
-    // ── 注册中心 ────────────────────────────────────────────
-
+impl Orchestrator {
     pub fn register_agent(&mut self, agent: Arc<dyn ExpertAgent>) {
-        let id = agent.id().to_string();
-        let meta = AgentMeta {
-            id: id.clone(),
-            name: agent.name().to_string(),
-            tags: agent.tags(),
-            priority: agent.priority(),
-        };
-
-        tracing::info!(
-            "【注册中心】注册专家: id={}, name={}, tags={}",
-            id,
-            meta.name,
-            meta.tags.join(",")
-        );
-
-        self.agent_registry.insert(id.clone(), agent);
-        self.meta_registry.insert(id, meta);
+        self.agent_registry.register(agent);
     }
 
-    pub fn get_agent(&self, agent_id: &str) -> Option<Arc<dyn ExpertAgent>> {
-        self.agent_registry.get(agent_id).cloned()
+    pub fn list_agents(&self) -> Vec<&AgentMeta> {
+        self.agent_registry.list()
     }
 
-    pub fn list_agents(&self) -> Vec<AgentMeta> {
-        self.meta_registry.values().cloned().collect()
+    pub fn register_chain(&mut self, chain: PredefinedChain) {
+        self.chain_registry.register_chain(chain);
     }
 
-    pub fn set_default_expert(&mut self, expert_id: &str) {
-        if self.agent_registry.contains_key(expert_id) {
-            self.default_expert_id = expert_id.to_string();
-        }
+    pub fn set_default_chain(&mut self, name: &str) {
+        self.chain_registry.set_default_chain(name);
     }
-
-    pub fn set_general_expert(&mut self, expert_id: &str) {
-        self.set_default_expert(expert_id);
-    }
-
-    // ── 上下文管理 ──────────────────────────────────────────
 
     pub fn put_context(&mut self, content: String) -> CtxId {
-        let data = ContextData {
+        self.context_store.put(ContextData {
             content,
             metadata: HashMap::new(),
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64,
-        };
-        self.context_store.put(data)
+        })
     }
 
-    pub fn get_context(&self, ctx_id: &str) -> Option<&ContextData> {
-        self.context_store.get(ctx_id)
-    }
-
-    // ── 调度算法：任务理解 + 关键词匹配 + 策略决策 ──────────────
-
-    pub fn schedule(&mut self, target: &str) -> Result<(Vec<Step>, DispatchStrategy, TaskProfile)> {
-        tracing::info!("【调度算法】开始分析任务: {}", target);
-
-        let profile = self.rule_engine.analyze_task(target)?;
-        let material_ctx_id = self.put_context(target.to_string());
-        tracing::debug!("【调度算法】上下文 ID: {}", material_ctx_id);
-
-        let agents: Vec<AgentMeta> = self.meta_registry.values().cloned().collect();
-        tracing::info!("【调度算法】注册中心共有 {} 个专家", agents.len());
-
-        let mut matched: Vec<(&AgentMeta, usize)> = Vec::new();
-        let target_lower = target.to_lowercase();
-
-        for agent in &agents {
-            for (idx, tag) in agent.tags.iter().enumerate() {
-                if target_lower.contains(&tag.to_lowercase()) || profile.domain_tags.contains(tag) {
-                    matched.push((agent, idx));
-                    tracing::info!("【调度算法】匹配成功: expert={}, tag={}", agent.name, tag);
-                    break;
-                }
-            }
-        }
-
-        if matched.is_empty() {
-            if let Some(agent) = agents.first() {
-                tracing::warn!("【调度算法】无匹配专家，使用默认: {}", agent.name);
-                matched.push((agent, 0));
-            } else {
-                return Err(anyhow!("无可用专家"));
-            }
-        }
-
-        let strategy = self.rule_engine.decide_strategy(&profile, matched.len());
-
-        matched.sort_by(|a, b| {
-            let priority_cmp = b.0.priority.cmp(&a.0.priority);
-            if priority_cmp != std::cmp::Ordering::Equal {
-                return priority_cmp;
-            }
-            a.1.cmp(&b.1)
-        });
-
-        let matched_ids: Vec<AgentId> = matched.iter().map(|(a, _)| a.id.clone()).collect();
-        let filtered_ids = self
-            .rule_engine
-            .filter_and_limit_agents(matched_ids, &profile);
-
-        let chain: Vec<Step> = filtered_ids
-            .iter()
-            .map(|id| Step {
-                agent_id: id.clone(),
-                input_ctx_id: material_ctx_id.clone(),
-            })
-            .collect();
-
-        tracing::info!(
-            "【调度算法】生成链路: {} 个步骤, 策略={:?}",
-            chain.len(),
-            strategy
-        );
-        for (i, step) in chain.iter().enumerate() {
-            tracing::info!("【调度算法】Step[{}] -> agent_id={}", i + 1, step.agent_id);
-        }
-
-        Ok((chain, strategy, profile))
-    }
-
-    // ── 执行入口：责任链串行执行 ──────────────────────────────
-
-    pub async fn execute(&mut self, target: &str) -> Result<ExecutionResult> {
+    pub async fn execute_chain(
+        &mut self,
+        input: &str,
+        chain_name: &str,
+        trace: &mut Trace,
+    ) -> Result<ExecutionResult> {
         let start = Instant::now();
 
-        let (chain, strategy, _profile) = self.schedule(target)?;
+        let chain = self
+            .chain_registry
+            .get_chain(chain_name)
+            .cloned()
+            .ok_or_else(|| anyhow!("链路不存在: {}", chain_name))?;
 
-        tracing::info!(
-            "【责任链执行】开始执行 {} 个步骤, 策略={:?}",
-            chain.len(),
-            strategy
+        let span = tracing::info_span!(
+            "execute_chain",
+            trace_id = %trace.id.as_str(),
+            chain_name = %chain_name,
+            chain_description = %chain.description,
+            steps_count = chain.steps.len(),
         );
-        let mut current_ctx_id = None;
+        let _enter = span.enter();
+
+        tracing::debug!("开始执行链路: {}", chain_name);
+
+        chain.constraint.validate_input(input)?;
+        self.global_constraint.validate_input(input)?;
+
+        let material_ctx_id = self.put_context(input.to_string());
+        let mut current_ctx_id: Option<String> = None;
         let mut agent_chain = Vec::new();
-        let mut all_outputs: Vec<String> = Vec::new();
+        let mut outputs = Vec::new();
 
-        for (index, step) in chain.iter().enumerate() {
-            self.rule_engine.check_max_steps(index + 1)?;
-            self.rule_engine.check_timeout(start.elapsed()).await?;
-
+        for (step_idx, step) in chain.steps.iter().enumerate() {
             let agent = self
                 .agent_registry
                 .get(&step.agent_id)
                 .ok_or_else(|| anyhow!("专家不存在: {}", step.agent_id))?;
 
-            tracing::info!(
-                "【责任链执行】Step[{}/{}] 执行专家: {}",
-                index + 1,
-                chain.len(),
-                agent.name()
-            );
-
-            let input_ctx_id = if self.rule_engine.config().pass_full_context {
-                &step.input_ctx_id as &str
+            let input_ctx_id = if step.pass_full_context {
+                &material_ctx_id
             } else {
-                current_ctx_id
-                    .as_deref()
-                    .unwrap_or(&step.input_ctx_id as &str)
+                current_ctx_id.as_deref().unwrap_or(&material_ctx_id)
             };
 
+            let expert_span = tracing::debug_span!(
+                "expert_run",
+                trace_id = %trace.id.as_str(),
+                expert_id = %agent.id(),
+                expert_name = %agent.name(),
+                step = step_idx + 1,
+                pass_full_context = step.pass_full_context,
+            );
+            let _expert_enter = expert_span.enter();
+
             let step_start = Instant::now();
-            let step_result = agent.run(input_ctx_id, &mut self.context_store).await;
-            let step_duration = step_start.elapsed().as_millis();
+            let ctx_id = agent.run(input_ctx_id, &mut self.context_store).await?;
+            let step_duration = step_start.elapsed().as_millis() as u64;
 
-            match step_result {
-                Ok(ctx_id) => {
-                    let output = self
-                        .context_store
-                        .get(&ctx_id)
-                        .map(|d| d.content.clone())
-                        .unwrap_or_default();
-                    all_outputs.push(output);
-                    current_ctx_id = Some(ctx_id);
-                    agent_chain.push(step.agent_id.clone());
+            tracing::info!("专家 [{}] 执行完成, 耗时: {}ms", agent.id(), step_duration);
 
-                    tracing::info!(
-                        "【责任链执行】Step[{}] 完成: expert={}, duration={}ms",
-                        index + 1,
-                        agent.name(),
-                        step_duration
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "【责任链执行】Step[{}] 失败: expert={}, error={:?}",
-                        index + 1,
-                        agent.name(),
-                        e
-                    );
-
-                    if !self.rule_engine.should_continue(Err::<CtxId, _>(e)) {
-                        return Err(anyhow!("专家执行失败: {}", agent.name()));
-                    }
-                }
-            }
+            let output = self
+                .context_store
+                .get(&ctx_id)
+                .map(|d| d.content.clone())
+                .unwrap_or_default();
+            outputs.push(output.clone());
+            current_ctx_id = Some(ctx_id);
+            agent_chain.push(step.agent_id.clone());
         }
 
-        let final_output = if all_outputs.is_empty() {
-            String::new()
-        } else {
-            let results: Vec<ContextData> = all_outputs
-                .iter()
-                .map(|c| ContextData {
-                    content: c.clone(),
-                    metadata: HashMap::new(),
-                    created_at: 0,
-                })
-                .collect();
-            let refs: Vec<&ContextData> = results.iter().collect();
-            self.rule_engine.merge_results(refs)
-        };
+        let final_output = outputs.last().cloned().unwrap_or_default();
+        chain.constraint.validate_output(&final_output)?;
+
         let duration_ms = start.elapsed().as_millis() as u64;
 
-        tracing::info!(
-            "【责任链执行】全部完成，耗时 {}ms, 策略={:?}",
-            duration_ms,
-            strategy
-        );
+        tracing::info!("链路执行完成, 总耗时: {}ms", duration_ms);
+
+        trace.expert_chain = agent_chain.clone();
 
         Ok(ExecutionResult {
             output: final_output,
             agent_chain,
             tokens: TokenStats::default(),
             duration_ms,
-            strategy,
+            chain_name: chain_name.to_string(),
         })
     }
 
-    // ── 兼容旧 API ──────────────────────────────────────────
+    pub async fn dispatch(&mut self, input: &str, trace: &mut Trace) -> Result<ExecutionResult> {
+        let domain_tags = DomainExtractor::extract_domain_tags(input);
 
-    pub async fn run_orchestrated(
+        let span = tracing::info_span!(
+            "dispatch",
+            trace_id = %trace.id.as_str(),
+            input_len = input.len(),
+            domain_tags_len = domain_tags.len(),
+        );
+        let _enter = span.enter();
+
+        tracing::debug!("提取到领域标签: {:?}", domain_tags);
+
+        let matched_experts = self
+            .agent_registry
+            .find_matching_experts(input, &domain_tags);
+
+        tracing::debug!("匹配到 {} 个专家", matched_experts.len());
+
+        if matched_experts.len() == 1 {
+            let agent = matched_experts[0].clone();
+
+            tracing::info!("模式: direct, 匹配专家: {} ({})", agent.id(), agent.name());
+
+            return self.execute_direct(agent, input, trace).await;
+        }
+
+        if matched_experts.is_empty() {
+            let default_agent = self
+                .agent_registry
+                .get("default")
+                .ok_or_else(|| anyhow!("内部通用专家未注册"))?;
+
+            tracing::warn!(
+                "模式: fallback, 未匹配到任何专家，使用内部通用专家: {} ({})",
+                default_agent.id(),
+                default_agent.name()
+            );
+
+            return self.execute_direct(default_agent, input, trace).await;
+        }
+
+        let chain_name = {
+            let chain = self
+                .chain_registry
+                .find_matching_chain(input, &domain_tags)
+                .or_else(|| self.chain_registry.get_default_chain())
+                .ok_or_else(|| anyhow!("未找到匹配的链路"))?;
+
+            tracing::info!(
+                "模式: chain, 匹配链路: {} ({})",
+                chain.name,
+                chain.description
+            );
+
+            chain.name.clone()
+        };
+
+        trace.chain_name = Some(chain_name.clone());
+        self.execute_chain(input, &chain_name, trace).await
+    }
+
+    async fn execute_direct(
+        &mut self,
+        agent: Arc<dyn ExpertAgent>,
+        input: &str,
+        trace: &mut Trace,
+    ) -> Result<ExecutionResult> {
+        let start = Instant::now();
+
+        let span = tracing::info_span!(
+            "execute_direct",
+            trace_id = %trace.id.as_str(),
+            expert_id = %agent.id(),
+            expert_name = %agent.name(),
+        );
+        let _enter = span.enter();
+
+        tracing::debug!("开始直接执行专家");
+
+        self.global_constraint.validate_input(input)?;
+
+        let material_ctx_id = self.put_context(input.to_string());
+
+        let expert_span = tracing::debug_span!(
+            "expert_run",
+            trace_id = %trace.id.as_str(),
+            expert_id = %agent.id(),
+            step = 1,
+        );
+        let _expert_enter = expert_span.enter();
+
+        let step_start = Instant::now();
+        let ctx_id = agent.run(&material_ctx_id, &mut self.context_store).await?;
+        let step_duration = step_start.elapsed().as_millis() as u64;
+
+        tracing::info!("专家执行完成, 耗时: {}ms", step_duration);
+
+        let output = self
+            .context_store
+            .get(&ctx_id)
+            .map(|d| d.content.clone())
+            .unwrap_or_default();
+
+        self.global_constraint.validate_output(&output)?;
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        trace.expert_chain = vec![agent.id().to_string()];
+
+        Ok(ExecutionResult {
+            output,
+            agent_chain: vec![agent.id().to_string()],
+            tokens: TokenStats::default(),
+            duration_ms,
+            chain_name: "direct".to_string(),
+        })
+    }
+
+    pub async fn run_orchestrated_with_trace(
         &mut self,
         input: &str,
         _user_id: &str,
+        trace: &mut Trace,
     ) -> Result<OrchestrationResult> {
-        let result = self.execute(input).await?;
+        let start = Instant::now();
+
+        let result = self.dispatch(input, trace).await?;
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+
         Ok(OrchestrationResult {
+            success: true,
             output: result.output,
-            strategy: match result.strategy {
-                DispatchStrategy::SimpleDispatch => "SimpleDispatch".to_string(),
-                DispatchStrategy::Pipeline => "Pipeline".to_string(),
-            },
+            session_id: "".to_string(),
+            trace_id: trace.id.as_str().to_string(),
+            strategy: result.chain_name,
             expert_chain: result.agent_chain,
             expert_outputs: HashMap::new(),
-            tokens: result.tokens,
-            duration_ms: result.duration_ms,
+            duration_ms,
+            critique_rounds: 0,
             critique_records: Vec::new(),
+            tokens: result.tokens,
         })
     }
-}
 
-// ─── 执行结果 ──────────────────────────────────────────────
+    pub fn list_chains(&self) -> Vec<ChainName> {
+        self.chain_registry.list_chains()
+    }
 
-#[derive(Debug, Clone)]
-pub struct ExecutionResult {
-    pub output: String,
-    pub agent_chain: Vec<String>,
-    pub tokens: TokenStats,
-    pub duration_ms: u64,
-    pub strategy: DispatchStrategy,
-}
-
-// ─── 默认专家实现 ──────────────────────────────────────────
-
-#[derive(Debug)]
-pub struct DefaultExpert {
-    id: String,
-    name: String,
-    tags: Vec<String>,
-    priority: u32,
-    role: String,
-    backstory: String,
-    goal: String,
-    runtime: Arc<Runtime>,
-}
-
-impl DefaultExpert {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        id: String,
-        name: String,
-        tags: Vec<String>,
-        priority: u32,
-        role: String,
-        backstory: String,
-        goal: String,
-        runtime: Arc<Runtime>,
-    ) -> Self {
-        Self {
-            id,
-            name,
-            tags,
-            priority,
-            role,
-            backstory,
-            goal,
-            runtime,
-        }
+    pub fn get_chain(&self, name: &str) -> Option<&PredefinedChain> {
+        self.chain_registry.get_chain(name)
     }
 }
 
-#[async_trait::async_trait]
-impl ExpertAgent for DefaultExpert {
-    fn id(&self) -> &str {
-        &self.id
-    }
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn tags(&self) -> Vec<String> {
-        self.tags.clone()
-    }
-    fn priority(&self) -> u32 {
-        self.priority
-    }
+// ─── AI 扩展生成器 ──────────────────────────────────────────
 
-    async fn run(&self, ctx_id: &str, store: &mut ContextStore) -> Result<CtxId> {
-        let context = store
-            .get(ctx_id)
-            .ok_or_else(|| anyhow!("上下文不存在: {}", ctx_id))?;
+pub struct ChainCodeGenerator;
 
-        let prompt = format!(
-            r#"你是 {}。
-角色背景：{}
-目标：{}
+impl ChainCodeGenerator {
+    pub fn generate_new_chain_code(
+        chain_name: &str,
+        description: &str,
+        keywords: &[&str],
+        domain_tags: &[&str],
+        steps: &[(&str, bool)],
+        max_input_length: usize,
+        max_output_length: usize,
+    ) -> String {
+        let keywords_str = keywords
+            .iter()
+            .map(|k| format!("\"{}\"", k))
+            .collect::<Vec<_>>()
+            .join(", ");
 
-当前任务：{}
+        let domain_tags_str = domain_tags
+            .iter()
+            .map(|t| format!("\"{}\"", t))
+            .collect::<Vec<_>>()
+            .join(", ");
 
-请直接回答这个任务。"#,
-            self.role, self.backstory, self.goal, context.content
-        );
+        let steps_str = steps
+            .iter()
+            .map(|(agent_id, pass_full)| {
+                format!(
+                    "        ChainStep {{\n            agent_id: \"{}\".to_string(),\n            pass_full_context: {},\n        }},",
+                    agent_id, pass_full
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
 
-        let messages = vec![
-            Message {
-                role: Role::System,
-                content: format!(
-                    "你是 {}。角色背景：{}。目标：{}",
-                    self.role, self.backstory, self.goal
-                ),
-                tool_call_id: None,
-            },
-            Message {
-                role: Role::User,
-                content: prompt,
-                tool_call_id: None,
-            },
-        ];
+        format!(
+            r#"// ─── {} ──────────────────────────────────────────
 
-        let response = self.runtime.call_llm(messages).await?;
-
-        Ok(store.put(ContextData {
-            content: response,
-            metadata: HashMap::new(),
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-        }))
+// {}
+pub fn register_{}_chain(orchestrator: &mut Orchestrator) {{
+    orchestrator.register_chain(PredefinedChain {{
+        name: "{}".to_string(),
+        description: "{}".to_string(),
+        condition: MatchCondition {{
+            keywords: vec![{}],
+            domain_tags: vec![{}],
+            exact_match: None,
+            priority: 10,
+        }},
+        steps: vec![
+{}
+        ],
+        constraint: ChainConstraint {{
+            input_validator: None,
+            output_validator: None,
+            max_input_length: {},
+            max_output_length: {},
+            timeout_ms: 300000,
+        }},
+    }});
+}}
+"#,
+            chain_name,
+            description,
+            chain_name.replace("-", "_").replace(" ", "_"),
+            chain_name,
+            description,
+            keywords_str,
+            domain_tags_str,
+            steps_str,
+            max_input_length,
+            max_output_length,
+        )
     }
 }
-
-// ─── 兼容旧 API ────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-pub struct CollaborationResult {
-    pub output: String,
-    pub expert_chain: Vec<String>,
-    pub expert_outputs: HashMap<String, String>,
-    pub tokens: TokenStats,
-    pub duration_ms: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct OrchestrationResult {
-    pub output: String,
-    pub strategy: String,
-    pub expert_chain: Vec<String>,
-    pub expert_outputs: HashMap<String, String>,
-    pub tokens: TokenStats,
-    pub duration_ms: u64,
-    pub critique_records: Vec<CritiqueRecord>,
-}
-
-#[derive(Debug, Clone)]
-pub struct CritiqueRecord;
-
-#[derive(Debug, Clone)]
-pub struct ExpertMatchResult;
-
-#[derive(Debug, Clone)]
-pub struct ExpertPerformance;
-
-pub type Expert = DefaultExpert;
-pub type ExpertAgentTrait = dyn ExpertAgent;

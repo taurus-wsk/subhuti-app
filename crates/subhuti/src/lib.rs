@@ -45,9 +45,9 @@ pub use memory::{
 };
 pub use observe::session::SessionRecordParams;
 pub use orchestrator::{
-    AgentMeta, CollaborationResult, ContextData, ContextStore, CtxId, DispatchStrategy, Expert,
-    ExpertAgent, ExpertMatchResult, ExpertPerformance, OrchestrationResult, Orchestrator,
-    OrchestratorConfig, RuleEngine, Step, TaskProfile,
+    AgentMeta, AgentRegistry, ChainCodeGenerator, ChainConstraint, ChainRegistry, ChainStep,
+    ContextData, ContextStore, CtxId, DomainExtractor, ExpertAgent, OrchestrationResult,
+    Orchestrator, PredefinedChain,
 };
 pub use runtime::{
     LLMClient, LLMConfig, LLMProvider, LLMResponse, Message, MockLLM, Role, Runtime, RuntimeConfig,
@@ -170,38 +170,125 @@ impl Subhuti {
         // 创建共享 Skill 管理器（tokio RwLock 用于编排器）
         let _shared_skills = Arc::new(tokio::sync::RwLock::new(SkillManager::new()));
 
-        // 创建多Agent协调编排器并注册内置专家
-        let mut orchestrator = Orchestrator::with_defaults();
+        let mut orchestrator = Orchestrator::new();
 
-        let coding_expert = orchestrator::DefaultExpert::new(
-            "coding".to_string(),
-            "编程专家".to_string(),
-            vec![
-                "编程".into(),
-                "代码".into(),
-                "rust".into(),
-                "开发".into(),
-                "bug".into(),
+        let coding_expert = Arc::new(CodingExpert::new(runtime.clone()));
+        orchestrator.register_agent(coding_expert);
+
+        let weather_expert = Arc::new(WeatherExpert::new(runtime.clone()));
+        orchestrator.register_agent(weather_expert);
+
+        let psychology_expert = Arc::new(PsychologyExpert::new(runtime.clone()));
+        orchestrator.register_agent(psychology_expert);
+
+        let default_expert = Arc::new(orchestrator::DefaultExpert::new(runtime.clone()));
+        orchestrator.register_agent(default_expert);
+
+        orchestrator.register_chain(PredefinedChain {
+            name: "coding-simple".to_string(),
+            description: "单专家编程任务".to_string(),
+            condition: orchestrator::MatchCondition {
+                keywords: vec![
+                    "编程",
+                    "代码",
+                    "rust",
+                    "开发",
+                    "bug",
+                    "python",
+                    "java",
+                    "javascript",
+                ]
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect(),
+                domain_tags: vec!["tech".to_string()],
+                exact_match: None,
+                priority: 10,
+            },
+            steps: vec![ChainStep {
+                agent_id: "coding".to_string(),
+                pass_full_context: false,
+            }],
+            constraint: ChainConstraint::default(),
+        });
+
+        orchestrator.register_chain(PredefinedChain {
+            name: "weather-simple".to_string(),
+            description: "单专家天气查询".to_string(),
+            condition: orchestrator::MatchCondition {
+                keywords: vec!["天气", "温度", "下雨", "气象"]
+                    .into_iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                domain_tags: vec!["weather".to_string()],
+                exact_match: None,
+                priority: 10,
+            },
+            steps: vec![ChainStep {
+                agent_id: "weather".to_string(),
+                pass_full_context: false,
+            }],
+            constraint: ChainConstraint::default(),
+        });
+
+        orchestrator.register_chain(PredefinedChain {
+            name: "psychology-simple".to_string(),
+            description: "单专家心理咨询".to_string(),
+            condition: orchestrator::MatchCondition {
+                keywords: vec!["心理", "咨询", "心情", "情绪", "情感"]
+                    .into_iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                domain_tags: vec!["psychology".to_string()],
+                exact_match: None,
+                priority: 10,
+            },
+            steps: vec![ChainStep {
+                agent_id: "psychology".to_string(),
+                pass_full_context: false,
+            }],
+            constraint: ChainConstraint::default(),
+        });
+
+        orchestrator.register_chain(PredefinedChain {
+            name: "weather-mood-pipeline".to_string(),
+            description: "天气查询+心情疏导流水线".to_string(),
+            condition: orchestrator::MatchCondition {
+                keywords: vec!["天气".to_string(), "心情".to_string(), "情绪".to_string()],
+                domain_tags: vec!["weather".to_string(), "psychology".to_string()],
+                exact_match: None,
+                priority: 20,
+            },
+            steps: vec![
+                ChainStep {
+                    agent_id: "weather".to_string(),
+                    pass_full_context: false,
+                },
+                ChainStep {
+                    agent_id: "psychology".to_string(),
+                    pass_full_context: false,
+                },
             ],
-            10,
-            "资深 Rust 开发专家".to_string(),
-            "10年 Rust 开发经验，精通系统编程".to_string(),
-            "帮助用户解决编程问题".to_string(),
-            runtime.clone(),
-        );
-        orchestrator.register_agent(Arc::new(coding_expert));
+            constraint: ChainConstraint::default(),
+        });
 
-        let weather_expert = orchestrator::DefaultExpert::new(
-            "weather".to_string(),
-            "天气专家".to_string(),
-            vec!["天气".into(), "气象".into(), "温度".into(), "下雨".into()],
-            5,
-            "气象预报专家".to_string(),
-            "专业气象分析师".to_string(),
-            "提供准确的天气预报".to_string(),
-            runtime.clone(),
-        );
-        orchestrator.register_agent(Arc::new(weather_expert));
+        orchestrator.register_chain(PredefinedChain {
+            name: "default-fallback".to_string(),
+            description: "默认回退链路".to_string(),
+            condition: orchestrator::MatchCondition {
+                keywords: vec![],
+                domain_tags: vec![],
+                exact_match: None,
+                priority: 1,
+            },
+            steps: vec![ChainStep {
+                agent_id: "coding".to_string(),
+                pass_full_context: false,
+            }],
+            constraint: ChainConstraint::default(),
+        });
+
+        orchestrator.set_default_chain("default-fallback");
 
         Self {
             config,
@@ -470,20 +557,14 @@ impl Subhuti {
     }
 
     /// 设置编排器通用专家
-    pub async fn set_orchestrator_general_expert(&self, expert_id: &str) {
-        self.orchestrator.lock().await.set_general_expert(expert_id);
-    }
+    pub async fn set_orchestrator_general_expert(&self, _expert_id: &str) {}
 
     /// 使用编排器分析任务
-    pub async fn analyze_task(&self, input: &str) -> TaskProfile {
-        let mut orch = self.orchestrator.lock().await;
-        match orch.schedule(input) {
-            Ok((_, _, profile)) => profile,
-            Err(_) => TaskProfile {
-                input: input.to_string(),
-                ..Default::default()
-            },
-        }
+    pub async fn analyze_task(&self, input: &str) -> serde_json::Value {
+        serde_json::json!({
+            "input": input,
+            "domain_tags": orchestrator::DomainExtractor::extract_domain_tags(input),
+        })
     }
 
     /// 使用编排器执行任务（自动选择策略）
@@ -492,8 +573,21 @@ impl Subhuti {
         input: &str,
         user_id: &str,
     ) -> Result<OrchestrationResult> {
+        let mut trace = crate::observe::Trace::new(user_id, "", input);
         let mut orch = self.orchestrator.lock().await;
-        orch.run_orchestrated(input, user_id).await
+        orch.run_orchestrated_with_trace(input, user_id, &mut trace)
+            .await
+    }
+
+    /// 使用编排器执行任务（带 Trace）
+    pub async fn run_orchestrated_with_trace(
+        &self,
+        input: &str,
+        _user_id: &str,
+        trace: &mut crate::observe::Trace,
+    ) -> Result<OrchestrationResult> {
+        let mut orch = self.orchestrator.lock().await;
+        orch.run_orchestrated_with_trace(input, "", trace).await
     }
 
     /// 使用编排器执行任务（指定策略）
@@ -501,10 +595,24 @@ impl Subhuti {
         &self,
         input: &str,
         user_id: &str,
-        _strategy: DispatchStrategy,
+        chain_name: &str,
     ) -> Result<OrchestrationResult> {
+        let mut trace = observe::Trace::new(user_id, "", input);
         let mut orch = self.orchestrator.lock().await;
-        orch.run_orchestrated(input, user_id).await
+        let result = orch.execute_chain(input, chain_name, &mut trace).await?;
+        Ok(OrchestrationResult {
+            success: true,
+            output: result.output,
+            session_id: "".to_string(),
+            trace_id: trace.id.0.clone(),
+            strategy: chain_name.to_string(),
+            expert_chain: result.agent_chain,
+            expert_outputs: HashMap::new(),
+            duration_ms: result.duration_ms,
+            critique_rounds: 0,
+            critique_records: Vec::new(),
+            tokens: result.tokens,
+        })
     }
 
     /// 获取编排器专家列表
@@ -518,10 +626,7 @@ impl Subhuti {
     }
 
     /// 匹配编排器专家
-    pub async fn match_orchestrator_experts(
-        &self,
-        _input: &str,
-    ) -> Vec<orchestrator::ExpertMatchResult> {
+    pub async fn match_orchestrator_experts(&self, _input: &str) -> Vec<serde_json::Value> {
         Vec::new()
     }
 
@@ -1220,6 +1325,7 @@ struct ExpertPluginAdapter {
     id: String,
     name: String,
     priority: u32,
+    tags: Vec<String>,
 }
 
 impl std::fmt::Debug for ExpertPluginAdapter {
@@ -1232,12 +1338,14 @@ impl std::fmt::Debug for ExpertPluginAdapter {
 
 impl ExpertPluginAdapter {
     fn new(plugin: std::sync::Arc<dyn expert::ExpertPlugin>, runtime: Arc<Runtime>) -> Self {
+        let tags = plugin.manifest().keywords.clone();
         Self {
             plugin: plugin.clone(),
             runtime,
             id: plugin.manifest().id,
             name: plugin.info().name,
             priority: 0,
+            tags,
         }
     }
 }
@@ -1252,8 +1360,8 @@ impl ExpertAgent for ExpertPluginAdapter {
         &self.name
     }
 
-    fn tags(&self) -> Vec<String> {
-        self.plugin.manifest().keywords.clone()
+    fn tags(&self) -> &[String] {
+        &self.tags
     }
 
     fn priority(&self) -> u32 {
@@ -1289,6 +1397,221 @@ impl ExpertAgent for ExpertPluginAdapter {
             Message {
                 role: Role::User,
                 content: prompt,
+                tool_call_id: None,
+            },
+        ];
+
+        let response = self.runtime.call_llm(messages).await?;
+
+        Ok(store.put(ContextData {
+            content: response,
+            metadata: HashMap::new(),
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        }))
+    }
+}
+
+struct CodingExpert {
+    runtime: Arc<Runtime>,
+    tags: Vec<String>,
+}
+
+impl CodingExpert {
+    fn new(runtime: Arc<Runtime>) -> Self {
+        Self {
+            runtime,
+            tags: vec![
+                "编程".to_string(),
+                "代码".to_string(),
+                "rust".to_string(),
+                "开发".to_string(),
+                "bug".to_string(),
+                "python".to_string(),
+                "java".to_string(),
+                "javascript".to_string(),
+            ],
+        }
+    }
+}
+
+impl std::fmt::Debug for CodingExpert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CodingExpert").finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl ExpertAgent for CodingExpert {
+    fn id(&self) -> &str {
+        "coding"
+    }
+
+    fn name(&self) -> &str {
+        "编程专家"
+    }
+
+    fn tags(&self) -> &[String] {
+        &self.tags
+    }
+
+    async fn run(&self, ctx_id: &str, store: &mut ContextStore) -> Result<CtxId> {
+        let context = store
+            .get(ctx_id)
+            .ok_or_else(|| anyhow::anyhow!("Context not found: {}", ctx_id))?;
+
+        let messages = vec![
+            Message {
+                role: Role::System,
+                content: "你是一位资深编程专家，精通多种编程语言，擅长解决代码问题和提供技术建议。请直接给出专业的回答。".to_string(),
+                tool_call_id: None,
+            },
+            Message {
+                role: Role::User,
+                content: context.content.clone(),
+                tool_call_id: None,
+            },
+        ];
+
+        let response = self.runtime.call_llm(messages).await?;
+
+        Ok(store.put(ContextData {
+            content: response,
+            metadata: HashMap::new(),
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        }))
+    }
+}
+
+struct WeatherExpert {
+    runtime: Arc<Runtime>,
+    tags: Vec<String>,
+}
+
+impl WeatherExpert {
+    fn new(runtime: Arc<Runtime>) -> Self {
+        Self {
+            runtime,
+            tags: vec![
+                "天气".to_string(),
+                "温度".to_string(),
+                "下雨".to_string(),
+                "气象".to_string(),
+            ],
+        }
+    }
+}
+
+impl std::fmt::Debug for WeatherExpert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeatherExpert").finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl ExpertAgent for WeatherExpert {
+    fn id(&self) -> &str {
+        "weather"
+    }
+
+    fn name(&self) -> &str {
+        "天气专家"
+    }
+
+    fn tags(&self) -> &[String] {
+        &self.tags
+    }
+
+    async fn run(&self, ctx_id: &str, store: &mut ContextStore) -> Result<CtxId> {
+        let context = store
+            .get(ctx_id)
+            .ok_or_else(|| anyhow::anyhow!("Context not found: {}", ctx_id))?;
+
+        let messages = vec![
+            Message {
+                role: Role::System,
+                content: "你是一位专业的气象预报专家，能够提供准确的天气信息和建议。请直接给出专业的回答。".to_string(),
+                tool_call_id: None,
+            },
+            Message {
+                role: Role::User,
+                content: context.content.clone(),
+                tool_call_id: None,
+            },
+        ];
+
+        let response = self.runtime.call_llm(messages).await?;
+
+        Ok(store.put(ContextData {
+            content: response,
+            metadata: HashMap::new(),
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        }))
+    }
+}
+
+struct PsychologyExpert {
+    runtime: Arc<Runtime>,
+    tags: Vec<String>,
+}
+
+impl PsychologyExpert {
+    fn new(runtime: Arc<Runtime>) -> Self {
+        Self {
+            runtime,
+            tags: vec![
+                "心理".to_string(),
+                "咨询".to_string(),
+                "心情".to_string(),
+                "情绪".to_string(),
+                "情感".to_string(),
+            ],
+        }
+    }
+}
+
+impl std::fmt::Debug for PsychologyExpert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PsychologyExpert").finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl ExpertAgent for PsychologyExpert {
+    fn id(&self) -> &str {
+        "psychology"
+    }
+
+    fn name(&self) -> &str {
+        "心理咨询专家"
+    }
+
+    fn tags(&self) -> &[String] {
+        &self.tags
+    }
+
+    async fn run(&self, ctx_id: &str, store: &mut ContextStore) -> Result<CtxId> {
+        let context = store
+            .get(ctx_id)
+            .ok_or_else(|| anyhow::anyhow!("Context not found: {}", ctx_id))?;
+
+        let messages = vec![
+            Message {
+                role: Role::System,
+                content: "你是一位专业的心理咨询师，能够提供温暖、专业的心理支持和建议。请直接给出专业的回答。".to_string(),
+                tool_call_id: None,
+            },
+            Message {
+                role: Role::User,
+                content: context.content.clone(),
                 tool_call_id: None,
             },
         ];

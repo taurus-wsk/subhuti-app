@@ -8,15 +8,33 @@
 //! - **长期归档记忆 (Archive)**: 历史对话沉淀，AI 主动调用搜索
 //! - **知识库语义记忆 (Knowledge)**: 向量知识、外部文档，向量检索
 
+pub mod convo_miner;
+mod dedup;
+mod dynamics;
 mod embedding;
+pub mod entities;
+pub mod fact_checker;
+pub mod hybrid_search;
 mod knowledge;
+pub mod knowledge_graph;
+pub mod layers;
 mod long_term;
+pub mod palace_graph;
 mod short_term;
 pub mod storage;
 
+pub use convo_miner::{ConvoExchange, ConvoMiner, MinedMemory};
+pub use dedup::{DedupConfig, DedupResult, Deduplicator, KeepStrategy};
+pub use dynamics::ConnectionDynamics;
 pub use embedding::{EmbeddingConfig, EmbeddingService};
+pub use entities::{Entity, EntityExtractor, EntityRegistry, EntitySource, EntityType};
+pub use fact_checker::{FactChecker, FactIssue, IssueType};
+pub use hybrid_search::{HybridSearchResult, HybridSearcher};
 pub use knowledge::KnowledgeMemory;
+pub use knowledge_graph::{KnowledgeGraph, KnowledgeGraphStats, QueryDirection, Triple};
+pub use layers::{LayerOutput, MemoryLayerConfig, MemoryStack};
 pub use long_term::LongTermMemory;
+pub use palace_graph::{Hallway, PalaceGraph, PalaceGraphStats, Room, Tunnel, Wing};
 pub use short_term::ShortTermMemory;
 pub use storage::{
     Database, DbConfig, FeedbackRow, HistoryRow, MemoryRow, PersonaData, PersonaRow,
@@ -176,6 +194,22 @@ pub struct Memory {
     database: RwLock<Option<Arc<Database>>>,
     /// Embedding 服务（可选，用于向量搜索）
     embedding: RwLock<Option<Arc<EmbeddingService>>>,
+    /// 实体注册表（线程安全，无需数据库）
+    entity_registry: Arc<RwLock<EntityRegistry>>,
+    /// 实体提取器（无状态）
+    entity_extractor: EntityExtractor,
+    /// 对话挖掘器（无状态）
+    convo_miner: ConvoMiner,
+    /// 混合搜索器（无状态）
+    hybrid_searcher: HybridSearcher,
+    /// 近似去重器（无状态）
+    deduplicator: Deduplicator,
+    /// 记忆宫殿图（内存）
+    palace_graph: Arc<RwLock<PalaceGraph>>,
+    /// 4层记忆栈（无状态，按需渲染）
+    memory_stack: MemoryStack,
+    /// 知识图谱（可选，需要数据库）
+    knowledge_graph: RwLock<Option<Arc<KnowledgeGraph>>>,
 }
 
 impl std::fmt::Debug for Memory {
@@ -184,6 +218,7 @@ impl std::fmt::Debug for Memory {
             .field("config", &self.config)
             .field("has_database", &self.has_database())
             .field("has_embedding", &self.has_embedding())
+            .field("has_knowledge_graph", &self.has_knowledge_graph())
             .finish()
     }
 }
@@ -197,6 +232,14 @@ impl Clone for Memory {
             knowledge: Arc::clone(&self.knowledge),
             database: RwLock::new(self.database()),
             embedding: RwLock::new(self.embedding_service()),
+            entity_registry: Arc::clone(&self.entity_registry),
+            entity_extractor: self.entity_extractor.clone(),
+            convo_miner: self.convo_miner.clone(),
+            hybrid_searcher: self.hybrid_searcher.clone(),
+            deduplicator: self.deduplicator.clone(),
+            palace_graph: Arc::clone(&self.palace_graph),
+            memory_stack: self.memory_stack.clone(),
+            knowledge_graph: RwLock::new(self.knowledge_graph()),
         }
     }
 }
@@ -218,6 +261,14 @@ impl Memory {
             knowledge: Arc::new(RwLock::new(KnowledgeMemory::new(config.knowledge_dim))),
             database: RwLock::new(None),
             embedding: RwLock::new(None),
+            entity_registry: Arc::new(RwLock::new(EntityRegistry::new())),
+            entity_extractor: EntityExtractor::new(),
+            convo_miner: ConvoMiner::new(),
+            hybrid_searcher: HybridSearcher::default(),
+            deduplicator: Deduplicator::new(DedupConfig::default()),
+            palace_graph: Arc::new(RwLock::new(PalaceGraph::new())),
+            memory_stack: MemoryStack::new(MemoryLayerConfig::default()),
+            knowledge_graph: RwLock::new(None),
         }
     }
 
@@ -229,8 +280,11 @@ impl Memory {
 
     /// 运行时设置数据库连接
     pub fn set_database(&self, db: Arc<Database>) {
-        *self.database.write().unwrap() = Some(db);
-        tracing::info!("Memory: Database connected for memory persistence");
+        *self.database.write().unwrap() = Some(db.clone());
+        // 同时初始化知识图谱
+        let kg = KnowledgeGraph::new(db);
+        *self.knowledge_graph.write().unwrap() = Some(Arc::new(kg));
+        tracing::info!("Memory: Database connected, knowledge graph initialized");
     }
 
     /// 获取数据库存储（如果有）
@@ -263,6 +317,51 @@ impl Memory {
     /// 检查是否有 embedding 服务
     pub fn has_embedding(&self) -> bool {
         self.embedding.read().unwrap().is_some()
+    }
+
+    /// 获取知识图谱（如果有）
+    pub fn knowledge_graph(&self) -> Option<Arc<KnowledgeGraph>> {
+        self.knowledge_graph.read().unwrap().clone()
+    }
+
+    /// 检查是否有知识图谱
+    pub fn has_knowledge_graph(&self) -> bool {
+        self.knowledge_graph.read().unwrap().is_some()
+    }
+
+    /// 获取实体注册表
+    pub fn entity_registry(&self) -> &Arc<RwLock<EntityRegistry>> {
+        &self.entity_registry
+    }
+
+    /// 获取实体提取器
+    pub fn entity_extractor(&self) -> &EntityExtractor {
+        &self.entity_extractor
+    }
+
+    /// 获取对话挖掘器
+    pub fn convo_miner(&self) -> &ConvoMiner {
+        &self.convo_miner
+    }
+
+    /// 获取混合搜索器
+    pub fn hybrid_searcher(&self) -> &HybridSearcher {
+        &self.hybrid_searcher
+    }
+
+    /// 获取去重器
+    pub fn deduplicator(&self) -> &Deduplicator {
+        &self.deduplicator
+    }
+
+    /// 获取记忆宫殿图
+    pub fn palace_graph(&self) -> &Arc<RwLock<PalaceGraph>> {
+        &self.palace_graph
+    }
+
+    /// 获取4层记忆栈
+    pub fn memory_stack(&self) -> &MemoryStack {
+        &self.memory_stack
     }
 
     /// 写入短期记忆

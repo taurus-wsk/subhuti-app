@@ -1,20 +1,3 @@
-//! Subhuti HTTP Server - 统一网关架构
-//!
-//! 运行: cargo run --bin http_server
-//!
-//! 设计理念：
-//! - **统一网关**：单一入口，智能路由到对应 Skill
-//! - **Skill 路由**：AI 自动判断调用哪个 Skill
-//! - **三层 Flow 概念**：框架核心 / Skill 模板 / 组合 Skill
-//! - **流式输出**：除工具调用外，其他场景使用 SSE 流式输出
-//!
-//! API 路径设计：
-//! - POST /api/v1/chat                    # 统一入口，AI 自动判断
-//! - POST /api/v1/skills                 # 列出所有 Skill
-//! - POST /api/v1/skills/{name}         # 执行指定 Skill
-//! - POST /api/v1/skills/{name}/stream  # 流式执行
-//! - GET  /api/v1/health                 # 健康检查
-
 use anyhow::Result;
 use axum::{
     body::{Body, Bytes},
@@ -32,121 +15,222 @@ use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 
-// 中间件模块
-mod middleware;
-use middleware::{RequestLogLayer, TraceIdLayer};
-
-// 配置模块
-mod config;
-use config::AppConfig;
-
-// 导入 subhuti 核心（使用框架统一配置）
 use async_trait::async_trait;
 use chrono::Local;
 use serde_json::Value;
 use subhuti::{
     runtime::tools::{Tool, ToolInfo, ToolResult},
     skill::{CalculatorSkill, DefaultChatSkill, FlowTemplate, SearchLongMemorySkill, WeatherSkill},
-    DispatchStrategy, FlowConfig, LLMConfig, LLMProvider, MemoryConfig, RuntimeConfig,
-    SessionRecordParams, Subhuti, SubhutiConfig,
+    FlowConfig, LLMConfig, LLMProvider, MemoryConfig, RuntimeConfig, SessionRecordParams, Subhuti,
+    SubhutiConfig,
 };
 
-// ============================================================
-// 第二部分：会话级依赖（对应 HTTP 的 Scoped）
-// ============================================================
+use crate::config::AppConfig;
+use crate::middleware::{RequestLogLayer, TraceIdLayer};
 
-/// 会话上下文（会话级，每次对话创建一次）
-pub struct SessionContext {
-    /// 会话 ID
-    pub session_id: String,
-    /// 用户 ID
-    pub user_id: String,
-    /// 创建时间
-    pub created_at: String,
-}
+pub async fn start_server() -> Result<()> {
+    let _log_guard = crate::middleware::init_logging();
 
-impl SessionContext {
-    pub fn new(user_id: String) -> Self {
-        Self {
-            session_id: uuid_v4(),
-            user_id,
-            created_at: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        }
+    tracing::info!("Starting Subhuti HTTP Server...");
+    tracing::info!("Log files will be written to ./logs/ directory");
+
+    dotenvy::dotenv().ok();
+
+    let app_config = AppConfig::load().unwrap_or_else(|e| {
+        eprintln!("⚠️  配置加载失败: {}", e);
+        eprintln!("   使用默认配置");
+        crate::config::default_config()
+    });
+
+    let config = SubhutiConfig {
+        llm: LLMConfig {
+            model: app_config.llm.model.clone(),
+            api_url: app_config.llm.api_url.clone(),
+            api_key: std::env::var("DOUBAO_API_KEY").ok(),
+            temperature: app_config.llm.temperature as f32,
+            max_tokens: app_config.llm.max_tokens,
+        },
+        provider: if app_config.test_mode.enabled {
+            LLMProvider::Custom
+        } else {
+            match app_config.llm.provider.as_str() {
+                "openai" => LLMProvider::OpenAI,
+                "ollama" => LLMProvider::Ollama,
+                "doubao" => LLMProvider::Doubao,
+                _ => LLMProvider::Doubao,
+            }
+        },
+        runtime: RuntimeConfig::default(),
+        memory: MemoryConfig::default(),
+        flow: FlowConfig::default(),
+        db: None,
+    };
+
+    tracing::info!(
+        "LLM Config: provider={}, model={}, test_mode={}",
+        match config.provider {
+            LLMProvider::OpenAI => "OpenAI",
+            LLMProvider::Ollama => "Ollama",
+            LLMProvider::Doubao => "Doubao",
+            LLMProvider::Custom => "MockLLM",
+        },
+        config.llm.model,
+        app_config.test_mode.enabled
+    );
+
+    let mut subhuti = create_agent(config);
+
+    if app_config.test_mode.enabled {
+        let mock_client = subhuti::runtime::llm::MockLlmClient::new(
+            subhuti::runtime::llm::LLMConfig {
+                model: "mock-llm".to_string(),
+                api_url: "mock://local".to_string(),
+                api_key: None,
+                temperature: 0.0,
+                max_tokens: 1024,
+            },
+            &app_config.test_mode.mock_responses_path,
+            app_config.test_mode.mock_delay_ms,
+        );
+        subhuti
+            .runtime()
+            .set_llm(subhuti::runtime::llm::LLMClient::Mock(mock_client));
+        tracing::info!(
+            "✅ 测试模式已启用，使用 Mock LLM (延迟: {}ms)",
+            app_config.test_mode.mock_delay_ms
+        );
     }
+
+    let db_config = subhuti::DbConfig {
+        host: app_config.database.host.clone(),
+        port: app_config.database.port,
+        database: app_config.database.database.clone(),
+        username: app_config.database.username.clone(),
+        password: app_config.database.password.clone(),
+        max_connections: app_config.database.max_connections,
+    };
+
+    match subhuti.init_database(&db_config).await {
+        Ok(_) => tracing::info!("Database initialized successfully"),
+        Err(e) => tracing::warn!("Database initialization failed (using file storage): {}", e),
+    }
+
+    subhuti.sync_experts_to_orchestrator().await;
+
+    let subhuti = Arc::new(subhuti);
+    tracing::info!(
+        "Agent built with {} skills, {} tools",
+        subhuti.skill_count(),
+        subhuti.runtime().get_tools().len()
+    );
+
+    let app = Router::new()
+        .route("/subhuti/api/v1/chat", post(chat_handler))
+        .route("/subhuti/api/v1/chat/stream", post(chat_stream_handler))
+        .route("/subhuti/api/v1/skills", post(skill_list_handler))
+        .route("/subhuti/api/v1/skills", get(skill_list_handler))
+        .route("/subhuti/api/v1/skills/:name", post(skill_execute_handler))
+        .route(
+            "/subhuti/api/v1/skills/:name/stream",
+            post(skill_execute_stream_handler),
+        )
+        .route("/subhuti/api/v1/health", get(health_handler))
+        .route(
+            "/subhuti/api/v1/health/detailed",
+            get(health_detailed_handler),
+        )
+        .route("/subhuti/api/v1/logs", get(logs_handler))
+        .route("/subhuti/api/v1/persona", get(persona_handler))
+        .route(
+            "/subhuti/api/v1/persona/evolve",
+            post(persona_evolve_handler),
+        )
+        .route(
+            "/subhuti/api/v1/persona/feedback",
+            post(persona_feedback_handler),
+        )
+        .route("/subhuti/api/v1/palace/stats", get(palace_stats_handler))
+        .route("/subhuti/api/v1/palace/forget", post(palace_forget_handler))
+        .route("/subhuti/api/v1/palace/search", post(palace_search_handler))
+        .route("/subhuti/api/v1/experts", get(experts_list_handler))
+        .route(
+            "/subhuti/api/v1/experts/plugins",
+            get(experts_plugins_handler),
+        )
+        .route(
+            "/subhuti/api/v1/experts/active",
+            get(experts_active_handler),
+        )
+        .route(
+            "/subhuti/api/v1/experts/:id/activate",
+            post(experts_activate_handler),
+        )
+        .route(
+            "/subhuti/api/v1/experts/deactivate",
+            post(experts_deactivate_handler),
+        )
+        .route(
+            "/subhuti/api/v1/experts/:id/enable",
+            post(experts_enable_handler),
+        )
+        .route(
+            "/subhuti/api/v1/experts/:id/disable",
+            post(experts_disable_handler),
+        )
+        .route("/subhuti/api/v1/experts/match", post(experts_match_handler))
+        .route("/subhuti/api/v1/orchestrate", post(orchestrate_handler))
+        .route(
+            "/subhuti/api/v1/orchestrate/analyze",
+            post(orchestrate_analyze_handler),
+        )
+        .route(
+            "/subhuti/api/v1/orchestrate/match",
+            post(orchestrate_match_handler),
+        )
+        .route(
+            "/subhuti/api/v1/orchestrate/experts",
+            get(orchestrate_experts_handler),
+        )
+        .route("/subhuti/api/v1/traces", get(traces_list_handler))
+        .route("/subhuti/api/v1/traces/:id", get(traces_get_handler))
+        .route("/subhuti/api/v1/traces/:id/tree", get(traces_tree_handler))
+        .route("/subhuti/api/v1/sessions", get(sessions_list_handler))
+        .route("/subhuti/api/v1/sessions/:id", get(sessions_get_handler))
+        .nest_service("/subhuti/test", ServeDir::new("static"))
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
+        .layer(RequestLogLayer)
+        .layer(TraceIdLayer)
+        .with_state(AppState {
+            subhuti,
+            trace_observer: Arc::new(subhuti::observe::TraceObserver::new()),
+            session_observer: Arc::new(subhuti::observe::SessionObserver::new()),
+        });
+
+    let addr = app_config.http.addr.clone();
+
+    tracing::info!("Server listening on {}", addr);
+
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
 }
 
-// ============================================================
-// 第三部分：手工 DI 容器（最地道 Rust 方案）
-// ============================================================
-
-/*
-三层 Flow 概念（必须分清）：
-
-1. 框架核心主流程（ReAct Loop）
-   - 位置：Flow 层内置
-   - 注册：不用注册，框架内置
-   - 职责：Agent 的调度大脑
-
-2. Skill 内流程模板（FlowStep）
-   - 位置：Skill 的 flow_steps() 方法
-   - 注册：不用注册，Skill 自己定义
-   - 职责：代码复用骨架
-
-3. 跨 Skill 业务工作流
-   - 位置：包装成「组合 Skill」
-   - 注册：像普通 Skill 一样注册
-   - 职责：复杂业务编排
-*/
-
-// ============================================================
-// 第三部分：Skill 层（手工 DI）
-// ============================================================
-
-/// 创建配置好的 Subhuti 实例（使用框架统一配置）
-pub fn create_agent(config: SubhutiConfig) -> Subhuti {
+fn create_agent(config: SubhutiConfig) -> Subhuti {
     let subhuti = Subhuti::with_config(config);
-
-    // 注册内置 Skill
     subhuti.register_skill(WeatherSkill);
     subhuti.register_skill(CalculatorSkill);
-    subhuti.register_skill(SearchLongMemorySkill); // 长期记忆检索
-    subhuti.register_skill(DefaultChatSkill); // 默认聊天 Skill
-
-    // 注册工具
+    subhuti.register_skill(SearchLongMemorySkill);
+    subhuti.register_skill(DefaultChatSkill);
     subhuti.runtime().register_tool(CalculatorTool);
-
-    // 注册专家插件
     subhuti.register_expert(subhuti_expert_psychology::PsychologyExpert::new());
-
     subhuti
 }
-
-// ============================================================
-// 第四部分：三层 Flow 概念落地
-// ============================================================
-
-/*
-三层 Flow 概念（必须分清）：
-
-1. 框架核心主流程（ReAct Loop）
-   - 位置：Flow 层内置
-   - 注册：不用注册，框架内置
-   - 职责：Agent 的调度大脑
-
-2. Skill 内流程模板（FlowStep）
-   - 位置：Skill 的 flow_steps() 方法
-   - 注册：不用注册，Skill 自己定义
-   - 职责：代码复用骨架
-
-3. 跨 Skill 业务工作流
-   - 位置：包装成「组合 Skill」
-   - 注册：像普通 Skill 一样注册
-   - 职责：复杂业务编排
-*/
-
-// ============================================================
-// 第五部分：内置工具实现
-// ============================================================
 
 struct CalculatorTool;
 
@@ -167,9 +251,7 @@ impl Tool for CalculatorTool {
             .get("expression")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-
         let result = simple_calculate(expr);
-
         Ok(ToolResult {
             success: true,
             content: result,
@@ -180,7 +262,6 @@ impl Tool for CalculatorTool {
 
 fn simple_calculate(expr: &str) -> String {
     let expr = expr.replace(" ", "");
-
     if let Some(pos) = expr.find('+') {
         if let (Ok(a), Ok(b)) = (expr[..pos].parse::<f64>(), expr[pos + 1..].parse::<f64>()) {
             return (a + b).to_string();
@@ -203,96 +284,54 @@ fn simple_calculate(expr: &str) -> String {
             }
         }
     }
-
     format!("无法计算: {}", expr)
 }
 
-// ============================================================
-// 第六部分：HTTP API 定义
-// ============================================================
-
-/// Chat 请求
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
     pub message: String,
     pub user_id: Option<String>,
     pub session_id: Option<String>,
-    /// 直接指定使用的 Skill 名称（可选）
-    /// 如果指定，则直接使用该 Skill，不进行智能匹配
     pub skill: Option<String>,
-    /// 流程模板（可选）
-    /// - 当有 Skill 匹配时：作为 Skill 的流程模板
-    /// - 当没有 Skill 匹配时：作为框架的 Flow 类型
     pub flow_template: Option<String>,
 }
 
-/// Chat 响应
 #[derive(Debug, Serialize)]
 pub struct ChatResponse {
     pub response: String,
     pub session_id: String,
-    /// Trace ID（用于追踪请求）
     pub trace_id: String,
     pub skill_used: Option<String>,
-    /// 技能调用链（展示 AI 判断过程）
     pub chain: Vec<String>,
-    /// 请求处理耗时（毫秒）
     pub duration_ms: u64,
-    /// 使用的模型
     pub model: Option<String>,
-    /// Prompt Token 数量
     pub prompt_tokens: u32,
-    /// Completion Token 数量
     pub completion_tokens: u32,
-    /// 总 Token 数量
     pub total_tokens: u32,
 }
 
-/// Skill 执行请求
 #[derive(Debug, Deserialize)]
 pub struct SkillExecuteRequest {
     pub message: String,
     pub user_id: Option<String>,
     pub session_id: Option<String>,
-    /// 流程模板（可选，覆盖 Skill 默认模板）
     pub flow_template: Option<String>,
 }
 
-/// Skill 列表响应
 #[derive(Debug, Serialize)]
 pub struct SkillListResponse {
     pub skills: Vec<SkillInfoItem>,
 }
 
-/// Skill 信息项
 #[derive(Debug, Serialize)]
 pub struct SkillInfoItem {
     pub name: String,
     pub description: String,
-    /// 使用的流程模板
     pub flow_template: Option<String>,
-    /// 所有实现的流程模板版本
     pub flow_templates: Vec<String>,
-    /// 优先级
     pub priority: i32,
 }
 
-/// 会话历史响应
-#[derive(Debug, Serialize)]
-pub struct HistoryResponse {
-    pub session_id: String,
-    pub messages: Vec<MessageItem>,
-}
-
-/// 消息项
-#[derive(Debug, Serialize)]
-pub struct MessageItem {
-    pub role: String,
-    pub content: String,
-    pub timestamp: String,
-}
-
-/// 性格快照响应
 #[derive(Debug, Serialize)]
 pub struct PersonaResponse {
     pub version: u32,
@@ -310,7 +349,6 @@ pub struct PersonaResponse {
     pub updated_at: String,
 }
 
-/// 性格五维响应
 #[derive(Debug, Serialize)]
 pub struct BigFiveResponse {
     pub openness: f32,
@@ -320,7 +358,6 @@ pub struct BigFiveResponse {
     pub neuroticism: f32,
 }
 
-/// 互动统计响应
 #[derive(Debug, Serialize)]
 pub struct InteractionStatsResponse {
     pub total_interactions: u32,
@@ -330,7 +367,6 @@ pub struct InteractionStatsResponse {
     pub dislikes: u32,
 }
 
-/// 演化结果响应
 #[derive(Debug, Serialize)]
 pub struct EvolveResponse {
     pub success: bool,
@@ -339,7 +375,6 @@ pub struct EvolveResponse {
     pub message: String,
 }
 
-/// 反馈请求
 #[derive(Debug, Deserialize)]
 pub struct FeedbackRequest {
     pub feedback_type: String,
@@ -347,7 +382,6 @@ pub struct FeedbackRequest {
     pub skill_name: String,
 }
 
-/// 反馈响应
 #[derive(Debug, Serialize)]
 pub struct FeedbackResponse {
     pub success: bool,
@@ -356,74 +390,20 @@ pub struct FeedbackResponse {
     pub message: String,
 }
 
-/// 错误响应
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
     pub error: String,
     pub code: u16,
 }
 
-// ── 编排器 API 类型 ──────────────────────────────────────
-
-/// 编排器执行请求
 #[derive(Debug, Deserialize)]
 pub struct OrchestrateRequest {
     pub message: String,
     pub user_id: Option<String>,
     pub session_id: Option<String>,
-    /// 强制使用指定的调度策略
-    pub strategy: Option<String>,
+    pub chain: Option<String>,
 }
 
-/// 编排器执行响应
-#[derive(Debug, Serialize)]
-pub struct OrchestrateResponse {
-    pub success: bool,
-    pub output: String,
-    pub session_id: String,
-    pub trace_id: String,
-    pub strategy: String,
-    pub expert_chain: Vec<String>,
-    pub expert_outputs: std::collections::HashMap<String, String>,
-    pub duration_ms: u64,
-    pub critique_rounds: usize,
-}
-
-/// 任务分析响应
-#[derive(Debug, Serialize)]
-pub struct TaskAnalysisResponse {
-    pub success: bool,
-    pub domains: Vec<String>,
-    pub complexity: String,
-    pub needs_collaboration: bool,
-    pub has_dependencies: bool,
-    pub needs_review: bool,
-    pub user_intent: String,
-    pub suggested_strategy: String,
-}
-
-/// 专家匹配响应
-#[derive(Debug, Serialize)]
-pub struct ExpertMatchResponse {
-    pub success: bool,
-    pub matches: Vec<ExpertMatchItem>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ExpertMatchItem {
-    pub expert_id: String,
-    pub expert_name: String,
-    pub domain_match: f32,
-    pub capability_coverage: f32,
-    pub historical_score: f32,
-    pub overall_score: f32,
-}
-
-// ============================================================
-// 第七部分：Axum Handler 实现
-// ============================================================
-
-/// 应用状态（包含 Subhuti 实例）
 #[derive(Clone)]
 struct AppState {
     subhuti: Arc<Subhuti>,
@@ -431,7 +411,6 @@ struct AppState {
     session_observer: Arc<subhuti::observe::SessionObserver>,
 }
 
-/// 统一响应枚举
 #[derive(Debug)]
 enum ApiResponse {
     Success(ChatResponse),
@@ -447,7 +426,6 @@ impl IntoResponse for ApiResponse {
     }
 }
 
-/// 解析 flow_template 字符串为 FlowTemplate 枚举
 fn parse_flow_template(template_str: &str) -> Option<FlowTemplate> {
     match template_str.to_lowercase().as_str() {
         "simple" => Some(FlowTemplate::Simple),
@@ -458,13 +436,8 @@ fn parse_flow_template(template_str: &str) -> Option<FlowTemplate> {
     }
 }
 
-/// Chat 处理函数 - 统一网关入口
-///
-/// AI 自动判断调用哪个 Skill，返回调用链信息
-/// 已集成 Trace 追踪和 LLM 重试机制
 async fn chat_handler(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> ApiResponse {
     let start_time = std::time::Instant::now();
-
     let user_id = req.user_id.unwrap_or_else(|| "anonymous".to_string());
     let session_id = req.session_id.unwrap_or_else(uuid_v4);
 
@@ -477,22 +450,14 @@ async fn chat_handler(State(state): State<AppState>, Json(req): Json<ChatRequest
         req.flow_template
     );
 
-    // 创建 Trace
     let mut trace = state
         .trace_observer
         .create_trace(&user_id, &session_id, &req.message);
     let trace_id = trace.id.0.clone();
 
-    // 解析 flow_template（统一参数）
     let flow_template = req.flow_template.as_deref().and_then(parse_flow_template);
-
-    // 记录当前激活的专家
-    if let Some(expert_id) = state.subhuti.active_expert_id() {
-        trace.record_expert(&expert_id);
-    }
-
-    // 调用 Agent（支持显式 Skill 指定和流程模板选择）
     let skill_name = req.skill.as_deref();
+
     match state
         .subhuti
         .run_simple_with_template(&user_id, &req.message, skill_name, flow_template)
@@ -501,21 +466,9 @@ async fn chat_handler(State(state): State<AppState>, Json(req): Json<ChatRequest
         Ok((response, skill_used, tokens)) => {
             let duration_ms = start_time.elapsed().as_millis() as u64;
 
-            // 记录 Skill 匹配
-            if let Some(ref skill) = skill_used {
-                trace.record_skill_match(skill, 1.0);
-            }
-
-            // 记录 LLM Token 消耗
-            trace.record_llm_call(tokens.prompt_tokens as u64, tokens.completion_tokens as u64);
-
-            // 完成 Trace
-            trace.complete(response.clone());
-
-            // 存储 Trace
+            trace.complete_success(response.clone(), duration_ms);
             state.trace_observer.store_trace(trace);
 
-            // 记录 Session
             let token_usage_str = format!("{{\"total_tokens\": {}}}", tokens.total_tokens);
             state.session_observer.record_request(&SessionRecordParams {
                 session_id: &session_id,
@@ -538,7 +491,6 @@ async fn chat_handler(State(state): State<AppState>, Json(req): Json<ChatRequest
                 trace_id
             );
 
-            // 构建技能调用链
             let mut chain = Vec::new();
             if let Some(ref skill) = skill_used {
                 chain.push(skill.clone());
@@ -560,14 +512,7 @@ async fn chat_handler(State(state): State<AppState>, Json(req): Json<ChatRequest
         Err(e) => {
             let duration_ms = start_time.elapsed().as_millis() as u64;
 
-            // 失败的 Span
-            let span_id = trace.create_span(
-                subhuti::observe::SpanKind::Response,
-                "error_response".to_string(),
-            );
-            trace.fail_span(&span_id, e.to_string());
-
-            // 存储 Trace（失败也保存）
+            trace.complete_failed(e.to_string(), duration_ms);
             state.trace_observer.store_trace(trace);
 
             tracing::error!(
@@ -584,10 +529,6 @@ async fn chat_handler(State(state): State<AppState>, Json(req): Json<ChatRequest
     }
 }
 
-/// Chat 流式处理函数（SSE）
-///
-/// 使用 Server-Sent Events 实现流式输出
-/// 除工具调用外，其他场景使用流式输出
 async fn chat_stream_handler(
     State(state): State<AppState>,
     Json(req): Json<ChatRequest>,
@@ -602,11 +543,9 @@ async fn chat_stream_handler(
         req.message
     );
 
-    // 创建 channel 用于流式输出
     let (tx, rx) = tokio::sync::mpsc::channel(100);
     let tx_clone = Arc::new(tx);
 
-    // 启动后台任务执行 Agent
     let subhuti_clone = state.subhuti.clone();
     let message_clone = req.message.clone();
     let user_id_clone = user_id.clone();
@@ -624,7 +563,6 @@ async fn chat_stream_handler(
         let _ = tx_arc.blocking_send("[DONE]".to_string());
     });
 
-    // 将 mpsc receiver 转换为 TryStream
     let stream = ReceiverStream::new(rx).map(|chunk| -> Result<Bytes, IoError> {
         let data = if chunk == "[DONE]" {
             Bytes::from("event: done\ndata: true\n\n")
@@ -639,7 +577,6 @@ async fn chat_stream_handler(
         Ok(data)
     });
 
-    // 发送初始响应（包含 session_id）
     let session_id_clone = session_id.clone();
     let initial_stream = futures::stream::once(async move {
         Ok::<Bytes, IoError>(Bytes::from(format!(
@@ -648,10 +585,8 @@ async fn chat_stream_handler(
         )))
     });
 
-    // 创建组合流：初始数据 + 后续流式数据
     let stream = initial_stream.chain(stream);
 
-    // 使用流式响应
     axum::response::Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "text/event-stream")
@@ -661,8 +596,6 @@ async fn chat_stream_handler(
         .unwrap()
 }
 
-/// 健康检查
-/// 获取当前性格快照
 async fn persona_handler(State(state): State<AppState>) -> impl IntoResponse {
     let profile = state.subhuti.soul_profile();
     let since_evolve = state.subhuti.interactions_since_last_evolve();
@@ -713,7 +646,6 @@ async fn persona_handler(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::OK, Json(resp))
 }
 
-/// 手动触发挥化
 async fn persona_evolve_handler(State(state): State<AppState>) -> Json<EvolveResponse> {
     let old_version = state.subhuti.soul_profile().version;
 
@@ -736,7 +668,6 @@ async fn persona_evolve_handler(State(state): State<AppState>) -> Json<EvolveRes
     }
 }
 
-/// 用户反馈（点赞/踩/评论）
 async fn persona_feedback_handler(
     State(state): State<AppState>,
     Json(req): Json<FeedbackRequest>,
@@ -772,9 +703,6 @@ async fn persona_feedback_handler(
     })
 }
 
-// ── 心灵宫殿 API ──────────────────────────────────────────
-
-/// 心灵宫殿统计信息
 async fn palace_stats_handler(State(state): State<AppState>) -> impl IntoResponse {
     let stats = state.subhuti.palace_stats();
     (
@@ -798,7 +726,6 @@ async fn palace_stats_handler(State(state): State<AppState>) -> impl IntoRespons
     )
 }
 
-/// 执行遗忘周期
 async fn palace_forget_handler(State(state): State<AppState>) -> impl IntoResponse {
     let forgotten = state.subhuti.run_forget_cycle();
     (
@@ -811,7 +738,6 @@ async fn palace_forget_handler(State(state): State<AppState>) -> impl IntoRespon
     )
 }
 
-/// 心灵宫殿搜索
 #[derive(Debug, Deserialize)]
 struct PalaceSearchRequest {
     query: String,
@@ -868,9 +794,6 @@ async fn palace_search_handler(
     )
 }
 
-// ── 专家插件 API ──────────────────────────────────────────
-
-/// 专家列表
 async fn experts_list_handler(State(state): State<AppState>) -> impl IntoResponse {
     let experts = state.subhuti.list_experts();
     (
@@ -883,7 +806,6 @@ async fn experts_list_handler(State(state): State<AppState>) -> impl IntoRespons
     )
 }
 
-/// 当前激活的专家
 async fn experts_active_handler(State(state): State<AppState>) -> impl IntoResponse {
     let active = state.subhuti.active_expert_info();
     (
@@ -921,7 +843,6 @@ async fn experts_activate_handler(
     }
 }
 
-/// 停用专家
 async fn experts_deactivate_handler(State(state): State<AppState>) -> impl IntoResponse {
     match state.subhuti.deactivate_expert() {
         Ok(_) => (
@@ -941,7 +862,6 @@ async fn experts_deactivate_handler(State(state): State<AppState>) -> impl IntoR
     }
 }
 
-/// 匹配专家请求
 #[derive(Debug, Deserialize)]
 struct MatchExpertRequest {
     input: String,
@@ -961,7 +881,6 @@ async fn experts_match_handler(
     )
 }
 
-/// 获取所有插件的详细信息（包括状态）
 async fn experts_plugins_handler(State(state): State<AppState>) -> impl IntoResponse {
     let plugins = state.subhuti.list_plugins();
     let plugins_json: Vec<serde_json::Value> = plugins
@@ -1007,7 +926,6 @@ async fn experts_plugins_handler(State(state): State<AppState>) -> impl IntoResp
     )
 }
 
-/// 启用插件
 async fn experts_enable_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1031,7 +949,6 @@ async fn experts_enable_handler(
     }
 }
 
-/// 停用插件
 async fn experts_disable_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1055,20 +972,15 @@ async fn experts_disable_handler(
     }
 }
 
-// ── Trace 追踪 API ──────────────────────────────────────
-
-/// 获取 Trace 列表（摘要）
 async fn traces_list_handler(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     let summaries = state.trace_observer.list_summaries();
 
-    // 检查是否请求 HTML
     let format = params.get("format").map(|s| s.as_str()).unwrap_or("json");
 
     if format == "html" {
-        // 返回 HTML 页面
         let html = generate_traces_list_html(&summaries);
         return (
             StatusCode::OK,
@@ -1078,7 +990,6 @@ async fn traces_list_handler(
             .into_response();
     }
 
-    // 默认返回 JSON
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -1090,7 +1001,6 @@ async fn traces_list_handler(
         .into_response()
 }
 
-/// 获取单个 Trace 详情
 async fn traces_get_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1098,12 +1008,10 @@ async fn traces_get_handler(
 ) -> impl IntoResponse {
     match state.trace_observer.get_trace(&id) {
         Some(trace) => {
-            // 检查是否请求 HTML
             let format = params.get("format").map(|s| s.as_str()).unwrap_or("json");
 
             if format == "html" {
-                // 返回 HTML 页面
-                let html = generate_trace_detail_html(&trace);
+                let html = generate_trace_detail_html(trace);
                 return (
                     StatusCode::OK,
                     [("Content-Type", "text/html; charset=utf-8")],
@@ -1112,7 +1020,6 @@ async fn traces_get_handler(
                     .into_response();
             }
 
-            // 默认返回 JSON
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -1136,7 +1043,6 @@ async fn traces_get_handler(
     }
 }
 
-/// 获取 Trace 的 Span 树（可视化）
 async fn traces_tree_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1159,9 +1065,6 @@ async fn traces_tree_handler(
     }
 }
 
-// ── Session 查询 API ──────────────────────────────────────
-
-/// 获取 Session 列表
 async fn sessions_list_handler(State(state): State<AppState>) -> impl IntoResponse {
     let sessions = state.session_observer.list_sessions();
     (
@@ -1174,7 +1077,6 @@ async fn sessions_list_handler(State(state): State<AppState>) -> impl IntoRespon
     )
 }
 
-/// 获取 Session 详情
 async fn sessions_get_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1197,41 +1099,50 @@ async fn sessions_get_handler(
     }
 }
 
-// ── 编排器 API Handler ──────────────────────────────────
-
-/// 编排器执行入口
 async fn orchestrate_handler(
     State(state): State<AppState>,
     Json(req): Json<OrchestrateRequest>,
 ) -> axum::response::Response {
     let start_time = std::time::Instant::now();
-    let user_id = req.user_id.unwrap_or_else(|| "anonymous".to_string());
-    let session_id = req.session_id.unwrap_or_else(uuid_v4);
 
-    tracing::info!(
-        "Orchestrate request: user={}, session={}, message={}, strategy={:?}",
-        user_id,
-        session_id,
-        req.message,
-        req.strategy
-    );
+    let user_id = req
+        .user_id
+        .clone()
+        .unwrap_or_else(|| "anonymous".to_string());
+    let session_id = req.session_id.clone().unwrap_or_else(uuid_v4);
 
-    // 创建 Trace
     let mut trace = state
         .trace_observer
         .create_trace(&user_id, &session_id, &req.message);
     let trace_id = trace.id.0.clone();
 
-    let strategy = req.strategy.as_deref().map(parse_dispatch_strategy);
+    let span = tracing::info_span!(
+        "orchestrate",
+        %trace_id,
+        %user_id,
+        %session_id,
+        message_len = req.message.len(),
+        chain = ?req.chain,
+    );
+    let _enter = span.enter();
 
-    let result = match strategy {
-        Some(strat) => {
+    tracing::info!("收到编排请求");
+
+    let result = match &req.chain {
+        Some(chain_name) => {
+            tracing::info!("使用指定链路: {}", chain_name);
             state
                 .subhuti
-                .run_orchestrated_with_strategy(&req.message, &user_id, strat)
+                .run_orchestrated_with_strategy(&req.message, &user_id, chain_name)
                 .await
         }
-        None => state.subhuti.run_orchestrated(&req.message, &user_id).await,
+        None => {
+            tracing::info!("使用自动链路匹配");
+            state
+                .subhuti
+                .run_orchestrated_with_trace(&req.message, &user_id, &mut trace)
+                .await
+        }
     };
 
     match result {
@@ -1239,25 +1150,14 @@ async fn orchestrate_handler(
             let duration_ms = start_time.elapsed().as_millis() as u64;
 
             tracing::info!(
-                "Orchestrate completed: strategy={:?}, experts={}, duration={}ms, trace_id={}",
+                "编排完成: chain={}, experts={}, duration={}ms",
                 orchestration_result.strategy,
                 orchestration_result.expert_chain.len(),
                 duration_ms,
-                trace_id
             );
 
-            // 记录专家链到 Trace
-            for expert_id in &orchestration_result.expert_chain {
-                trace.record_expert(expert_id);
-            }
+            trace.complete_success(orchestration_result.output.clone(), duration_ms);
 
-            // 完成 Trace
-            trace.complete(orchestration_result.output.clone());
-            state.trace_observer.store_trace(trace);
-
-            // 记录 Session
-            let token_usage = orchestration_result.tokens.total_tokens;
-            let token_usage_str = format!("{{\"total_tokens\": {}}}", token_usage);
             state.session_observer.record_request(&SessionRecordParams {
                 session_id: &session_id,
                 user_id: &user_id,
@@ -1269,7 +1169,10 @@ async fn orchestrate_handler(
                     .expert_chain
                     .first()
                     .map(|s| s.as_str()),
-                token_usage: Some(token_usage_str),
+                token_usage: Some(format!(
+                    "{{\"total_tokens\": {}}}",
+                    orchestration_result.tokens.total_tokens
+                )),
                 status: "Success",
             });
 
@@ -1278,28 +1181,24 @@ async fn orchestrate_handler(
                 "output": orchestration_result.output,
                 "session_id": session_id,
                 "trace_id": trace_id,
-                "strategy": format!("{:?}", orchestration_result.strategy),
+                "chain": orchestration_result.strategy,
                 "expert_chain": orchestration_result.expert_chain,
                 "expert_outputs": orchestration_result.expert_outputs,
                 "duration_ms": duration_ms,
-                "critique_rounds": orchestration_result.critique_records.len(),
-                "critique_records": orchestration_result.critique_records.iter().map(|_c| {
-                    serde_json::json!({})
-                }).collect::<Vec<_>>(),
+                "critique_rounds": 0,
+                "critique_records": [],
             }));
+
+            state.trace_observer.store_trace(trace);
+
             (StatusCode::OK, body).into_response()
         }
         Err(e) => {
             let duration_ms = start_time.elapsed().as_millis() as u64;
-            tracing::error!("Orchestrate error: {}, duration={}ms", e, duration_ms);
 
-            // 失败的 Span
-            let span_id = trace.create_span(
-                subhuti::observe::SpanKind::Response,
-                "error_response".to_string(),
-            );
-            trace.fail_span(&span_id, e.to_string());
-            state.trace_observer.store_trace(trace);
+            tracing::error!("编排错误: {}, duration={}ms", e, duration_ms);
+
+            trace.complete_failed(e.to_string(), duration_ms);
 
             let body = Json(serde_json::json!({
                 "success": false,
@@ -1308,29 +1207,28 @@ async fn orchestrate_handler(
                 "trace_id": trace_id,
                 "duration_ms": duration_ms,
             }));
+
+            state.trace_observer.store_trace(trace);
+
             (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
         }
     }
 }
 
-/// 任务分析（简化版）
 async fn orchestrate_analyze_handler(
     State(state): State<AppState>,
     Json(req): Json<OrchestrateRequest>,
 ) -> axum::response::Response {
     let profile = state.subhuti.analyze_task(&req.message).await;
 
-    // 简化版：只返回基本信息
     let body = Json(serde_json::json!({
         "success": true,
-        "input": profile.input,
-        "target_expert": profile.target_expert,
+        "profile": profile,
         "suggested_strategy": "SimpleDispatch",
     }));
     (StatusCode::OK, body).into_response()
 }
 
-/// 专家匹配（简化版）
 async fn orchestrate_match_handler(
     State(state): State<AppState>,
     Json(_req): Json<OrchestrateRequest>,
@@ -1345,7 +1243,6 @@ async fn orchestrate_match_handler(
     (StatusCode::OK, body).into_response()
 }
 
-/// 编排器专家列表
 async fn orchestrate_experts_handler(State(state): State<AppState>) -> axum::response::Response {
     let experts = state.subhuti.list_orchestrator_experts().await;
 
@@ -1355,15 +1252,6 @@ async fn orchestrate_experts_handler(State(state): State<AppState>) -> axum::res
         "total": experts.len(),
     }));
     (StatusCode::OK, body).into_response()
-}
-
-/// 解析调度策略字符串
-fn parse_dispatch_strategy(s: &str) -> DispatchStrategy {
-    match s.to_lowercase().as_str() {
-        "simple" | "simple_dispatch" | "simpledispatch" => DispatchStrategy::SimpleDispatch,
-        "pipeline" => DispatchStrategy::Pipeline,
-        _ => DispatchStrategy::SimpleDispatch,
-    }
 }
 
 async fn health_handler() -> impl IntoResponse {
@@ -1376,7 +1264,6 @@ async fn health_handler() -> impl IntoResponse {
     )
 }
 
-/// 详细健康检查（包含系统各组件状态）
 async fn health_detailed_handler(State(state): State<AppState>) -> impl IntoResponse {
     let report = state.subhuti.health_check();
 
@@ -1403,20 +1290,18 @@ async fn health_detailed_handler(State(state): State<AppState>) -> impl IntoResp
     )
 }
 
-/// 日志查询参数
 #[derive(Debug, Deserialize)]
 struct LogQueryParams {
     trace_id: Option<String>,
     level: Option<String>,
     target: Option<String>,
     keyword: Option<String>,
-    start: Option<String>, // 新增：开始时间 ISO 8601
-    end: Option<String>,   // 新增：结束时间 ISO 8601
+    start: Option<String>,
+    end: Option<String>,
     page: Option<usize>,
     page_size: Option<usize>,
 }
 
-/// 日志条目
 #[derive(Debug, Clone, Serialize)]
 struct LogEntry {
     timestamp: String,
@@ -1428,7 +1313,6 @@ struct LogEntry {
     line_number: Option<u32>,
 }
 
-/// 日志列表响应
 #[derive(Debug, Serialize)]
 struct LogListResponse {
     total: usize,
@@ -1437,7 +1321,6 @@ struct LogListResponse {
     logs: Vec<LogEntry>,
 }
 
-/// 日志查询处理函数
 async fn logs_handler(
     axum::extract::Query(params): axum::extract::Query<LogQueryParams>,
 ) -> impl IntoResponse {
@@ -1472,8 +1355,6 @@ async fn logs_handler(
     }
 }
 
-/// 读取并过滤日志文件
-/// 日志过滤参数
 #[derive(Debug, Clone)]
 struct LogFilterParams {
     trace_id: Option<String>,
@@ -1495,13 +1376,11 @@ fn read_logs(
     let log_dir = "./logs";
     let mut all_logs: Vec<LogEntry> = Vec::new();
 
-    // 读取日志目录下的所有文件
     let entries = std::fs::read_dir(log_dir)?;
     let mut files: Vec<_> = entries
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_file())
         .collect();
-    // 按文件名排序，最新的文件优先
     files.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
 
     for entry in files {
@@ -1515,7 +1394,6 @@ fn read_logs(
                 continue;
             }
 
-            // 解析 JSON
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
                 let ts = value["timestamp"].as_str().unwrap_or("").to_string();
                 let lv = value["level"].as_str().unwrap_or("").to_string();
@@ -1525,7 +1403,6 @@ fn read_logs(
                 let filename = value["filename"].as_str().map(|s| s.to_string());
                 let line_number = value["line_number"].as_u64().map(|n| n as u32);
 
-                // 过滤 trace_id
                 if let Some(ref tid) = filter.trace_id {
                     let field_tid = fields["trace_id"].as_str().unwrap_or("");
                     if !field_tid.contains(tid) {
@@ -1533,21 +1410,18 @@ fn read_logs(
                     }
                 }
 
-                // 过滤 level
                 if let Some(ref lv_filter) = filter.level {
                     if !lv.eq_ignore_ascii_case(lv_filter) {
                         continue;
                     }
                 }
 
-                // 过滤 target
                 if let Some(ref tgt_filter) = filter.target {
                     if !tgt.contains(tgt_filter) {
                         continue;
                     }
                 }
 
-                // 关键词搜索（在 message 和所有 fields 中搜索）
                 if let Some(ref kw) = filter.keyword {
                     let kw_lower = kw.to_lowercase();
                     let haystack = format!("{} {}", msg, fields).to_lowercase();
@@ -1556,7 +1430,6 @@ fn read_logs(
                     }
                 }
 
-                // 时间范围过滤
                 if let Some(ref start) = filter.start_time {
                     if ts.as_str() < start.as_str() {
                         continue;
@@ -1581,7 +1454,6 @@ fn read_logs(
         }
     }
 
-    // 按时间倒序（最新的在前面）
     all_logs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
     let total = all_logs.len();
@@ -1596,7 +1468,6 @@ fn read_logs(
     Ok((paged_logs, total))
 }
 
-/// Skill 列表处理函数
 async fn skill_list_handler(State(state): State<AppState>) -> impl IntoResponse {
     let skills = state.subhuti.list_skills();
 
@@ -1623,7 +1494,6 @@ async fn skill_list_handler(State(state): State<AppState>) -> impl IntoResponse 
     )
 }
 
-/// Skill 执行处理函数
 async fn skill_execute_handler(
     State(state): State<AppState>,
     Path(skill_name): Path<String>,
@@ -1642,16 +1512,12 @@ async fn skill_execute_handler(
         req.flow_template
     );
 
-    // 解析 flow_template（统一参数）
     let flow_template = req.flow_template.as_deref().and_then(parse_flow_template);
 
-    // 调用指定 Skill（支持动态流程模板选择）
-    // 创建 Trace
     let mut trace = state
         .trace_observer
         .create_trace(&user_id, &session_id, &req.message);
     let trace_id = trace.id.0.clone();
-    trace.record_skill_match(&skill_name, 1.0);
 
     match state
         .subhuti
@@ -1661,9 +1527,7 @@ async fn skill_execute_handler(
         Ok((response, skill_used, tokens)) => {
             let duration_ms = start_time.elapsed().as_millis() as u64;
 
-            // 记录 LLM Token 消耗
-            trace.record_llm_call(tokens.prompt_tokens as u64, tokens.completion_tokens as u64);
-            trace.complete(response.clone());
+            trace.complete_success(response.clone(), duration_ms);
             state.trace_observer.store_trace(trace);
 
             tracing::info!(
@@ -1690,11 +1554,7 @@ async fn skill_execute_handler(
         Err(e) => {
             let duration_ms = start_time.elapsed().as_millis() as u64;
 
-            let span_id = trace.create_span(
-                subhuti::observe::SpanKind::SkillExecute,
-                "skill_error".to_string(),
-            );
-            trace.fail_span(&span_id, e.to_string());
+            trace.complete_failed(e.to_string(), duration_ms);
             state.trace_observer.store_trace(trace);
 
             tracing::error!(
@@ -1711,7 +1571,6 @@ async fn skill_execute_handler(
     }
 }
 
-/// Skill 流式执行处理函数
 async fn skill_execute_stream_handler(
     State(state): State<AppState>,
     Path(skill_name): Path<String>,
@@ -1727,11 +1586,9 @@ async fn skill_execute_stream_handler(
         req.message
     );
 
-    // 创建 channel 用于流式输出
     let (tx, rx) = tokio::sync::mpsc::channel(100);
     let tx_clone = Arc::new(tx);
 
-    // 启动后台任务执行 Skill
     let subhuti_clone = state.subhuti.clone();
     let message_clone = req.message.clone();
     let user_id_clone = user_id.clone();
@@ -1744,15 +1601,12 @@ async fn skill_execute_stream_handler(
             let _ = tx_for_callback.blocking_send(chunk);
         };
 
-        // 注意：Skill 流式执行需要使用 SkillManager 的流式接口
-        // 这里暂时使用非流式接口，后续可以优化
         let _ = subhuti_clone
             .run_simple_with_skill(&user_id_clone, &message_clone, Some(&skill_name_clone))
             .await;
         let _ = tx_clone.blocking_send("[DONE]".to_string());
     });
 
-    // 转换流
     let stream = ReceiverStream::new(rx).map(|chunk| -> Result<Bytes, IoError> {
         let data = if chunk == "[DONE]" {
             Bytes::from("event: done\ndata: true\n\n")
@@ -1767,7 +1621,6 @@ async fn skill_execute_stream_handler(
         Ok(data)
     });
 
-    // 发送初始响应（包含 session_id）
     let session_id_clone = session_id.clone();
     let initial_stream = futures::stream::once(async move {
         Ok::<Bytes, IoError>(Bytes::from(format!(
@@ -1787,13 +1640,8 @@ async fn skill_execute_stream_handler(
         .unwrap()
 }
 
-// ============================================================
-// 第八部分：HTML 生成函数
-// ============================================================
-
-/// 生成 Trace 列表 HTML
-fn generate_traces_list_html(summaries: &[subhuti::observe::TraceSummary]) -> String {
-    let mut html = String::from(
+fn generate_traces_list_html(_summaries: &[(String, String, String)]) -> String {
+    String::from(
         r#"<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1804,68 +1652,20 @@ fn generate_traces_list_html(summaries: &[subhuti::observe::TraceSummary]) -> St
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 40px; background: #f5f5f5; }
         .container { max-width: 1200px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
         h1 { color: #333; border-bottom: 3px solid #4CAF50; padding-bottom: 10px; }
-        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
-        th { background: #4CAF50; color: white; }
-        tr:hover { background: #f5f5f5; }
-        a { color: #4CAF50; text-decoration: none; }
-        a:hover { text-decoration: underline; }
-        .badge { padding: 4px 8px; border-radius: 4px; font-size: 12px; }
-        .success { background: #4CAF50; color: white; }
-        .error { background: #f44336; color: white; }
+        p { color: #666; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🔍 Trace 列表</h1>"#,
-    );
-
-    html.push_str(&format!("<p>共 {} 个 Trace</p>", summaries.len()));
-    html.push_str("<table>");
-    html.push_str("<tr><th>Trace ID</th><th>输入</th><th>耗时</th><th>Skill</th><th>Tokens</th><th>状态</th></tr>");
-
-    for summary in summaries {
-        let status_class = if matches!(summary.status, subhuti::observe::TraceStatus::Success) {
-            "success"
-        } else {
-            "error"
-        };
-        let status_text = format!("{:?}", summary.status);
-        let duration = summary
-            .duration_ms
-            .map(|d| format!("{}ms", d))
-            .unwrap_or_else(|| "-".to_string());
-        let tokens = summary
-            .token_usage
-            .as_ref()
-            .map(|t| t.total_tokens.to_string())
-            .unwrap_or_else(|| "-".to_string());
-
-        html.push_str(&format!(
-            "<tr>
-                <td><a href='/subhuti/api/v1/traces/{}?format=html'>{}</a></td>
-                <td>{}</td>
-                <td>{}</td>
-                <td>{}</td>
-                <td>{}</td>
-                <td><span class='badge {}'>{}</span></td>
-            </tr>",
-            summary.trace_id,
-            &summary.trace_id[..8],
-            summary.input.chars().take(50).collect::<String>(),
-            duration,
-            summary.matched_skill.as_deref().unwrap_or("-"),
-            tokens,
-            status_class,
-            status_text
-        ));
-    }
-
-    html.push_str("</table></div></body></html>");
-    html
+        <h1>🔍 Trace 列表</h1>
+        <p>Trace 列表功能已迁移到业务埋点层，调试链路请使用标准 tracing 生态工具。</p>
+        <p>可通过 <code>RUST_LOG=debug</code> 环境变量查看详细日志，配合 <code>jq</code> 按 trace_id 过滤。</p>
+    </div>
+</body>
+</html>"#,
+    )
 }
 
-/// 生成 Trace 详情 HTML
 fn generate_trace_detail_html(trace: &subhuti::observe::Trace) -> String {
     let mut html = String::from(
         r#"<!DOCTYPE html>
@@ -1878,16 +1678,14 @@ fn generate_trace_detail_html(trace: &subhuti::observe::Trace) -> String {
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 40px; background: #f5f5f5; }
         .container { max-width: 1200px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
         h1 { color: #333; border-bottom: 3px solid #4CAF50; padding-bottom: 10px; }
-        h2 { color: #555; margin-top: 30px; }
         .info { background: #e8f5e9; padding: 15px; border-radius: 5px; margin: 15px 0; }
         .info p { margin: 8px 0; }
-        .tree { background: #f9f9f9; padding: 20px; border-radius: 5px; font-family: monospace; }
-        .span { margin: 10px 0; padding: 10px; background: white; border-left: 3px solid #4CAF50; }
         .badge { padding: 4px 8px; border-radius: 4px; font-size: 12px; }
         .success { background: #4CAF50; color: white; }
         .error { background: #f44336; color: white; }
         pre { background: #f5f5f5; padding: 15px; border-radius: 5px; overflow-x: auto; }
         a { color: #4CAF50; text-decoration: none; }
+        .expert-chain { margin: 8px 0; padding: 4px 8px; background: #fff3e0; border-radius: 4px; }
     </style>
 </head>
 <body>
@@ -1895,9 +1693,16 @@ fn generate_trace_detail_html(trace: &subhuti::observe::Trace) -> String {
         <h1>🔍 Trace 详情</h1>"#,
     );
 
-    // 基本信息
     html.push_str("<div class='info'>");
     html.push_str(&format!("<p><strong>Trace ID:</strong> {}</p>", trace.id.0));
+    html.push_str(&format!(
+        "<p><strong>用户 ID:</strong> {}</p>",
+        trace.user_id
+    ));
+    html.push_str(&format!(
+        "<p><strong>会话 ID:</strong> {}</p>",
+        trace.session_id
+    ));
     html.push_str(&format!(
         "<p><strong>用户输入:</strong> {}</p>",
         trace.input
@@ -1912,6 +1717,21 @@ fn generate_trace_detail_html(trace: &subhuti::observe::Trace) -> String {
         duration_text
     ));
 
+    if let Some(chain_name) = &trace.chain_name {
+        html.push_str(&format!("<p><strong>链路名称:</strong> {}</p>", chain_name));
+    }
+
+    if !trace.expert_chain.is_empty() {
+        html.push_str("<p><strong>专家执行链:</strong></p>");
+        for (i, expert) in trace.expert_chain.iter().enumerate() {
+            html.push_str(&format!(
+                "<div class='expert-chain'>步骤 {}: {}</div>",
+                i + 1,
+                expert
+            ));
+        }
+    }
+
     let status_class = if matches!(trace.status, subhuti::observe::TraceStatus::Success) {
         "success"
     } else {
@@ -1924,279 +1744,17 @@ fn generate_trace_detail_html(trace: &subhuti::observe::Trace) -> String {
     ));
 
     if let Some(output) = &trace.output {
-        html.push_str(&format!(
-            "<p><strong>输出:</strong> {}</p>",
-            output.chars().take(100).collect::<String>()
-        ));
-    }
-
-    if let Some(ref tokens) = trace.token_usage {
-        html.push_str("<p><strong>Token 使用:</strong> ");
-        html.push_str(&format!(
-            "prompt={}, completion={}, total={}",
-            tokens.prompt_tokens, tokens.completion_tokens, tokens.total_tokens
-        ));
-        html.push_str("</p>");
+        html.push_str("<p><strong>输出:</strong></p>");
+        html.push_str(&format!("<pre>{}</pre>", output));
     }
 
     html.push_str("</div>");
 
-    // 调用链
-    html.push_str("<h2>调用链</h2>");
-    html.push_str("<div class='tree'>");
-
-    // 简单的树形显示
-    for (span_id, span) in &trace.spans {
-        html.push_str("<div class='span'>");
-        html.push_str(&format!(
-            "<strong>{}</strong> ({}) - {}ms<br>",
-            span.name,
-            span.kind,
-            span.duration_ms
-                .map(|d| d.to_string())
-                .unwrap_or_else(|| "-".to_string())
-        ));
-
-        if let Some(output) = &span.output {
-            if let Some(obj) = output.as_object() {
-                for (key, value) in obj {
-                    html.push_str(&format!("&nbsp;&nbsp;{}: {}<br>", key, value));
-                }
-            }
-        }
-
-        html.push_str(&format!("<small>ID: {}</small>", span_id));
-        html.push_str("</div>");
-    }
-
-    html.push_str("</div>");
     html.push_str("<p><a href='/subhuti/api/v1/traces?format=html'>← 返回 Trace 列表</a></p>");
     html.push_str("</div></body></html>");
     html
 }
 
-// ============================================================
-// 第九部分：主函数
-// ============================================================
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    // 1. 初始化日志（控制台 + 文件）
-    let _log_guard = middleware::init_logging();
-
-    tracing::info!("Starting Subhuti HTTP Server...");
-    tracing::info!("Log files will be written to ./logs/ directory");
-
-    // 2. 加载环境变量
-    dotenvy::dotenv().ok();
-
-    // 3. 加载 TOML 配置（支持环境变量覆盖）
-    let app_config = AppConfig::load().unwrap_or_else(|e| {
-        eprintln!("⚠️  配置加载失败: {}", e);
-        eprintln!("   使用默认配置");
-        config::default_config()
-    });
-
-    // 4. 创建框架统一配置
-    let config = SubhutiConfig {
-        llm: LLMConfig {
-            model: app_config.llm.model.clone(),
-            api_url: app_config.llm.api_url.clone(),
-            api_key: std::env::var("DOUBAO_API_KEY").ok(),
-            temperature: app_config.llm.temperature as f32,
-            max_tokens: app_config.llm.max_tokens,
-        },
-        provider: if app_config.test_mode.enabled {
-            LLMProvider::Custom
-        } else {
-            match app_config.llm.provider.as_str() {
-                "openai" => LLMProvider::OpenAI,
-                "ollama" => LLMProvider::Ollama,
-                "doubao" => LLMProvider::Doubao,
-                _ => LLMProvider::Doubao,
-            }
-        },
-        runtime: RuntimeConfig::default(),
-        memory: MemoryConfig::default(),
-        flow: FlowConfig::default(),
-        db: None,
-    };
-
-    tracing::info!(
-        "LLM Config: provider={}, model={}, test_mode={}",
-        match config.provider {
-            LLMProvider::OpenAI => "OpenAI",
-            LLMProvider::Ollama => "Ollama",
-            LLMProvider::Doubao => "Doubao",
-            LLMProvider::Custom => "MockLLM",
-        },
-        config.llm.model,
-        app_config.test_mode.enabled
-    );
-
-    // 4. 创建 Agent（使用框架配置）
-    let mut subhuti = create_agent(config);
-
-    // 如果启用测试模式，设置 Mock LLM
-    if app_config.test_mode.enabled {
-        let mock_client = subhuti::runtime::llm::MockLlmClient::new(
-            subhuti::runtime::llm::LLMConfig {
-                model: "mock-llm".to_string(),
-                api_url: "mock://local".to_string(),
-                api_key: None,
-                temperature: 0.0,
-                max_tokens: 1024,
-            },
-            &app_config.test_mode.mock_responses_path,
-            app_config.test_mode.mock_delay_ms,
-        );
-        subhuti
-            .runtime()
-            .set_llm(subhuti::runtime::llm::LLMClient::Mock(mock_client));
-        tracing::info!(
-            "✅ 测试模式已启用，使用 Mock LLM (延迟: {}ms)",
-            app_config.test_mode.mock_delay_ms
-        );
-    }
-
-    // 5. 初始化数据库
-    let db_config = subhuti::DbConfig {
-        host: app_config.database.host.clone(),
-        port: app_config.database.port,
-        database: app_config.database.database.clone(),
-        username: app_config.database.username.clone(),
-        password: app_config.database.password.clone(),
-        max_connections: app_config.database.max_connections,
-    };
-
-    match subhuti.init_database(&db_config).await {
-        Ok(_) => tracing::info!("Database initialized successfully"),
-        Err(e) => tracing::warn!("Database initialization failed (using file storage): {}", e),
-    }
-
-    // 同步专家到编排器
-    subhuti.sync_experts_to_orchestrator().await;
-
-    let subhuti = Arc::new(subhuti);
-    tracing::info!(
-        "Agent built with {} skills, {} tools",
-        subhuti.skill_count(),
-        subhuti.runtime().get_tools().len()
-    );
-
-    // 5. 创建 Axum 应用（统一网关路由）
-    let app = Router::new()
-        // 统一入口 - AI 自动判断调用哪个 Skill
-        .route("/subhuti/api/v1/chat", post(chat_handler))
-        .route("/subhuti/api/v1/chat/stream", post(chat_stream_handler))
-        // Skill 列表
-        .route("/subhuti/api/v1/skills", post(skill_list_handler))
-        .route("/subhuti/api/v1/skills", get(skill_list_handler))
-        // Skill 执行
-        .route("/subhuti/api/v1/skills/:name", post(skill_execute_handler))
-        .route(
-            "/subhuti/api/v1/skills/:name/stream",
-            post(skill_execute_stream_handler),
-        )
-        // 健康检查
-        .route("/subhuti/api/v1/health", get(health_handler))
-        .route(
-            "/subhuti/api/v1/health/detailed",
-            get(health_detailed_handler),
-        )
-        // 日志查询
-        .route("/subhuti/api/v1/logs", get(logs_handler))
-        .route("/subhuti/api/v1/persona", get(persona_handler))
-        .route(
-            "/subhuti/api/v1/persona/evolve",
-            post(persona_evolve_handler),
-        )
-        .route(
-            "/subhuti/api/v1/persona/feedback",
-            post(persona_feedback_handler),
-        )
-        // 心灵宫殿
-        .route("/subhuti/api/v1/palace/stats", get(palace_stats_handler))
-        .route("/subhuti/api/v1/palace/forget", post(palace_forget_handler))
-        .route("/subhuti/api/v1/palace/search", post(palace_search_handler))
-        // 专家插件
-        .route("/subhuti/api/v1/experts", get(experts_list_handler))
-        .route(
-            "/subhuti/api/v1/experts/plugins",
-            get(experts_plugins_handler),
-        )
-        .route(
-            "/subhuti/api/v1/experts/active",
-            get(experts_active_handler),
-        )
-        .route(
-            "/subhuti/api/v1/experts/:id/activate",
-            post(experts_activate_handler),
-        )
-        .route(
-            "/subhuti/api/v1/experts/deactivate",
-            post(experts_deactivate_handler),
-        )
-        .route(
-            "/subhuti/api/v1/experts/:id/enable",
-            post(experts_enable_handler),
-        )
-        .route(
-            "/subhuti/api/v1/experts/:id/disable",
-            post(experts_disable_handler),
-        )
-        .route("/subhuti/api/v1/experts/match", post(experts_match_handler))
-        // 多Agent协调编排
-        .route("/subhuti/api/v1/orchestrate", post(orchestrate_handler))
-        .route(
-            "/subhuti/api/v1/orchestrate/analyze",
-            post(orchestrate_analyze_handler),
-        )
-        .route(
-            "/subhuti/api/v1/orchestrate/match",
-            post(orchestrate_match_handler),
-        )
-        .route(
-            "/subhuti/api/v1/orchestrate/experts",
-            get(orchestrate_experts_handler),
-        )
-        // Trace 追踪（可观测性）
-        .route("/subhuti/api/v1/traces", get(traces_list_handler))
-        .route("/subhuti/api/v1/traces/:id", get(traces_get_handler))
-        .route("/subhuti/api/v1/traces/:id/tree", get(traces_tree_handler))
-        // Session 查询
-        .route("/subhuti/api/v1/sessions", get(sessions_list_handler))
-        .route("/subhuti/api/v1/sessions/:id", get(sessions_get_handler))
-        // 测试页面（静态文件）
-        .nest_service("/subhuti/test", ServeDir::new("static"))
-        // 中间件（注册顺序从内到外，执行顺序从外到内）
-        // 执行顺序: RequestLogLayer → TraceIdLayer → CorsLayer → handler
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
-        .layer(RequestLogLayer) // 第2层：记录请求日志（能拿到 Trace ID）
-        .layer(TraceIdLayer) // 第1层（最外层）：生成 Trace ID
-        .with_state(AppState {
-            subhuti,
-            trace_observer: Arc::new(subhuti::observe::TraceObserver::new()),
-            session_observer: Arc::new(subhuti::observe::SessionObserver::new()),
-        });
-
-    // 6. 启动服务器
-    let addr = app_config.http.addr.clone();
-
-    tracing::info!("Server listening on {}", addr);
-
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
-
-    Ok(())
-}
-
-// UUID v4 生成（使用标准 UUID crate）
 fn uuid_v4() -> String {
     uuid::Uuid::new_v4().to_string()
 }
