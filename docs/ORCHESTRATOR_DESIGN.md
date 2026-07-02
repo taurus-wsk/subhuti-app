@@ -402,5 +402,6 @@ rule_engine.set_execution_rule(Box::new(MyExecutionRule));
 
 - 核心实现：[crates/subhuti/src/orchestrator/mod.rs](../crates/subhuti/src/orchestrator/mod.rs)
 - 全局状态：[crates/subhuti/src/lib.rs](../crates/subhuti/src/lib.rs)
-- API 入口：[src/bin/http_server/main.rs](../src/bin/http_server/main.rs)
+- 统一入口：[src/bin/main.rs](../src/bin/main.rs)
+- HTTP 服务器：[src/server.rs](../src/server.rs)
 - 测试页面：[static/index.html](../static/index.html)
