@@ -1,0 +1,550 @@
+//! # HTTP 适配器层
+//!
+//! 六边形架构的入站适配层适配器：将 HTTP 协议请求转换为业务用例调用，
+//! 将业务响应转换为 HTTP 响应。
+//!
+//! 设计原则：
+//! - 适配器持有业务端口（UseCase），是边界层的固有设计
+//! - 所有 axum 提取器、Request、Response 只存在适配器内部
+//! - 协议转换、错误处理统一封装在适配器层；trace/session 由应用层 `TraceAppService` 装饰器自动记录
+//! - 业务层完全不认识 axum
+//!
+//! ## 方案 C：inventory 自动注册
+//!
+//! 每个路由通过 `inventory::submit!` 自注册路径、方法、trace 配置，
+//! server.rs 无需手动维护路由列表。新增路由只需在此文件添加 handler 函数 +
+//! `inventory::submit!` 块即可。
+
+use std::sync::Arc;
+
+use async_stream::stream;
+use axum::{
+    extract::{Json, Path, State},
+    http::StatusCode,
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
+    routing::{get, post},
+    Json as AxumJson,
+};
+use tokio::sync::mpsc;
+
+use crate::adapter::inbound::http::route_adapter::RouteEntry;
+use crate::adapter::inbound::http::routes::AppState;
+use crate::application::{
+    ChatPort, ExpertQueryPort, SessionObserverPort, SkillPort, StreamEvent, TraceObserverPort,
+};
+use crate::domain::dto::OrchestrateRequest as PortRequest;
+
+// ─── 通用响应类型 ────────────────────────────────────────────────
+
+/// 统一成功响应
+///
+/// 所有 API 成功响应均使用此结构，确保格式一致：
+/// `{ "success": true, "data": <T> }`
+#[derive(Debug, serde::Serialize)]
+pub struct ApiSuccess<T: serde::Serialize> {
+    pub success: bool,
+    pub data: T,
+}
+
+/// 统一错误响应
+///
+/// 所有 API 错误响应均使用此结构，确保格式一致：
+/// `{ "success": false, "error": "...", "code": 500 }`
+#[derive(Debug, serde::Serialize)]
+pub struct ApiError {
+    pub success: bool,
+    pub error: String,
+    pub code: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+}
+
+// ─── IntoResponse 实现 ───────────────────────────────────────────
+
+impl<T: serde::Serialize> IntoResponse for ApiSuccess<T> {
+    fn into_response(self) -> Response {
+        (StatusCode::OK, AxumJson(self)).into_response()
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (
+            StatusCode::from_u16(self.code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            AxumJson(self),
+        )
+            .into_response()
+    }
+}
+
+// ─── 便捷构造方法 ──────────────────────────────────────────────────
+
+impl ApiSuccess<serde_json::Value> {
+    pub fn ok(data: serde_json::Value) -> Self {
+        Self {
+            success: true,
+            data,
+        }
+    }
+}
+
+impl ApiError {
+    pub fn internal(msg: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            error: msg.into(),
+            code: 500,
+            details: None,
+        }
+    }
+
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            error: msg.into(),
+            code: 404,
+            details: None,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn bad_request(msg: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            error: msg.into(),
+            code: 400,
+            details: None,
+        }
+    }
+
+    pub fn with_detail(mut self, detail: serde_json::Value) -> Self {
+        self.details = Some(detail);
+        self
+    }
+}
+
+// ─── HTTP 请求 DTO ──────────────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize)]
+pub struct SkillExecuteRequest {
+    pub message: String,
+    pub user_id: Option<String>,
+    pub session_id: Option<String>,
+    pub flow_template: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct OrchestrateRequest {
+    pub message: String,
+    pub user_id: Option<String>,
+    pub session_id: Option<String>,
+    pub chain: Option<String>,
+}
+
+// ─── 工具函数 ──────────────────────────────────────────────────
+
+fn uuid_v4() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+// ─── 流式事件转 SSE（适配器职责：协议格式 + 分块策略）────────────
+
+/// 把协议中立的 StreamEvent 流转为 SSE Event 流
+///
+/// 职责：分块大小、sleep 节奏、SSE 事件 JSON 格式 —— 全部在适配器层。
+/// 应用层只发语义事件（Start/Chunk/Done/Error），不关心传输细节。
+fn stream_to_sse(
+    receiver: mpsc::Receiver<StreamEvent>,
+) -> impl futures::Stream<Item = Result<Event, axum::BoxError>> {
+    stream! {
+        let mut rx = receiver;
+        while let Some(event) = rx.recv().await {
+            match event {
+                StreamEvent::Start => {
+                    yield Ok(Event::default().data(r#"{"type":"start"}"#));
+                }
+                StreamEvent::Chunk { content } => {
+                    // 分块策略 + 节奏（适配器职责，可按需调整）
+                    let chunk_size = 64;
+                    for i in (0..content.len()).step_by(chunk_size) {
+                        let chunk = &content[i..std::cmp::min(i + chunk_size, content.len())];
+                        let json = serde_json::json!({
+                            "type": "data",
+                            "content": chunk,
+                            "done": false,
+                        }).to_string();
+                        yield Ok(Event::default().data(json));
+                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    }
+                }
+                StreamEvent::Done { output, meta } => {
+                    let mut payload = serde_json::Map::new();
+                    payload.insert("type".into(), "done".into());
+                    payload.insert("content".into(), output.into());
+                    if let serde_json::Value::Object(m) = meta {
+                        for (k, v) in m {
+                            payload.insert(k, v);
+                        }
+                    }
+                    yield Ok(Event::default().data(serde_json::Value::Object(payload).to_string()));
+                }
+                StreamEvent::Error { error } => {
+                    let json = serde_json::json!({"type": "error", "error": error}).to_string();
+                    yield Ok(Event::default().data(json));
+                }
+            }
+        }
+    }
+}
+
+// ─── Chat Stream 路由 ───────────────────────────────────────────
+
+/// POST /subhuti/api/v1/chat/stream（SSE 流式响应）
+async fn chat_stream_handler(
+    State(state): State<AppState>,
+    Json(req): Json<OrchestrateRequest>,
+) -> impl IntoResponse {
+    let user_id = req
+        .user_id
+        .clone()
+        .unwrap_or_else(|| "anonymous".to_string());
+    let session_id = req.session_id.clone().unwrap_or_else(uuid_v4);
+
+    tracing::info!(
+        user = %user_id, session = %session_id,
+        message = %req.message, chain = ?req.chain,
+        "Chat stream 请求"
+    );
+
+    let receiver = state.chat_port.orchestrate_stream(PortRequest {
+        message: req.message.clone(),
+        user_id: Some(user_id.clone()),
+        session_id: Some(session_id.clone()),
+        chain: req.chain.clone(),
+        trace_id: None,
+    });
+
+    Sse::new(stream_to_sse(receiver)).keep_alive(KeepAlive::default())
+}
+
+inventory::submit! {
+    RouteEntry {
+        path: "/subhuti/api/v1/chat/stream",
+        method: "POST",
+        trace_enabled: false,  // 辅助路由（流式，trace 由装饰器自动覆盖）
+        register: |r| r.route("/subhuti/api/v1/chat/stream", post(chat_stream_handler)),
+    }
+}
+
+// ─── Orchestrate 路由 ───────────────────────────────────────────
+
+/// POST /subhuti/api/v1/orchestrate
+async fn orchestrate_handler(
+    State(state): State<AppState>,
+    Json(req): Json<OrchestrateRequest>,
+) -> impl IntoResponse {
+    let user_id = req
+        .user_id
+        .clone()
+        .unwrap_or_else(|| "anonymous".to_string());
+    let session_id = req.session_id.clone().unwrap_or_else(uuid_v4);
+
+    tracing::info!(
+        user = %user_id, session = %session_id,
+        message_len = req.message.len(), chain = ?req.chain,
+        "收到编排请求"
+    );
+
+    let response = state
+        .chat_port
+        .orchestrate(PortRequest {
+            message: req.message.clone(),
+            user_id: Some(user_id.clone()),
+            session_id: Some(session_id.clone()),
+            chain: req.chain.clone(),
+            trace_id: None,
+        })
+        .await;
+
+    if response.success {
+        tracing::info!(
+            chain = ?response.chain,
+            experts = response.expert_chain.len(),
+            "编排完成"
+        );
+        ApiSuccess::ok(serde_json::json!({
+            "output": response.output,
+            "session_id": session_id,
+            "chain": response.chain,
+            "expert_chain": response.expert_chain,
+            "expert_outputs": response.expert_outputs,
+        }))
+        .into_response()
+    } else {
+        let error_msg = response.error.clone().unwrap_or_default();
+        tracing::error!(error = %error_msg, "编排错误");
+        ApiError::internal(error_msg)
+            .with_detail(serde_json::json!({ "session_id": session_id }))
+            .into_response()
+    }
+}
+
+inventory::submit! {
+    RouteEntry {
+        path: "/subhuti/api/v1/orchestrate",
+        method: "POST",
+        trace_enabled: true,  // 核心业务路由标记（debug 分类用）
+        register: |r| r.route("/subhuti/api/v1/orchestrate", post(orchestrate_handler)),
+    }
+}
+
+// ─── Orchestrate Analyze 路由 ───────────────────────────────────
+
+/// POST /subhuti/api/v1/orchestrate/analyze
+async fn orchestrate_analyze_handler(
+    State(state): State<AppState>,
+    Json(req): Json<OrchestrateRequest>,
+) -> impl IntoResponse {
+    let profile = state.expert_query_port.analyze_task(&req.message).await;
+
+    ApiSuccess::ok(serde_json::json!({
+        "profile": profile,
+        "suggested_strategy": "SimpleDispatch",
+    }))
+}
+
+inventory::submit! {
+    RouteEntry {
+        path: "/subhuti/api/v1/orchestrate/analyze",
+        method: "POST",
+        trace_enabled: false,
+        register: |r| r.route("/subhuti/api/v1/orchestrate/analyze", post(orchestrate_analyze_handler)),
+    }
+}
+
+// ─── Orchestrate Match 路由 ─────────────────────────────────────
+
+/// POST /subhuti/api/v1/orchestrate/match
+async fn orchestrate_match_handler(
+    State(state): State<AppState>,
+    Json(req): Json<OrchestrateRequest>,
+) -> impl IntoResponse {
+    let experts = state.expert_query_port.match_expert(&req.message).await;
+
+    ApiSuccess::ok(serde_json::json!({
+        "matches": experts,
+        "total": experts.len(),
+    }))
+}
+
+inventory::submit! {
+    RouteEntry {
+        path: "/subhuti/api/v1/orchestrate/match",
+        method: "POST",
+        trace_enabled: false,
+        register: |r| r.route("/subhuti/api/v1/orchestrate/match", post(orchestrate_match_handler)),
+    }
+}
+
+// ─── Orchestrate Experts 路由 ───────────────────────────────────
+
+/// GET /subhuti/api/v1/orchestrate/experts
+async fn orchestrate_experts_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let experts = state.expert_query_port.list_experts().await;
+
+    ApiSuccess::ok(serde_json::json!({
+        "experts": experts,
+        "total": experts.len(),
+    }))
+}
+
+inventory::submit! {
+    RouteEntry {
+        path: "/subhuti/api/v1/orchestrate/experts",
+        method: "GET",
+        trace_enabled: false,
+        register: |r| r.route("/subhuti/api/v1/orchestrate/experts", get(orchestrate_experts_handler)),
+    }
+}
+
+// ─── Skill Execute 路由 ─────────────────────────────────────────
+
+/// POST /subhuti/api/v1/skills/:name
+async fn skill_execute_handler(
+    State(state): State<AppState>,
+    Path(skill_name): Path<String>,
+    Json(req): Json<SkillExecuteRequest>,
+) -> impl IntoResponse {
+    let user_id = req
+        .user_id
+        .clone()
+        .unwrap_or_else(|| "anonymous".to_string());
+    let session_id = req.session_id.clone().unwrap_or_else(uuid_v4);
+
+    tracing::info!(
+        user = %user_id, skill = %skill_name, session = %session_id,
+        message = %req.message,
+        "Skill execute 请求"
+    );
+
+    let response = state
+        .skill_port
+        .execute_skill(&skill_name, &req.message, "", "")
+        .await;
+
+    if response.success {
+        tracing::info!(
+            skill = %skill_name, expert = %response.expert_id,
+            "Skill execute 完成"
+        );
+        ApiSuccess::ok(serde_json::json!({
+            "output": response.output,
+            "session_id": session_id,
+            "skill_used": skill_name,
+            "chain": vec![response.expert_id],
+        }))
+        .into_response()
+    } else {
+        let error_msg = response.error.clone().unwrap_or_default();
+        tracing::error!(skill = %skill_name, error = %error_msg, "Skill execute 错误");
+        ApiError::internal(error_msg)
+            .with_detail(serde_json::json!({ "session_id": session_id }))
+            .into_response()
+    }
+}
+
+inventory::submit! {
+    RouteEntry {
+        path: "/subhuti/api/v1/skills/:name",
+        method: "POST",
+        trace_enabled: true,  // 核心业务路由标记（debug 分类用）
+        register: |r| r.route("/subhuti/api/v1/skills/:name", post(skill_execute_handler)),
+    }
+}
+
+// ─── Skill List 路由 ────────────────────────────────────────────
+
+/// GET/POST /subhuti/api/v1/skills
+async fn skill_list_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let skills = state.skill_port.skill_list().await;
+
+    let skill_infos: Vec<serde_json::Value> = skills
+        .into_iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "description": s.description,
+                "flow_template": serde_json::Value::Null,
+                "flow_templates": Vec::<String>::new(),
+                "priority": 0,
+            })
+        })
+        .collect();
+
+    ApiSuccess::ok(serde_json::json!({
+        "skills": skill_infos,
+    }))
+}
+
+inventory::submit! {
+    RouteEntry {
+        path: "/subhuti/api/v1/skills",
+        method: "GET+POST",  // 同一路径注册两个方法
+        trace_enabled: false,
+        register: |r| r.route("/subhuti/api/v1/skills", get(skill_list_handler).post(skill_list_handler)),
+    }
+}
+
+// ─── Skill Stream 路由 ──────────────────────────────────────────
+
+/// POST /subhuti/api/v1/skills/:name/stream
+async fn skill_stream_handler(
+    State(state): State<AppState>,
+    Path(skill_name): Path<String>,
+    Json(req): Json<SkillExecuteRequest>,
+) -> impl IntoResponse {
+    let _user_id = req
+        .user_id
+        .clone()
+        .unwrap_or_else(|| "anonymous".to_string());
+    let session_id = req.session_id.clone().unwrap_or_else(uuid_v4);
+
+    tracing::info!(
+        "Skill execute stream request: skill={}, session={}, message={}",
+        skill_name,
+        session_id,
+        req.message
+    );
+
+    let receiver = state
+        .skill_port
+        .execute_skill_stream(&skill_name, &req.message, "", "");
+
+    Sse::new(stream_to_sse(receiver)).keep_alive(KeepAlive::default())
+}
+
+inventory::submit! {
+    RouteEntry {
+        path: "/subhuti/api/v1/skills/:name/stream",
+        method: "POST",
+        trace_enabled: false,
+        register: |r| r.route("/subhuti/api/v1/skills/:name/stream", post(skill_stream_handler)),
+    }
+}
+
+// ─── 适配器工厂 ──────────────────────────────────────────────────
+
+/// HTTP 依赖注入工厂
+///
+/// 适配器本身无状态（关联函数），仅 AppState 需要注入端口。
+/// trace/session 记录由应用层 TraceAppService 装饰器自动处理，
+/// observer 仅用于 traces/sessions 查询路由读取历史记录。
+pub struct HttpAdapterFactory {
+    chat_port: Arc<dyn ChatPort>,
+    expert_query_port: Arc<dyn ExpertQueryPort>,
+    skill_port: Arc<dyn SkillPort>,
+    trace_observer: Arc<dyn TraceObserverPort>,
+    session_observer: Arc<dyn SessionObserverPort>,
+}
+
+impl HttpAdapterFactory {
+    pub fn new(
+        chat_port: Arc<dyn ChatPort>,
+        expert_query_port: Arc<dyn ExpertQueryPort>,
+        skill_port: Arc<dyn SkillPort>,
+        trace_observer: Arc<dyn TraceObserverPort>,
+        session_observer: Arc<dyn SessionObserverPort>,
+    ) -> Self {
+        Self {
+            chat_port,
+            expert_query_port,
+            skill_port,
+            trace_observer,
+            session_observer,
+        }
+    }
+
+    /// 创建 AppState（依赖注入容器，供 handler 通过 State 取端口）
+    pub fn create_app_state(&self) -> AppState {
+        AppState {
+            chat_port: self.chat_port.clone(),
+            expert_query_port: self.expert_query_port.clone(),
+            skill_port: self.skill_port.clone(),
+            trace_observer: self.trace_observer.clone(),
+            session_observer: self.session_observer.clone(),
+        }
+    }
+
+    /// 获取 trace observer（供 traces 查询路由读取历史记录）
+    pub fn trace_observer(&self) -> Arc<dyn TraceObserverPort> {
+        self.trace_observer.clone()
+    }
+
+    /// 获取 session observer（供 sessions 查询路由读取历史记录）
+    pub fn session_observer(&self) -> Arc<dyn SessionObserverPort> {
+        self.session_observer.clone()
+    }
+}

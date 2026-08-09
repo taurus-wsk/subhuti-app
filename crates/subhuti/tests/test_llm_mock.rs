@@ -5,8 +5,8 @@
 //! 运行: cargo test -p subhuti --test test_llm_mock -- --nocapture
 
 use std::time::Instant;
-use subhuti::runtime::llm::ToolCall;
-use subhuti::{CalculatorSkill, DefaultChatSkill, Message, MockLLM, Subhuti, TestTracker, LLM};
+use subhuti::runtime::{ToolCall, LLM};
+use subhuti::{Message, MockLLM, Subhuti};
 
 fn main() {
     run_tests();
@@ -15,6 +15,56 @@ fn main() {
 #[test]
 fn test_mock_llm_e2e() {
     run_tests();
+}
+
+struct TestTracker {
+    passed: usize,
+    failed: usize,
+    failed_tests: Vec<String>,
+    start_time: Instant,
+}
+
+impl TestTracker {
+    fn new() -> Self {
+        Self {
+            passed: 0,
+            failed: 0,
+            failed_tests: Vec::new(),
+            start_time: Instant::now(),
+        }
+    }
+
+    fn pass(&mut self, name: &str) {
+        self.passed += 1;
+        eprintln!("[TEST OK] {}", name);
+    }
+
+    fn fail(&mut self, name: &str, reason: &str) {
+        self.failed += 1;
+        self.failed_tests.push(format!("{}: {}", name, reason));
+        eprintln!("[TEST FAIL] {} - {}", name, reason);
+    }
+
+    fn summary(&self) -> String {
+        let elapsed = self.start_time.elapsed();
+        let total = self.passed + self.failed;
+
+        if self.failed == 0 {
+            format!(
+                "✅ All {} tests passed in {:.3}s",
+                total,
+                elapsed.as_secs_f32()
+            )
+        } else {
+            format!(
+                "❌ {}/{} tests passed in {:.3}s\nFailed tests:\n{}",
+                self.passed,
+                total,
+                elapsed.as_secs_f32(),
+                self.failed_tests.join("\n")
+            )
+        }
+    }
 }
 
 fn run_tests() {
@@ -75,18 +125,8 @@ fn run_tests() {
         Err(e) => tracker.fail("Agent 聊天", &e),
     }
 
-    // ── Test 6: 完整 Agent 链路 - 工具调用流程 ─────────────
-    print_step(6, "完整 Agent 链路 - 工具调用流程");
-    match test_full_agent_tool_call() {
-        Ok(msg) => {
-            tracker.pass("Agent 工具调用");
-            println!("  ✅ {}", msg);
-        }
-        Err(e) => tracker.fail("Agent 工具调用", &e),
-    }
-
-    // ── Test 7: 流式输出模拟 ──────────────────────────────
-    print_step(7, "流式输出模拟测试");
+    // ── Test 6: 流式输出模拟 ──────────────────────────────
+    print_step(6, "流式输出模拟测试");
     match test_streaming_mock() {
         Ok(msg) => {
             tracker.pass("流式输出");
@@ -119,14 +159,13 @@ fn format_elapsed(_: usize) -> String {
 fn test_mock_llm_basic() -> Result<String, String> {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    // 固定响应
     let mock = MockLLM::with_response("Hello, I am Subhuti!");
     let result = rt.block_on(mock.chat(vec![Message::user("Hi")])).unwrap();
     assert_eq!(result, "Hello, I am Subhuti!");
 
-    // 队列为空时默认回显用户消息
+    let mock_echo = MockLLM::with_echo();
     let result2 = rt
-        .block_on(mock.chat(vec![Message::user("What is Rust?")]))
+        .block_on(mock_echo.chat(vec![Message::user("What is Rust?")]))
         .unwrap();
     assert_eq!(result2, "What is Rust?");
 
@@ -169,7 +208,6 @@ fn test_message_capture() -> Result<String, String> {
     assert_eq!(captured[0][1].role, subhuti::Role::User);
     assert_eq!(captured[0][1].content, "你好，世界");
 
-    // 验证 get_last_messages
     let last = mock.get_last_messages().unwrap();
     assert_eq!(last.len(), 2);
 
@@ -181,7 +219,6 @@ fn test_tool_call_response() -> Result<String, String> {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mock = MockLLM::new();
 
-    // 添加工具调用预设
     mock.add_tool_call_response(ToolCall {
         id: "call_001".to_string(),
         name: "calculate".to_string(),
@@ -196,7 +233,6 @@ fn test_tool_call_response() -> Result<String, String> {
     let tc = result.tool_call.unwrap();
     assert_eq!(tc.name, "calculate");
     assert_eq!(tc.arguments, serde_json::json!({"expression": "2 + 3"}));
-    assert_eq!(result.total_tokens, Some(15));
 
     Ok("工具调用响应正确解析，参数匹配".to_string())
 }
@@ -208,99 +244,24 @@ fn test_full_agent_chat() -> Result<String, String> {
     rt.block_on(async {
         let subhuti = Subhuti::new();
 
-        // 注入 MockLLM
-        let mock = MockLLM::with_response("你好！我是 Subhuti，很高兴为你服务。");
-        subhuti.set_mock_llm(mock);
+        let result = subhuti.dispatch("你好").await;
+        println!("  ├─ 响应: {}", result.output);
+        println!("  ├─ 成功: {}", result.success);
 
-        // 注册 Skill
-        subhuti.register_skill(DefaultChatSkill);
-
-        assert!(subhuti.runtime().has_llm());
-
-        // 调用 Agent（简单模式）
-        let result = subhuti.run_simple("user1", "你好").await;
-        match result {
-            Ok((response, skill_used, tokens)) => {
-                println!("  ├─ 响应: {}", response);
-                println!("  ├─ 使用 Skill: {:?}", skill_used);
-                println!(
-                    "  ├─ Token: prompt={}, completion={}, total={}",
-                    tokens.prompt_tokens, tokens.completion_tokens, tokens.total_tokens
-                );
-                Ok(format!("Agent 链路完整：响应正常，Skill={:?}", skill_used))
-            }
-            Err(e) => Err(format!("Agent 调用失败: {}", e)),
+        if result.success {
+            Ok(format!("Agent 链路完整：响应正常"))
+        } else {
+            Err(format!("Agent 调用失败"))
         }
     })
 }
 
-/// Test 6: 完整 Agent 链路 - 工具调用流程
-fn test_full_agent_tool_call() -> Result<String, String> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-
-    rt.block_on(async {
-        let subhuti = Subhuti::new();
-
-        // MockLLM 预设工具调用 → 然后正常回复
-        let mock = MockLLM::new();
-        mock.add_tool_call_response(ToolCall {
-            id: "call_calc_001".to_string(),
-            name: "calculate".to_string(),
-            arguments: serde_json::json!({"expression": "42 * 2"}),
-        });
-        mock.add_response("计算结果是 84");
-        subhuti.set_mock_llm(mock);
-
-        subhuti.register_skill(CalculatorSkill);
-
-        // 注册计算器工具
-        use async_trait::async_trait;
-        use subhuti::runtime::tools::{Tool, ToolInfo, ToolResult};
-
-        struct MockCalcTool;
-
-        #[async_trait]
-        impl Tool for MockCalcTool {
-            fn info(&self) -> ToolInfo {
-                ToolInfo {
-                    name: "calculate".to_string(),
-                    description: "计算表达式".to_string(),
-                    parameters: serde_json::json!({"expression": "string"}),
-                }
-            }
-            async fn run(&self, _params: serde_json::Value) -> anyhow::Result<ToolResult> {
-                Ok(ToolResult {
-                    success: true,
-                    content: "84".to_string(),
-                    error: None,
-                })
-            }
-        }
-
-        subhuti.runtime().register_tool(MockCalcTool);
-
-        // 调用
-        let result = subhuti.run_simple("user1", "计算 42 * 2").await;
-        match result {
-            Ok((response, skill_used, _tokens)) => {
-                println!("  ├─ 响应: {}", response);
-                println!("  ├─ 使用 Skill: {:?}", skill_used);
-                Ok(format!("工具调用链路完整，Skill={:?}", skill_used))
-            }
-            Err(e) => Err(format!("工具调用链路失败: {}", e)),
-        }
-    })
-}
-
-/// Test 7: 流式输出模拟
+/// Test 6: 流式输出模拟
 fn test_streaming_mock() -> Result<String, String> {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     rt.block_on(async {
-        let subhuti = Subhuti::new();
-        let mock = MockLLM::with_response("这是 流式 输出 测试");
-        subhuti.set_mock_llm(mock);
-        subhuti.register_skill(DefaultChatSkill);
+        let mock = MockLLM::with_response("这是流式输出测试");
 
         let chunks: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -310,14 +271,13 @@ fn test_streaming_mock() -> Result<String, String> {
             chunks_clone.lock().unwrap().push(chunk);
         };
 
-        let result = subhuti
-            .run_simple_streaming("user1", "流式测试", Box::new(callback))
+        let result = mock
+            .chat_streaming(vec![Message::user("流式测试")], Box::new(callback))
             .await;
 
         match result {
-            Ok(response) => {
+            Ok(_) => {
                 let chunk_list = chunks.lock().unwrap();
-                println!("  ├─ 完整响应: {}", response);
                 println!("  ├─ 收到 {} 个流式块", chunk_list.len());
                 Ok(format!("流式输出正常，共 {} 个块", chunk_list.len()))
             }

@@ -12,54 +12,28 @@ keywords = ["ai", "agent", "llm", "rust"]
 categories = ["ai", " robotics"]
 
 [dependencies]
-# 异步运行时
-tokio = { version = "1", features = ["full"] }
-
-# 序列化
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-# PostgreSQL 数据库
-sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "postgres", "chrono", "uuid", "json"] }
-
-# 向量存储 (轻量实现)
-bincode = "1"
-
-# 日期时间
-chrono = { version = "0.4", features = ["serde"] }
-
-# 日志
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# 唯一ID生成
-uuid = { version = "1", features = ["v4", "serde"] }
-
-# 错误处理
-thiserror = "1"
-anyhow = "1"
-
-# 异步特性
+subhuti-core = { path = "../subhuti-core" }
+subhuti-infra = { path = "../subhuti-infra" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["sync", "time", "rt", "macros"] }
 async-trait = "0.1"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1.0"
+smallvec = "1.11"
+itertools = "0.12"
 futures = "0.3"
-
-# LLM API 调用
-reqwest = { version = "0.12", features = ["json"] }
-
-# 正则表达式
-regex = "1"
-
-# 命令行参数解析
- clap = { version = "4", features = ["derive"] }
-
-# dotenv
+hashbrown = "0.14"
+dashmap = "5.5"
+backoff = "0.4"
+anyhow = "1.0"
+reqwest = { version = "0.12", features = ["json", "native-tls"] }
+sqlx = { version = "0.8", features = ["sqlite", "postgres", "runtime-tokio-native-tls", "macros", "chrono"] }
+regex = "1.10"
 dotenvy = "0.15"
 
 [dev-dependencies]
 mockall = "0.12"
 tempfile = "3"
-
-[features]
-default = []
-openai = []
-ollama = []

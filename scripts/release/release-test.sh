@@ -267,14 +267,14 @@ fi
 # 聊天测试
 echo "💬 聊天测试..."
 CHAT_START=$(date +%s)
-CHAT=$(curl -sf -X POST http://localhost:8080/subhuti/api/v1/chat \
+CHAT=$(curl -sf -X POST http://localhost:8080/subhuti/api/v1/orchestrate \
     -H "Content-Type: application/json" \
     -d '{"message": "你好，请回复一个 OK", "user_id": "release_test", "session_id": "release-test-session"}' \
     2>&1)
 CHAT_TIME=$(( $(date +%s) - CHAT_START ))
 
-if echo "$CHAT" | grep -q '"response"'; then
-    RESPONSE=$(echo "$CHAT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('response','')[:50])" 2>/dev/null)
+if echo "$CHAT" | grep -q '"output"'; then
+    RESPONSE=$(echo "$CHAT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('output','')[:50])" 2>/dev/null)
     CHAIN=$(echo "$CHAT" | python3 -c "import sys,json; d=json.load(sys.stdin); c=d.get('chain',[]); print(c[0] if c else 'unknown')" 2>/dev/null)
     record_test "聊天功能" "PASS" "响应: $RESPONSE..., 耗时 ${CHAT_TIME}s"
 else

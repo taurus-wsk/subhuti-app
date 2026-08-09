@@ -1,0 +1,9 @@
+//! # LLM 基础设施层
+//!
+//! 具体的 LLM API 客户端实现，对接第三方服务。
+
+pub mod cached_llm;
+pub mod client;
+
+pub use cached_llm::{CacheStats, CachedLLM};
+pub use client::*;

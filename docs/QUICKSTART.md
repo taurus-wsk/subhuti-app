@@ -262,9 +262,80 @@ export OLLAMA_BASE_URL=http://localhost:11434
 ### Q: 支持哪些 LLM？
 
 **A**: 目前支持：
-- 豆包（Doubao）- 默认
+- 豆包（Doubao）
 - Ollama - 本地模型
 - OpenAI 兼容接口
+- **智谱 Zhipu（glm-4-flash）** — 当前默认，默认 model=`glm-4-flash`，深度推理可切 `glm-4.7-flash`
+
+---
+
+## 🎯 第六步：Orchestrate 调度调试（Make 速查，最常用）
+
+> **前提**：Subhuti HTTP 服务已经在本地 `127.0.0.1:8080` 启动（启动命令：`make serve-debug`）。
+> 默认 LLM = 智谱 glm-4-flash（Key 从项目根目录 `.env` 文件的 `ZHIPU_API_KEY` 读取）。
+
+所有命令都在项目根目录执行，统一前缀 `make orch-xxx`：
+
+### ⭐ 你最常用的那一条（完整编排 + 真实 LLM 调用）
+
+```bash
+make orch-run \
+  ORCH_MSG='帮我用 Blender 做一个 5 秒的弹跳球动画' \
+  ORCH_USER=hezenghui \
+  ORCH_SESSION=debug-1
+```
+
+对应 HTTP：`POST /subhuti/api/v1/orchestrate`（Layer 1+2+3 全链路，约 20~40s，打智谱 glm-4-flash）。
+
+### 全链路一键跑完（experts → analyze → match → run）
+
+```bash
+make orch-all ORCH_MSG='帮我用 Blender 做一个 5 秒的弹跳球动画'
+```
+
+### 分层调试（单独调某一层，不打网络或只打很少）
+
+| 想调试什么 | make 命令 | 是否打 LLM | 耗时 |
+|---|---|---|---|
+| 先看已注册的专家快照 | `make orch-experts` | ❌ 不打 | <1s |
+| Layer 1 任务分析（domain_tags / task_type） | `make orch-analyze ORCH_MSG='帮我用 Blender 做一个 5 秒的弹跳球动画'` | ❌ 不打 | <1s |
+| Layer 1+2 专家匹配（命中多少个专家） | `make orch-match   ORCH_MSG='帮我用 Blender 做一个 5 秒的弹跳球动画'` | ❌ 不打 | <1s |
+| Layer 1+2+3 完整编排（真实回答） | `make orch-run ORCH_MSG='...' ORCH_USER=xx ORCH_SESSION=xx` | ✅ 打智谱 | 20~40s |
+| 上面四个按顺序跑完 | `make orch-all ORCH_MSG='...'` | ✅ 最后一步打 | 25~45s |
+
+### 可用参数
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `ORCH_MSG='你的问题'` | `帮我用 Blender 做一个 5 秒的弹跳球动画` | 用户输入内容 |
+| `ORCH_USER=<id>` | `debug-user` | user_id（透传到 orchestrate 请求体） |
+| `ORCH_SESSION=<id>` | `orch-session-1` | session_id（透传到 orchestrate 请求体） |
+| `HTTP_ADDR=<url>` | `http://localhost:8080` | 服务地址（远程调试 / Docker 时用） |
+
+### 典型用法
+
+```bash
+# 1) 先看看专家库里都有谁
+make orch-experts
+
+# 2) 先只调"任务分析"，看看关键词提取准不准
+make orch-analyze ORCH_MSG='渲染一张产品 4K 360° 环绕镜头图'
+
+# 3) 看专家匹配对不对（要不要命中 blender 专家）
+make orch-match ORCH_MSG='渲染一张产品 4K 360° 环绕镜头图'
+
+# 4) 确认前面三层没问题后，再跑完整编排（免得白白浪费 LLM token）
+make orch-run \
+  ORCH_MSG='渲染一张产品 4K 360° 环绕镜头图' \
+  ORCH_USER=hezenghui \
+  ORCH_SESSION=prod-render-1
+```
+
+### 相关代码位置
+
+- Make 命令实现：`Makefile#L435-L563`
+- Orchestrate HTTP 入口：`src/presentation/http/adapters.rs`
+- 图匹配（决定触发 blender_workflow 的代码）：`crates/subhuti-core/src/orchestrator/mod.rs#L790-L827`
 
 ---
 
@@ -273,7 +344,8 @@ export OLLAMA_BASE_URL=http://localhost:11434
 - [完整用户指南](USER_GUIDE.md) - 详细功能说明
 - [架构详解](ARCHITECTURE.md) - 深入理解框架设计
 - [调试工具指南](DEBUG_TOOLS_GUIDE.md) - 开发调试利器
-- [API 文档](API_REFERENCE.md) - 完整 API 参考
+- [API 文档](API_TUTORIAL.md) — 完整 API + curl/make 示例
+- [调度器设计](ORCHESTRATOR_DESIGN.md) — Layer 1/2/3 三层调度原理
 
 ---
 

@@ -21,23 +21,22 @@ COPY crates/subhuti/Cargo.toml crates/subhuti/
 COPY crates/subhuti-expert-psychology/Cargo.toml crates/subhuti-expert-psychology/
 
 # 创建占位源码，让依赖预编译通过（利用缓存层）
-RUN mkdir -p src/bin/http_server src/bin/cli \
-    && echo "fn main() {}" > src/bin/http_server/main.rs \
-    && echo "fn main() {}" > src/bin/cli/main.rs \
+RUN mkdir -p src/bin \
+    && echo "fn main() {}" > src/bin/main.rs \
     && echo "fn main() {}" > src/bin/sync_test.rs \
-    && echo "fn main() {}" > src/main.rs \
+    && echo "fn main() {}" > src/bin/subhuti_app.rs \
     && mkdir -p crates/subhuti/src && echo "" > crates/subhuti/src/lib.rs \
     && mkdir -p crates/subhuti-expert-psychology/src && echo "" > crates/subhuti-expert-psychology/src/lib.rs
 
 # 预编译依赖（仅在 Cargo.toml 变更时重新执行）
-RUN cargo build --release --bin http_server 2>/dev/null || true
+RUN cargo build --release --bin subhuti 2>/dev/null || true
 
 # 复制真实源码并触发增量编译
 COPY . .
 RUN touch crates/subhuti/src/lib.rs \
     crates/subhuti-expert-psychology/src/lib.rs \
-    src/bin/http_server/main.rs \
-    && cargo build --release --bin http_server
+    src/bin/main.rs \
+    && cargo build --release --bin subhuti
 
 # ============ Stage 2: Runtime ============
 FROM debian:bookworm-slim
@@ -51,7 +50,7 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY --from=builder /app/target/release/http_server /app/http_server
+COPY --from=builder /app/target/release/subhuti /app/subhuti
 
 COPY static/ /app/static/
 COPY data/ /app/data/
@@ -75,4 +74,4 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD curl -sf http://localhost:8080/subhuti/api/v1/health || exit 1
 
-CMD ["/app/http_server"]
+CMD ["/app/subhuti", "serve"]

@@ -49,7 +49,6 @@ start() {
         "$IMAGE_NAME"
 
     echo "✅ 容器已启动"
-    echo "   测试页面: http://localhost:8080/subhuti/test/index.html"
     echo "   健康检查: http://localhost:8080/subhuti/api/v1/health"
 }
 

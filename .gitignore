@@ -93,6 +93,10 @@ __pycache__/
 venv/
 .env
 
+# LLM 调试缓存（SUBHUTI_LLM_CACHE=1 时生成）
+.llm-cache.json
+.llm-cache-*.json
+
 # 备份文件
 *.backup
 *.orig

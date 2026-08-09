@@ -7,6 +7,13 @@
       <sourceFolder url="file://$MODULE_DIR$/examples" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/subhuti-expert-psychology/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/subhuti/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/subhuti-expert-psychology-wasm/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/subhuti-plugin-sdk/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/subhuti-wasm/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/subhuti-core/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/subhuti-infra/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/subhuti-infra/tests" isTestSource="true" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />

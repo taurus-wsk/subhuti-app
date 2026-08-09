@@ -5,13 +5,41 @@
 # ============================================================
 
 [llm]
-# LLM 提供商: doubao, openai, ollama
-provider = "doubao"
-model = "doubao-seed-2-0-lite-260215"
-api_url = "https://ark.cn-beijing.volces.com/api/v3/responses"
-# api_key 建议通过环境变量 DOUBAO_API_KEY 设置，不要写在此文件中
+# LLM 提供商: zhipu(智谱/GLM), doubao(豆包), openai, ollama
+provider = "zhipu"
+# 默认用 glm-4-flash（标准版，QPS 宽松、响应快、不限流）
+# 需要深度思考时用 ZhipuClient.with_model("glm-4.7-flash") 切，用完切回
+model = "glm-4-flash"
+api_url = "https://open.bigmodel.cn/api/paas/v4"
+# api_key 建议通过环境变量 ZHIPU_API_KEY 设置，不要写在此文件中
+# export ZHIPU_API_KEY="你的智谱 API Key"
 temperature = 0.7
 max_tokens = 2048
+
+# ===== Zhipu glm-4.7-flash（深度思考版，高峰期可能 429 限流）切换示例 =====
+# 代码层调用：
+#   let thinking_client = Arc::new(zhipu_client.with_model("glm-4.7-flash"));
+#   subhuti.set_llm(thinking_client);  // 临时切到 4.7
+#   // ... 跑完深度思考任务
+#   subhuti.set_llm(default_client);    // 用完切回 glm-4-flash
+
+# ===== Doubao / 豆包示例（如需切换，注释掉上面 zhipu 块，取消下面注释） =====
+# provider = "doubao"
+# model = "doubao-seed-2-0-lite-260215"
+# api_url = "https://ark.cn-beijing.volces.com/api/v3/responses"
+# # DOUBAO_API_KEY 环境变量
+
+# ===== OpenAI 示例 =====
+# provider = "openai"
+# model = "gpt-4o-mini"
+# api_url = "https://api.openai.com/v1"
+# # OPENAI_API_KEY 环境变量
+
+# ===== Ollama 本地示例 =====
+# provider = "ollama"
+# model = "qwen2.5:7b"
+# api_url = "http://localhost:11434/api"
+# # 不需要 api_key
 
 [database]
 host = "localhost"
@@ -23,7 +51,7 @@ password = "123456"
 max_connections = 10
 
 [http]
-addr = "0.0.0.0:8080"
+addr = "0.0.0.0:8615"
 
 [logging]
 # 日志级别: trace, debug, info, warn, error
@@ -44,8 +72,9 @@ evolve_interval = 50
 importance_threshold = 0.6
 
 [test_mode]
-# 是否启用测试模式（启用后使用 Mock LLM 替代真实 LLM）
-enabled = true
+# 是否启用测试模式（启用后使用 Mock LLM 替代真实 LLM，不打网络）
+# 需要实际调用智谱/OpenAI 等远程 LLM 时，请设置为 false
+enabled = false
 # Mock 响应延迟（毫秒），模拟 LLM 调用耗时
 mock_delay_ms = 3000
 # Mock 响应数据文件路径

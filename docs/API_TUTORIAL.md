@@ -959,6 +959,260 @@ if __name__ == "__main__":
 
 ---
 
+## 🎯 Orchestrate 调度 API（多 Agent / 工作流编排）
+
+Subhuti 的核心编排能力：接收用户问题后，通过 **Layer 1 任务理解 → Layer 2 调度决策 → Layer 3 执行监控** 三层流程决定调用哪个专家 / 哪条工作流，并最终生成回答。
+
+HTTP 前缀：`/subhuti/api/v1/orchestrate`
+
+> 所有接口都提供等价的 **`make` 命令**（适合本地调试，直接在项目根目录运行），无需手写 JSON。
+
+---
+
+### 0. 完整编排（一次性跑三层 + LLM）
+
+最常用的接口。内部会依次走：**图路由匹配 → RuleEngine 三层调度 → 命中 blender 专家 → 调 glm-4-flash 生成回答**。
+
+#### 请求
+
+```http
+POST /subhuti/api/v1/orchestrate
+Content-Type: application/json
+```
+
+#### 请求体
+
+```json
+{
+  "message": "帮我用 Blender 做一个 5 秒的弹跳球动画",
+  "user_id": "hezenghui",
+  "session_id": "debug-1"
+}
+```
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `message` | string | ✅ | 用户输入 |
+| `user_id` | string | ❌ | 用户 ID，默认 `debug-user` |
+| `session_id` | string | ❌ | 会话 ID，默认 `orch-session-1` |
+| `chain` | string[] | ❌ | 强制指定策略链（未指定时由调度器自动决定） |
+
+#### 响应
+
+```json
+{
+  "success": true,
+  "session_id": "debug-1",
+  "chain": ["graph:blender_workflow"],
+  "expert_chain": ["blender"],
+  "expert_outputs": [],
+  "output": "（glm-4-flash 生成的完整 Blender 操作说明 + Python bpy 脚本）",
+  "tokens": { "input": 128, "output": 512 }
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `chain` | 实际命中的策略 / 图名（`graph:xxx` 表示走工作流图，`rule_engine:xxx` 表示走 RuleEngine） |
+| `expert_chain` | 最终被实际调用到的专家 ID 列表 |
+| `output` | LLM 生成的最终回答 |
+| `success` | 整次编排是否成功 |
+
+#### ⭐ 你最常用的调试命令（等价 curl）
+
+```bash
+make orch-run \
+  ORCH_MSG='帮我用 Blender 做一个 5 秒的弹跳球动画' \
+  ORCH_USER=hezenghui \
+  ORCH_SESSION=debug-1
+```
+
+等价 curl：
+
+```bash
+curl -X POST http://localhost:8080/subhuti/api/v1/orchestrate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "message": "帮我用 Blender 做一个 5 秒的弹跳球动画",
+    "user_id": "hezenghui",
+    "session_id": "debug-1"
+  }' | python3 -m json.tool
+```
+
+---
+
+### 1. 列出所有已注册专家快照（Layer 0）
+
+查看 Orchestrator 当前注册了哪些专家，每个专家有哪些 skills / tags。**不打网络，秒回**。
+
+#### 请求 / 响应
+
+```http
+GET /subhuti/api/v1/orchestrate/experts
+```
+
+```json
+{
+  "success": true,
+  "total": 1,
+  "data": [
+    {
+      "id": "blender",
+      "name": "Blender 动画专家",
+      "tags": ["blender", "3D", "动画", "建模", "渲染", "材质", "节点", "粒子"],
+      "skills": [
+        { "id": "blender-chat", "name": "聊天对话", "parameters": ["问题"] },
+        { "id": "blender-modeling", "name": "3D建模", "parameters": ["模型类型", "风格"] },
+        { "id": "blender-animation", "name": "动画制作", "parameters": ["动画类型", "时长"] },
+        { "id": "blender-render", "name": "渲染输出", "parameters": ["渲染器", "分辨率", "采样"] }
+      ]
+    }
+  ]
+}
+```
+
+#### Make 调试命令
+
+```bash
+make orch-experts
+```
+
+---
+
+### 2. Layer 1 任务分析（`analyze_task`）
+
+只调第一层：把用户问题解析成 `TaskProfile`（领域标签、任务类型、主谓宾结构化分解）。**不打网络，秒回**。
+
+#### 请求
+
+```http
+POST /subhuti/api/v1/orchestrate/analyze
+Content-Type: application/json
+```
+
+```json
+{ "message": "帮我用 Blender 做一个 5 秒的弹跳球动画" }
+```
+
+#### 响应
+
+```json
+{
+  "success": true,
+  "suggested_strategy": "SimpleDispatch",
+  "profile": {
+    "task_type": "chat",
+    "domain_tags": ["blender"],
+    "subject": "帮我用",
+    "predicate": "Blender",
+    "object": "做一个"
+  }
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `suggested_strategy` | RuleEngine 建议使用的调度策略（SimpleDispatch / ParallelDispatch / GraphFirst ...） |
+| `profile.domain_tags` | 提取到的领域标签（命中 blender 就会填 `["blender"]`） |
+| `profile.task_type` | `chat` / `task` / `code` / `review` 等，由 `analysis_rule` 产出 |
+| `profile.subject/predicate/object` | 中文 SVO 主谓宾初步切分（用于后续语义路由打分） |
+
+#### Make 调试命令
+
+```bash
+make orch-analyze ORCH_MSG='帮我用 Blender 做一个 5 秒的弹跳球动画'
+```
+
+---
+
+### 3. Layer 1 + Layer 2 专家匹配（`match_expert`）
+
+先 analyze 拿 TaskProfile，再 `decide_strategy` 按关键词打分 + 过滤 + 限量，最后返回命中的专家列表（含 skills、tags）。**不打网络，秒回**。
+
+#### 请求
+
+```http
+POST /subhuti/api/v1/orchestrate/match
+Content-Type: application/json
+```
+
+```json
+{ "message": "帮我用 Blender 做一个 5 秒的弹跳球动画" }
+```
+
+#### 响应
+
+```json
+{
+  "success": true,
+  "total": 1,
+  "matches": [
+    {
+      "id": "blender",
+      "name": "Blender 动画专家",
+      "tags": ["blender", "3D", "动画", ...],
+      "skills": [
+        { "id": "blender-chat", "name": "聊天对话", "parameters": ["问题"] },
+        ...
+      ]
+    }
+  ]
+}
+```
+
+返回顺序 = RuleEngine `DispatchPlan.steps` 的顺序（已经过打分和 Top-K 过滤）。
+
+#### Make 调试命令
+
+```bash
+make orch-match ORCH_MSG='帮我用 Blender 做一个 5 秒的弹跳球动画'
+```
+
+---
+
+### 4. 全链路一键调试
+
+等价顺序跑：① `orch-experts` → ② `orch-analyze` → ③ `orch-match` → ④ `orch-run`。前三层失败时可以快速看到哪一层先出错，避免白跑 LLM。
+
+```bash
+make orch-all ORCH_MSG='帮我用 Blender 做一个 5 秒的弹跳球动画'
+```
+
+可选参数（所有 orch-xxx 命令都支持）：
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `ORCH_MSG='你的问题'` | `帮我用 Blender 做一个 5 秒的弹跳球动画` | 用户输入 |
+| `ORCH_USER=<id>` | `debug-user` | user_id |
+| `ORCH_SESSION=<id>` | `orch-session-1` | session_id |
+| `HTTP_ADDR=<url>` | `http://localhost:8080` | 服务地址 |
+
+---
+
+### 典型调试流程（推荐）
+
+```bash
+# Step 1: 启动服务（首次）
+make serve-debug
+
+# Step 2: 先看专家库有啥
+make orch-experts
+
+# Step 3: 只调"任务分析"，避免浪费 token
+make orch-analyze ORCH_MSG='渲染一张产品 4K 360° 环绕镜头图'
+
+# Step 4: 看专家匹配对不对
+make orch-match   ORCH_MSG='渲染一张产品 4K 360° 环绕镜头图'
+
+# Step 5: 确认前面 OK 再跑完整编排（真正打 LLM）
+make orch-run     ORCH_MSG='渲染一张产品 4K 360° 环绕镜头图' ORCH_USER=hezenghui ORCH_SESSION=prod-1
+
+# 或者一键跑完整链路
+make orch-all ORCH_MSG='帮我用 Blender 做一个 5 秒的弹跳球动画'
+```
+
+---
+
 ## ❓ 常见问题
 
 ### Q: API 返回 500 错误怎么办？
@@ -979,14 +1233,25 @@ curl http://localhost:8080/subhuti/api/v1/trace/{trace_id}
 - **记忆系统**：底层存储，简单的增删改查
 - **心灵宫殿**：上层封装，包含分区、重要性、遗忘、联想激活、人格影响等高级功能
 
+### Q: orchestrate 命中 blender_workflow 的条件是什么？
+
+**A**: Orchestrator.dispatch() 按以下优先级决定路径：
+
+1. 语义路由（SemanticRouter）— 当前默认 disabled
+2. **图匹配 `graph_registry.find_matching_graph(input)`** — 当前注册 1 个图（`blender_workflow`）时，任意输入都会命中 blender；注册图≥2 个时，会按"图名 contains 关键词 / 分类关键词"命中。
+3. RuleEngine 三层调度（analyze → decide_strategy → execute） — 图匹配失败才走到这层。
+
+对应代码：`crates/subhuti-core/src/orchestrator/mod.rs#L396-L475`
+
 ---
 
 ## 📚 更多资源
 
-- [Quickstart 快速上手](QUICKSTART.md) - 5 分钟体验
-- [架构详解](ARCHITECTURE.md) - 深入理解框架
-- [用户指南](USER_GUIDE.md) - 完整功能说明
-- [调试工具指南](DEBUG_TOOLS_GUIDE.md) - 开发调试
+- [Quickstart 快速上手](QUICKSTART.md) — 5 分钟体验 + Orchestrate Make 速查表
+- [架构详解](ARCHITECTURE.md) — 深入理解框架
+- [用户指南](USER_GUIDE.md) — 完整功能说明
+- [调试工具指南](DEBUG_TOOLS_GUIDE.md) — 开发调试
+- [调度器设计](ORCHESTRATOR_DESIGN.md) — Layer 1/2/3 三层调度原理
 
 ---
 
