@@ -4,13 +4,15 @@
 //!
 //! 六边形架构：
 //! - 领域层定义接口（DomainExpert）
-//! - 出站适配层实现适配器（DomainExpert → subhuti::ExpertAgent）
+//! - 出站适配层实现适配器（DomainExpert → subhuti_core::ExpertAgent）
 //! - 应用层通过出站端口（ExpertRepositoryPort）管理专家
 //!
 //! 这样领域层可以完全独立于框架，便于测试和提取为独立 crate。
 
 use async_trait::async_trait;
 use std::sync::Arc;
+
+use crate::domain::ports::ToolchainPort;
 
 /// 领域技能信息（纯领域 DTO）
 ///
@@ -48,6 +50,8 @@ pub struct DomainExecutionContext {
     pub skill_id: Option<String>,
     /// 技能参数（可选）
     pub skill_params: Option<String>,
+    /// Rust 工具链（可选，RustExpert 等需要编译验证的专家使用）
+    pub toolchain: Option<Arc<dyn ToolchainPort>>,
 }
 
 impl std::fmt::Debug for DomainExecutionContext {

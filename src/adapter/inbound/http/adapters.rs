@@ -32,6 +32,7 @@ use tokio::sync::mpsc;
 
 use crate::adapter::inbound::http::route_adapter::RouteEntry;
 use crate::adapter::inbound::http::routes::AppState;
+use crate::application::observer::{record_fn_log, LogLevel};
 use crate::application::{
     ChatPort, ExpertQueryPort, SessionObserverPort, SkillPort, StreamEvent, TraceObserverPort,
 };
@@ -142,6 +143,8 @@ pub struct OrchestrateRequest {
     pub user_id: Option<String>,
     pub session_id: Option<String>,
     pub chain: Option<String>,
+    /// 指定要使用的图名称（为空时自动匹配）
+    pub graph: Option<String>,
 }
 
 // ─── 工具函数 ──────────────────────────────────────────────────
@@ -213,10 +216,15 @@ async fn chat_stream_handler(
         .unwrap_or_else(|| "anonymous".to_string());
     let session_id = req.session_id.clone().unwrap_or_else(uuid_v4);
 
-    tracing::info!(
-        user = %user_id, session = %session_id,
-        message = %req.message, chain = ?req.chain,
-        "Chat stream 请求"
+    record_fn_log(
+        None,
+        "",
+        LogLevel::Info,
+        format!(
+            "Chat stream 请求 (user={}, session={}, message={}, chain={:?})",
+            user_id, session_id, req.message, req.chain
+        ),
+        None,
     );
 
     let receiver = state.chat_port.orchestrate_stream(PortRequest {
@@ -224,6 +232,7 @@ async fn chat_stream_handler(
         user_id: Some(user_id.clone()),
         session_id: Some(session_id.clone()),
         chain: req.chain.clone(),
+        graph: req.graph.clone(),
         trace_id: None,
     });
 
@@ -252,10 +261,18 @@ async fn orchestrate_handler(
         .unwrap_or_else(|| "anonymous".to_string());
     let session_id = req.session_id.clone().unwrap_or_else(uuid_v4);
 
-    tracing::info!(
-        user = %user_id, session = %session_id,
-        message_len = req.message.len(), chain = ?req.chain,
-        "收到编排请求"
+    record_fn_log(
+        None,
+        "",
+        LogLevel::Info,
+        format!(
+            "收到编排请求 (user={}, session={}, message_len={}, chain={:?})",
+            user_id,
+            session_id,
+            req.message.len(),
+            req.chain
+        ),
+        None,
     );
 
     let response = state
@@ -265,29 +282,48 @@ async fn orchestrate_handler(
             user_id: Some(user_id.clone()),
             session_id: Some(session_id.clone()),
             chain: req.chain.clone(),
+            graph: req.graph.clone(),
             trace_id: None,
         })
         .await;
 
     if response.success {
-        tracing::info!(
-            chain = ?response.chain,
-            experts = response.expert_chain.len(),
-            "编排完成"
+        record_fn_log(
+            None,
+            "",
+            LogLevel::Info,
+            format!(
+                "编排完成 (chain={:?}, experts={}, trace={})",
+                response.chain,
+                response.expert_chain.len(),
+                response.trace_id
+            ),
+            None,
         );
         ApiSuccess::ok(serde_json::json!({
             "output": response.output,
-            "session_id": session_id,
+            "trace_id": response.trace_id,
+            "session_id": response.session_id,
             "chain": response.chain,
             "expert_chain": response.expert_chain,
             "expert_outputs": response.expert_outputs,
+            "duration_ms": response.duration_ms,
         }))
         .into_response()
     } else {
         let error_msg = response.error.clone().unwrap_or_default();
-        tracing::error!(error = %error_msg, "编排错误");
+        record_fn_log(
+            None,
+            "",
+            LogLevel::Error,
+            format!("编排错误 (error={})", error_msg),
+            None,
+        );
         ApiError::internal(error_msg)
-            .with_detail(serde_json::json!({ "session_id": session_id }))
+            .with_detail(serde_json::json!({
+                "session_id": session_id,
+                "trace_id": response.trace_id,
+            }))
             .into_response()
     }
 }
@@ -384,10 +420,15 @@ async fn skill_execute_handler(
         .unwrap_or_else(|| "anonymous".to_string());
     let session_id = req.session_id.clone().unwrap_or_else(uuid_v4);
 
-    tracing::info!(
-        user = %user_id, skill = %skill_name, session = %session_id,
-        message = %req.message,
-        "Skill execute 请求"
+    record_fn_log(
+        None,
+        "",
+        LogLevel::Info,
+        format!(
+            "Skill execute 请求 (user={}, skill={}, session={}, message={})",
+            user_id, skill_name, session_id, req.message
+        ),
+        None,
     );
 
     let response = state
@@ -396,9 +437,15 @@ async fn skill_execute_handler(
         .await;
 
     if response.success {
-        tracing::info!(
-            skill = %skill_name, expert = %response.expert_id,
-            "Skill execute 完成"
+        record_fn_log(
+            None,
+            "",
+            LogLevel::Info,
+            format!(
+                "Skill execute 完成 (skill={}, expert={})",
+                skill_name, response.expert_id
+            ),
+            None,
         );
         ApiSuccess::ok(serde_json::json!({
             "output": response.output,
@@ -409,7 +456,16 @@ async fn skill_execute_handler(
         .into_response()
     } else {
         let error_msg = response.error.clone().unwrap_or_default();
-        tracing::error!(skill = %skill_name, error = %error_msg, "Skill execute 错误");
+        record_fn_log(
+            None,
+            "",
+            LogLevel::Error,
+            format!(
+                "Skill execute 错误 (skill={}, error={})",
+                skill_name, error_msg
+            ),
+            None,
+        );
         ApiError::internal(error_msg)
             .with_detail(serde_json::json!({ "session_id": session_id }))
             .into_response()
@@ -472,11 +528,15 @@ async fn skill_stream_handler(
         .unwrap_or_else(|| "anonymous".to_string());
     let session_id = req.session_id.clone().unwrap_or_else(uuid_v4);
 
-    tracing::info!(
-        "Skill execute stream request: skill={}, session={}, message={}",
-        skill_name,
-        session_id,
-        req.message
+    record_fn_log(
+        None,
+        "",
+        LogLevel::Info,
+        format!(
+            "Skill execute stream request: skill={}, session={}, message={}",
+            skill_name, session_id, req.message
+        ),
+        None,
     );
 
     let receiver = state

@@ -6,6 +6,7 @@
 //! 注意：业务 trace/session 记录已下沉到应用层 `TraceAppService` 装饰器，
 //! 自动覆盖所有入站端口，HTTP 层不再承担 trace 记录职责。
 
+use crate::application::observer::{record_fn_log, LogLevel};
 use axum::{
     extract::Request,
     http::{HeaderName, HeaderValue},
@@ -141,7 +142,7 @@ where
         let start = Instant::now();
 
         // 获取 Trace ID
-        let trace_id = req
+        let _trace_id = req
             .extensions()
             .get::<TraceId>()
             .map(|t| t.0.clone())
@@ -155,18 +156,18 @@ where
             let status = response.status();
 
             // 记录请求日志
-            tracing::info!(
-                target: "http_request",
-                trace_id = %trace_id,
-                method = %method,
-                path = %path,
-                status = %status.as_u16(),
-                duration_ms = %duration.as_millis(),
-                "{} {} {} ({}ms)",
-                method,
-                path,
-                status.as_u16(),
-                duration.as_millis()
+            record_fn_log(
+                None,
+                "",
+                LogLevel::Info,
+                format!(
+                    "{} {} {} ({}ms)",
+                    method,
+                    path,
+                    status.as_u16(),
+                    duration.as_millis()
+                ),
+                None,
             );
 
             Ok(response)

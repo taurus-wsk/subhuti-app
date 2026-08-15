@@ -21,6 +21,7 @@
 //! 提取时无需修改核心逻辑。
 
 pub mod blender;
+pub mod rust_expert;
 
 use std::sync::Arc;
 
@@ -30,5 +31,8 @@ use crate::domain::traits::DomainExpert;
 ///
 /// 返回领域层接口的专家列表，由应用层负责注册到 ExpertRepositoryPort。
 pub fn create_all_experts() -> Vec<Arc<dyn DomainExpert>> {
-    vec![Arc::new(blender::BlenderExpert::new())]
+    vec![
+        Arc::new(blender::BlenderExpert::new()),
+        Arc::new(rust_expert::RustExpert::new()),
+    ]
 }

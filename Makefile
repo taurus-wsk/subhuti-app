@@ -359,10 +359,8 @@ http-orchestrate:
 			MESSAGE=$$(cat subhuti.md); \
 			echo "$(CYAN)📖 从 subhuti.md 读取消息$(NC)"; \
 		else \
-			echo "$(RED)❌ 未指定 HTTP_MESSAGE 且 subhuti.md 不存在$(NC)"; \
-			echo "用法: make http-orchestrate HTTP_MESSAGE='你的问题'"; \
-			echo "或创建 subhuti.md 文件写入默认消息"; \
-			exit 1; \
+			MESSAGE="你好"; \
+			echo "$(CYAN)ℹ️  使用默认消息 '你好'$(NC)"; \
 		fi; \
 	fi; \
 	echo "$(GREEN)🎯 HTTP Orchestrate - 通过 HTTP API 测试多 Agent 调度$(NC)"; \
@@ -373,7 +371,18 @@ http-orchestrate:
 	echo ""; \
 	curl -s -X POST "$(HTTP_ADDR)/subhuti/api/v1/orchestrate" \
 		-H "Content-Type: application/json" \
-		-d "{\"message\":\"$$MESSAGE\"}" | python3 -m json.tool
+		-d "{\"message\":\"$$MESSAGE\",\"user_id\":\"$(HTTP_USER)\",\"session_id\":\"$$(uuidgen | tr '[:upper:]' '[:lower:]')\"}" \
+	| python3 -m json.tool; \
+	echo ""; \
+	echo "$(GREEN)🔍 查看最后一次 trace 的函数调用报告:$(NC)"; \
+	echo "  $(CYAN)$(HTTP_ADDR)/subhuti/api/v1/traces/last/fn_call_report$(NC)"; \
+	echo ""; \
+	read -p "❓ 是否在浏览器打开函数调用报告? [Y/n] " ans; \
+	if [ "$$ans" != "n" ] && [ "$$ans" != "N" ]; then \
+		open "$(HTTP_ADDR)/subhuti/api/v1/traces/last/fn_call_report" 2>/dev/null || \
+		xdg-open "$(HTTP_ADDR)/subhuti/api/v1/traces/last/fn_call_report" 2>/dev/null || \
+		echo "  请手动打开上述 URL"; \
+	fi
 
 api-persona:
 	@echo "$(GREEN)💎 API Persona$(NC)"

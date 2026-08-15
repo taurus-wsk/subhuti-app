@@ -6,13 +6,13 @@
 //!
 //! 六边形架构：
 //! - 属于 outbound adapter（适配框架 EventHandler → 应用层 TraceObserverPort）
-//! - 依赖：框架层 subhuti::event::EventHandler、应用层 TraceObserverPort/SpanData
+//! - 依赖：框架层 subhuti_core::event::EventHandler、应用层 TraceObserverPort/SpanData
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use subhuti::event::{AgentEventData, Event, EventFilter, EventHandler};
+use subhuti_core::event::{AgentEventData, Event, EventFilter, EventHandler};
 
 use crate::application::observer::{SpanData, TraceObserverPort};
 
@@ -243,6 +243,7 @@ impl TraceEventBridge {
             AgentEventData::NodeCompleted {
                 run_id,
                 node_name,
+                actor_name: _,
                 output,
                 success,
                 duration_ms,
@@ -306,7 +307,81 @@ impl TraceEventBridge {
                 }
             }
 
-            // LLM/Tool/Memory/Span 事件也可扩展，当前方案聚焦 orchestrator + graph，留空
+            // ── LLM 层事件 ──
+            AgentEventData::LLMCalling {
+                messages_count,
+                model,
+            } => {
+                extra.insert("messages_count".into(), messages_count.to_string());
+                if let Some(m) = model {
+                    extra.insert("model".into(), m.clone());
+                }
+                SpanData {
+                    span_type,
+                    name: "llm_call".into(),
+                    input: None,
+                    output: None,
+                    duration_ms: None,
+                    tokens: None,
+                    timestamp,
+                    success: None,
+                    extra: extra_empty(),
+                }
+            }
+
+            AgentEventData::LLMResponded {
+                response,
+                tokens_used,
+                duration_ms,
+            } => {
+                extra.insert("tokens_used".into(), tokens_used.to_string());
+                SpanData {
+                    span_type,
+                    name: "llm_response".into(),
+                    input: None,
+                    output: Some(response.clone()),
+                    duration_ms: Some(*duration_ms),
+                    tokens: Some(*tokens_used),
+                    timestamp,
+                    success: Some(true),
+                    extra: extra_empty(),
+                }
+            }
+
+            // ── 工具层事件 ──
+            AgentEventData::ToolCalling { tool_name, args } => {
+                extra.insert("tool_args".into(), args.to_string());
+                SpanData {
+                    span_type,
+                    name: tool_name.clone(),
+                    input: Some(args.to_string()),
+                    output: None,
+                    duration_ms: None,
+                    tokens: None,
+                    timestamp,
+                    success: None,
+                    extra: extra_empty(),
+                }
+            }
+
+            AgentEventData::ToolResponded {
+                tool_name,
+                result,
+                success,
+                duration_ms,
+            } => SpanData {
+                span_type,
+                name: tool_name.clone(),
+                input: None,
+                output: Some(result.clone()),
+                duration_ms: Some(*duration_ms),
+                tokens: None,
+                timestamp,
+                success: Some(*success),
+                extra: extra_empty(),
+            },
+
+            // Memory/Span 等事件暂不处理，后续扩展
             _ => return None,
         };
         // 统一填 extra（包含 trace_id 追加）
@@ -336,5 +411,141 @@ impl EventHandler for TraceEventBridge {
                 self.trace_observer.record_span(trace_id, span);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use subhuti_core::event::EventMetadata;
+
+    fn make_event(data: AgentEventData, trace_id: &str, session_id: Option<&str>) -> Event {
+        let mut meta = EventMetadata::new();
+        meta.trace_id = Some(trace_id.to_string());
+        meta.session_id = session_id.map(|s| s.to_string());
+        Event {
+            metadata: meta,
+            data,
+        }
+    }
+
+    #[test]
+    fn test_convert_llm_calling() {
+        let event = make_event(
+            AgentEventData::LLMCalling {
+                messages_count: 2,
+                model: Some("gpt-4".into()),
+            },
+            "trace-123",
+            Some("session-456"),
+        );
+        let span = TraceEventBridge::convert(&event).expect("LLMCalling 不应返回 None");
+        assert_eq!(span.span_type, "llm_calling");
+        assert_eq!(span.name, "llm_call");
+        assert_eq!(span.success, None);
+        assert_eq!(span.duration_ms, None);
+        assert_eq!(span.tokens, None);
+        assert_eq!(
+            span.extra.get("trace_id").map(|s| s.as_str()),
+            Some("trace-123")
+        );
+        assert_eq!(
+            span.extra.get("messages_count").map(|s| s.as_str()),
+            Some("2")
+        );
+        assert_eq!(span.extra.get("model").map(|s| s.as_str()), Some("gpt-4"));
+    }
+
+    #[test]
+    fn test_convert_llm_responded() {
+        let event = make_event(
+            AgentEventData::LLMResponded {
+                response: "Hello!".into(),
+                tokens_used: 42,
+                duration_ms: 1500,
+            },
+            "trace-123",
+            None,
+        );
+        let span = TraceEventBridge::convert(&event).expect("LLMResponded 不应返回 None");
+        assert_eq!(span.span_type, "llm_responded");
+        assert_eq!(span.name, "llm_response");
+        assert_eq!(span.output, Some("Hello!".into()));
+        assert_eq!(span.duration_ms, Some(1500));
+        assert_eq!(span.tokens, Some(42));
+        assert_eq!(span.success, Some(true));
+    }
+
+    #[test]
+    fn test_convert_tool_calling() {
+        let event = make_event(
+            AgentEventData::ToolCalling {
+                tool_name: "write_files".into(),
+                args: serde_json::json!({"path": "/tmp/test"}),
+            },
+            "trace-123",
+            None,
+        );
+        let span = TraceEventBridge::convert(&event).expect("ToolCalling 不应返回 None");
+        assert_eq!(span.span_type, "tool_calling");
+        assert_eq!(span.name, "write_files");
+        assert_eq!(span.success, None);
+        assert_eq!(span.duration_ms, None);
+    }
+
+    #[test]
+    fn test_convert_tool_responded() {
+        let event = make_event(
+            AgentEventData::ToolResponded {
+                tool_name: "cargo_check".into(),
+                result: "编译通过".into(),
+                success: true,
+                duration_ms: 500,
+            },
+            "trace-123",
+            None,
+        );
+        let span = TraceEventBridge::convert(&event).expect("ToolResponded 不应返回 None");
+        assert_eq!(span.span_type, "tool_responded");
+        assert_eq!(span.name, "cargo_check");
+        assert_eq!(span.output, Some("编译通过".into()));
+        assert_eq!(span.duration_ms, Some(500));
+        assert_eq!(span.success, Some(true));
+    }
+
+    #[test]
+    fn test_convert_no_trace_id_returns_none() {
+        let event = Event::new(AgentEventData::LLMCalling {
+            messages_count: 1,
+            model: None,
+        });
+        let span = TraceEventBridge::convert(&event);
+        assert!(span.is_none(), "无 trace_id 应返回 None");
+    }
+
+    #[test]
+    fn test_convert_other_events_return_none() {
+        // MemoryWritten 事件应返回 None（暂未处理）
+        let event = make_event(
+            AgentEventData::MemoryWritten {
+                key: "test".into(),
+                category: "chat".into(),
+            },
+            "trace-123",
+            None,
+        );
+        let span = TraceEventBridge::convert(&event);
+        assert!(span.is_none(), "MemoryWritten 应返回 None（暂未处理）");
+    }
+
+    #[test]
+    fn test_convert_empty_trace_id_returns_none() {
+        let mut event = Event::new(AgentEventData::LLMCalling {
+            messages_count: 1,
+            model: None,
+        });
+        event.metadata.trace_id = Some("".into());
+        let span = TraceEventBridge::convert(&event);
+        assert!(span.is_none(), "空 trace_id 应返回 None");
     }
 }

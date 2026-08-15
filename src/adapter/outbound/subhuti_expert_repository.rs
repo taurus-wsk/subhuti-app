@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use subhuti::Subhuti;
+use subhuti_core::engine::Subhuti;
 
 use crate::adapter::outbound::domain_expert_adapter::DomainExpertAdapter;
 use crate::adapter::outbound::framework_to_app_expert;
@@ -67,7 +67,7 @@ impl ExpertRepositoryPort for SubhutiExpertRepository {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         let subhuti = self.subhuti.clone();
         // 将领域专家转换为框架专家（传递 repository）
-        let framework_expert = Arc::new(DomainExpertAdapter::new(expert, repository));
+        let framework_expert = Arc::new(DomainExpertAdapter::new(expert, repository, None));
         Box::pin(async move {
             subhuti.register_orchestrator_expert(framework_expert).await;
         })

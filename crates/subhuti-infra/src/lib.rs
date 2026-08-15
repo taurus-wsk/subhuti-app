@@ -8,11 +8,21 @@
 //! - **infra**: 具体实现，对接第三方服务（LLM API、数据库、工具等）
 //! - **应用层**: 业务实现，使用 core 接口和 infra 实现
 
+pub mod config;
+pub mod debug;
 pub mod llm;
 pub mod memory;
 pub mod tool;
 pub mod vertical;
 
+pub use config::{
+    BigFive, EmotionalTendency, FeedbackType, FlowConfig, FlowTemplate, InteractionStats,
+    RuntimeConfig, SoulProfile, SubhutiConfig, TokenUsage, ToneStyle,
+};
+pub use debug::{
+    assert_with_context, debug_print, diagnose_value, measure_time, HealthReport, HealthStatus,
+    LockDetector, Profiler, TestTracker,
+};
 pub use llm::{
     CacheStats, CachedLLM, DoubaoClient, DoubaoConfig, MockLLM, OllamaClient, OllamaConfig,
     OpenAIClient, OpenAIConfig, ZhipuClient, ZhipuConfig,

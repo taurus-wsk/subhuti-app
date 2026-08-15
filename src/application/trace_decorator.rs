@@ -1,6 +1,6 @@
 //! # Trace 装饰器
 //!
-//! 包装 AppService，为 3 个入站端口自动记录 trace + session。
+//! 包装 OrchestrationService，为 3 个入站端口自动记录 trace + session。
 //! 所有 inbound adapter（HTTP/测试/未来 gRPC）拿到的是 TraceAppService，
 //! trace 自动生效，无需任何 adapter 手写 trace 逻辑。
 //!
@@ -14,16 +14,16 @@ use std::time::Instant;
 
 use tokio::sync::mpsc;
 
-use crate::application::app_service::AppService;
 use crate::application::observer::{
     SessionObserverPort, SessionRecordParams, TraceHandle, TraceObserverPort,
 };
+use crate::application::orchestration_service::OrchestrationService;
 use crate::application::ports::{ChatPort, ExpertQueryPort, SkillPort, StreamEvent};
 use crate::domain::dto::{
     ExpertInfo, OrchestrateRequest, OrchestrateResponse, SkillInfo, SkillResponse,
 };
 
-/// Trace 装饰器：包装 AppService，自动记录 trace + session
+/// Trace 装饰器：包装 OrchestrationService，自动记录 trace + session
 ///
 /// 一个结构体实现 3 个入站端口（ChatPort + ExpertQueryPort + SkillPort）：
 /// - 执行类方法（orchestrate/execute_skill 及其 stream 版本）自动加 trace + session
@@ -31,14 +31,14 @@ use crate::domain::dto::{
 ///
 /// 组合根产出 `Arc<TraceAppService>`，clone 成 3 个 trait object 分发给各 adapter。
 pub struct TraceAppService {
-    inner: Arc<AppService>,
+    inner: Arc<OrchestrationService>,
     trace_observer: Arc<dyn TraceObserverPort>,
     session_observer: Arc<dyn SessionObserverPort>,
 }
 
 impl TraceAppService {
     pub fn new(
-        inner: Arc<AppService>,
+        inner: Arc<OrchestrationService>,
         trace_observer: Arc<dyn TraceObserverPort>,
         session_observer: Arc<dyn SessionObserverPort>,
     ) -> Self {
@@ -129,7 +129,7 @@ impl ChatPort for TraceAppService {
 
         Box::pin(async move {
             let trace = trace_observer.create_trace(&user_id, &session_id, &message);
-            // 生成 trace_id 并注入 request，供 AppService → 出站适配器 → 框架 ctx 使用
+            // 生成 trace_id 并注入 request，供 OrchestrationService → 出站适配器 → 框架 ctx 使用
             let trace_id = trace.trace_id.clone();
             let mut request = request;
             request.trace_id = Some(trace_id);

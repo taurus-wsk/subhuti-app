@@ -201,6 +201,7 @@ pub enum AgentEventData {
     NodeCompleted {
         run_id: String,
         node_name: String,
+        actor_name: String,
         output: String,
         success: bool,
         duration_ms: u64,
@@ -221,6 +222,36 @@ pub enum AgentEventData {
         success: bool,
         total_steps: usize,
         duration_ms: u64,
+    },
+
+    // ── Actor 竞标事件 ──
+    /// 演员任务可用（调度器发布，通知所有 Actor 有任务了）
+    ActorTaskRequested {
+        run_id: String,
+        node_name: String,
+        /// 任务标签（Actor 根据此标签自评分数）
+        task_tags: Vec<String>,
+        /// 任务描述
+        task_description: String,
+        step: usize,
+        /// 当前图状态
+        state: std::collections::HashMap<String, serde_json::Value>,
+    },
+    /// 演员竞标（Actor 自评后发布分数）
+    ActorBid {
+        run_id: String,
+        node_name: String,
+        actor_id: String,
+        score: u32,
+    },
+    /// 节点任务分配（调度器选中最匹配 Actor 后发布）
+    NodeTaskAssigned {
+        run_id: String,
+        node_name: String,
+        actor_id: String,
+        actor_name: String,
+        score: u32,
+        state: std::collections::HashMap<String, serde_json::Value>,
     },
 }
 
@@ -301,6 +332,9 @@ impl AgentEventData {
             Self::NodeCompleted { .. } => "node_completed",
             Self::NodeFailed { .. } => "node_failed",
             Self::GraphCompleted { .. } => "graph_completed",
+            Self::ActorTaskRequested { .. } => "actor_task_requested",
+            Self::ActorBid { .. } => "actor_bid",
+            Self::NodeTaskAssigned { .. } => "node_task_assigned",
         }
     }
 }

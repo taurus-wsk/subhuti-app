@@ -8,12 +8,13 @@
 //! - **Actor 层**：并发执行、状态隔离、故障恢复（`actor/`）
 //! - **Event 层**：解耦通信、可观测性（`event/`）
 //!
-//! ## 两种执行模式
+//! ## 执行模式
 //!
 //! | 方法 | 模式 | 特点 |
 //! |------|------|------|
-//! | `run()` | 直接执行 | 串行，轻量 |
+//! | `run_event_driven()` | 事件驱动 | 竞标制调度，Actor 池执行，可观测 |
 //! | `run_with_actors()` | Actor 执行 | 并行 fan-out，故障恢复 |
+//! | `run_with_id()` | 直接执行 | 串行，支持检查点恢复 |
 
 use super::actor::{NodeMessage, SupervisionStrategy, Supervisor};
 use super::checkpoint::{Checkpoint, CheckpointStore, MemoryCheckpointStore};
@@ -22,6 +23,8 @@ use super::state::{GraphState, StateReducer};
 use super::validator::{INodeValidator, NodeFixRunner};
 use crate::event::{AgentEventData, EventBus};
 use crate::guardrails::IGuardrail;
+use crate::orchestrator::actor::ActorRegistry;
+use crate::orchestrator::ExpertState;
 use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -70,6 +73,8 @@ pub struct Graph {
     pub(crate) name: String,
     /// 节点列表
     pub(crate) nodes: HashMap<String, GraphNode>,
+    /// 节点标签（竞标制用：Actor 根据标签自评分数）
+    pub(crate) node_tags: HashMap<String, Vec<String>>,
     /// 静态边：from -> [to]
     pub(crate) edges: HashMap<String, Vec<String>>,
     /// 条件边：from -> ConditionalEdge
@@ -103,6 +108,7 @@ impl Clone for Graph {
         Self {
             name: self.name.clone(),
             nodes: self.nodes.clone(),
+            node_tags: self.node_tags.clone(),
             edges: self.edges.clone(),
             conditional_edges: self.conditional_edges.clone(),
             entry: self.entry.clone(),
@@ -218,12 +224,6 @@ impl Graph {
                 }
             }
         })
-    }
-
-    /// 执行图
-    pub async fn run(&self, mut state: GraphState) -> Result<GraphOutput> {
-        self.run_with_id(&uuid::Uuid::new_v4().to_string(), &mut state)
-            .await
     }
 
     /// 带执行 ID 执行（支持从检查点恢复）
@@ -490,14 +490,19 @@ impl Graph {
     /// |------|------|------|
     /// | 直接执行 | `run()` | 串行，轻量，调试用 |
     /// | Actor 执行 | `run_with_actors()` | 并行，容错，紧耦合 |
-    /// | **事件驱动** | `run_event_driven()` | **完全解耦，事件总线通信** |
+    /// | **事件驱动** | `run_event_driven()` | **竞标制：Actor 池竞标上岗** |
     ///
-    /// 事件驱动模式的核心：
-    /// - 调度器不直接调用 Actor，只发布 `NodeExecuteRequested` 事件
-    /// - Actor 订阅事件执行，完成后发布 `NodeCompleted` 事件
-    /// - 调度器订阅 `NodeCompleted` 事件，驱动下一节点
-    /// - 完全通过事件总线通信，支持动态插拔和分布式扩展
-    pub async fn run_event_driven(&self, state: GraphState) -> Result<GraphOutput> {
+    /// 事件驱动模式的核心变化（竞标制）：
+    /// - 不再为每个节点创建固定 Actor
+    /// - 全局 Actor 池（ActorRegistry）中的 Actor 竞争每个节点
+    /// - 节点发布任务要求 → 所有 Actor 自评分数 → 最高分上台
+    /// - 图节点不再预绑定专家，实现真正的解耦
+    pub async fn run_event_driven(
+        &self,
+        state: GraphState,
+        actor_registry: &ActorRegistry,
+        expert_state: &ExpertState,
+    ) -> Result<GraphOutput> {
         let bus = self
             .event_bus
             .clone()
@@ -505,31 +510,21 @@ impl Graph {
 
         let run_id = format!("run_{}", chrono::Utc::now().timestamp_millis());
 
-        let mut subscriptions = Vec::new();
+        // 不再为每个节点创建 EventDrivenActor
+        // 全局 Actor 池（ActorRegistry）中的 Actor 通过竞标制竞争节点
+        // 参见 EventDrivenScheduler::run_with_run_id 中的竞标逻辑
 
-        // 为每个节点创建 EventDrivenActor（确保订阅完成）
-        for (name, node) in &self.nodes {
-            let (_actor, subscription_id) = super::actor::EventDrivenActor::new(
-                name.clone(),
-                node.func.clone(),
-                bus.clone(),
-                run_id.clone(),
-            )
-            .await;
-            subscriptions.push(subscription_id);
-        }
-
-        // 创建事件驱动调度器
+        // 创建事件驱动调度器（传入 ActorRegistry 用于竞标，ExpertState 用于 Actor 执行）
         let graph_arc = Arc::new(self.clone());
-        let scheduler = super::actor::EventDrivenScheduler::new(graph_arc, bus.clone());
+        let scheduler = super::actor::EventDrivenScheduler::new(
+            graph_arc,
+            bus.clone(),
+            actor_registry,
+            expert_state,
+        );
 
         // 执行
         let result = scheduler.run_with_run_id(state, run_id).await;
-
-        // 清理本次创建的订阅
-        for subscription_id in subscriptions {
-            bus.unsubscribe(&subscription_id).await;
-        }
 
         result
     }
@@ -894,6 +889,7 @@ pub struct GraphStructure {
 pub struct GraphBuilder {
     name: String,
     nodes: HashMap<String, GraphNode>,
+    node_tags: HashMap<String, Vec<String>>,
     edges: HashMap<String, Vec<String>>,
     conditional_edges: HashMap<String, ConditionalEdge>,
     entry: Option<String>,
@@ -914,6 +910,7 @@ impl GraphBuilder {
         Self {
             name: "graph".to_string(),
             nodes: HashMap::new(),
+            node_tags: HashMap::new(),
             edges: HashMap::new(),
             conditional_edges: HashMap::new(),
             entry: None,
@@ -963,6 +960,12 @@ impl GraphBuilder {
             name.clone(),
             GraphNode::new(name, func).with_description(desc),
         );
+        self
+    }
+
+    /// 为节点设置竞标标签（Actor 根据标签自评匹配度）
+    pub fn node_tag(mut self, node_name: impl Into<String>, tags: Vec<String>) -> Self {
+        self.node_tags.insert(node_name.into(), tags);
         self
     }
 
@@ -1113,6 +1116,7 @@ impl GraphBuilder {
         Ok(Graph {
             name: self.name,
             nodes: self.nodes,
+            node_tags: self.node_tags,
             edges: self.edges,
             conditional_edges: self.conditional_edges,
             entry: Some(entry),
@@ -1156,7 +1160,10 @@ mod tests {
             .build()
             .unwrap();
 
-        let output = graph.run(GraphState::new()).await.unwrap();
+        let output = graph
+            .run_with_id("test-1", &mut GraphState::new())
+            .await
+            .unwrap();
 
         assert!(output.success);
         assert_eq!(output.output, "result_c");
@@ -1187,7 +1194,10 @@ mod tests {
             .build()
             .unwrap();
 
-        let output = graph.run(GraphState::new()).await.unwrap();
+        let output = graph
+            .run_with_id("test-2", &mut GraphState::new())
+            .await
+            .unwrap();
 
         assert!(output.success);
         assert_eq!(output.output, "reviewed");
@@ -1208,7 +1218,10 @@ mod tests {
             .build()
             .unwrap();
 
-        let output = graph.run(GraphState::new()).await.unwrap();
+        let output = graph
+            .run_with_id("test-3", &mut GraphState::new())
+            .await
+            .unwrap();
 
         assert!(!output.success);
         assert_eq!(output.execution_path, vec!["a", "b"]);
@@ -1225,7 +1238,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let result = graph.run(GraphState::new()).await;
+        let result = graph.run_with_id("test-4", &mut GraphState::new()).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1295,7 +1308,10 @@ mod tests {
             .build()
             .unwrap();
 
-        let output = graph.run(GraphState::new()).await.unwrap();
+        let output = graph
+            .run_with_id("test-5", &mut GraphState::new())
+            .await
+            .unwrap();
 
         let messages = output.state.get_value("messages").unwrap();
         assert_eq!(messages, &serde_json::json!(["msg_a", "msg_b"]));
@@ -1317,7 +1333,10 @@ mod tests {
             .build()
             .unwrap();
 
-        let output = graph.run(GraphState::new()).await.unwrap();
+        let output = graph
+            .run_with_id("test-event-bus", &mut GraphState::new())
+            .await
+            .unwrap();
 
         assert!(output.success);
 
@@ -1368,7 +1387,10 @@ mod tests {
             .build()
             .unwrap();
 
-        let output = graph.run(GraphState::new()).await.unwrap();
+        let output = graph
+            .run_with_id("test-route", &mut GraphState::new())
+            .await
+            .unwrap();
 
         // start 使用显式路由跳转到 skip，跳过 middle
         assert_eq!(output.execution_path, vec!["start", "skip"]);

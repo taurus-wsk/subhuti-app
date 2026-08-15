@@ -21,7 +21,7 @@
 //! 使用默认规则：
 //!
 //! ```rust
-//! use subhuti::orchestrator::{DefaultTaskAnalysisRule, DefaultDispatchRule, DefaultExecutionRule};
+//! use subhuti_core::orchestrator::{DefaultTaskAnalysisRule, DefaultDispatchRule, DefaultExecutionRule};
 //! use std::sync::Arc;
 //!
 //! let analysis_rule = Arc::new(DefaultTaskAnalysisRule::new());
@@ -31,7 +31,7 @@
 
 use async_trait::async_trait;
 use std::sync::Arc;
-use subhuti::orchestrator::{
+use subhuti_core::orchestrator::{
     DefaultDispatchRule, DefaultExecutionRule, DefaultTaskAnalysisRule, DispatchRule,
     ExecutionRule, RuleConfig, TaskAnalysisRule, TaskProfile,
 };
@@ -104,7 +104,7 @@ impl CustomAnalysisRule {
 #[async_trait]
 #[allow(dead_code)]
 impl TaskAnalysisRule for CustomAnalysisRule {
-    fn analyze(&self, input: &str, config: &RuleConfig) -> subhuti::Result<TaskProfile> {
+    fn analyze(&self, input: &str, config: &RuleConfig) -> subhuti_core::Result<TaskProfile> {
         // 自定义任务理解逻辑
         // 可以调用 LLM 做语义分析，或使用自定义关键词表
         DefaultTaskAnalysisRule::new().analyze(input, config)

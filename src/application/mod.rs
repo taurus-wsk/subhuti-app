@@ -5,7 +5,7 @@
 //! ## 职责
 //!
 //! - **组合根**（`CompositionRoot`）：创建 Subhuti 实例、注册领域专家、设置规则、装配出站端口
-//! - **应用服务**（`AppService`）：纯应用服务，持有领域出站端口、实现 3 个入站窄端口
+//! - **编排服务**（`OrchestrationService`）：多专家对话编排入口，持有领域出站端口、实现 3 个入站窄端口
 //!
 //! ## 入站端口（Driving Port，入站适配层调用）
 //!
@@ -23,16 +23,17 @@
 //! - 领域出站端口在 `domain::ports`（ExpertRepositoryPort, OrchestrationEnginePort, SkillExecutionPort）
 //! - 图编排：在出站适配层（`adapter/outbound/graphs/`）配置
 
-pub mod app_service;
 pub mod composition_root;
 pub mod observer;
+pub mod orchestration_service;
 pub mod ports;
 pub mod trace_decorator;
 
-pub use app_service::AppService;
 pub use composition_root::CompositionRoot;
 pub use observer::{
-    SessionObserverPort, SessionRecordParams, SpanData, TraceHandle, TraceObserverPort, TraceStatus,
+    record_fn_log, FnCallData, FnTracer, LogEntry, LogLevel, SessionObserverPort,
+    SessionRecordParams, SpanData, TraceHandle, TraceObserverPort, TraceStatus,
 };
+pub use orchestration_service::OrchestrationService;
 pub use ports::{ChatPort, ExpertQueryPort, SkillPort, StreamEvent};
 pub use trace_decorator::TraceAppService;

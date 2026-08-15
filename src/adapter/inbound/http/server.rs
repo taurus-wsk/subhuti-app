@@ -5,6 +5,7 @@ use tower_http::services::ServeDir;
 use crate::adapter::inbound::http::adapters::HttpAdapterFactory;
 use crate::adapter::inbound::http::middleware::{self, RequestLogLayer, TraceIdLayer};
 use crate::adapter::inbound::http::route_adapter::build_router;
+use crate::application::observer::{record_fn_log, LogLevel};
 use crate::application::CompositionRoot;
 use crate::infra::config::AppConfig;
 
@@ -20,14 +21,32 @@ pub struct ServerOptions {
 pub async fn start_server(options: ServerOptions) -> Result<()> {
     let _log_guard = middleware::init_logging();
 
-    tracing::info!("Starting Subhuti HTTP Server...");
-    tracing::info!("Log files will be written to ./logs/ directory");
+    record_fn_log(
+        None,
+        "",
+        LogLevel::Info,
+        "Starting Subhuti HTTP Server...",
+        None,
+    );
+    record_fn_log(
+        None,
+        "",
+        LogLevel::Info,
+        "Log files will be written to ./logs/ directory",
+        None,
+    );
 
     if options.debug {
-        tracing::info!("✅ Debug mode enabled");
+        record_fn_log(None, "", LogLevel::Info, "✅ Debug mode enabled", None);
     }
     if options.mock {
-        tracing::info!("✅ Mock mode enabled - using configured mock responses");
+        record_fn_log(
+            None,
+            "",
+            LogLevel::Info,
+            "✅ Mock mode enabled - using configured mock responses",
+            None,
+        );
     }
 
     dotenvy::dotenv().ok();
@@ -72,9 +91,7 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
     // 创建 AppState（依赖注入容器）
     let app_state = factory.create_app_state();
 
-    tracing::info!(
-        "✅ 六边形架构完成：3 窄端口（trace 装饰器自动记录）+ 2 观察者端口，路由采用 inventory 自动注册"
-    );
+    record_fn_log(None, "", LogLevel::Info, "✅ 六边形架构完成：3 窄端口（trace 装饰器自动记录）+ 2 观察者端口，路由采用 inventory 自动注册", None);
 
     // ── 方案 C：inventory 自动注册所有路由 ──
     // 所有路由通过 `inventory::submit!` 自注册，build_router 遍历收集后统一构建。
@@ -94,7 +111,13 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
 
     let addr = app_config.http.addr.clone();
 
-    tracing::info!("Server listening on {}", addr);
+    record_fn_log(
+        None,
+        "",
+        LogLevel::Info,
+        format!("Server listening on {}", addr),
+        None,
+    );
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;

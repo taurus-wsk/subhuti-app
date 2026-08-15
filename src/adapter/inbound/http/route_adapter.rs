@@ -49,6 +49,7 @@ use tower_service::Service;
 
 use crate::adapter::inbound::http::adapters::ApiSuccess;
 use crate::adapter::inbound::http::routes::AppState;
+use crate::application::observer::{record_fn_log, LogLevel};
 
 /// 路由注册项
 ///
@@ -106,7 +107,13 @@ pub fn build_router() -> Router<AppState> {
         count += 1;
     }
 
-    tracing::info!("✅ 路由自动注册完成（inventory 模式）：total={}", count);
+    record_fn_log(
+        None,
+        "",
+        LogLevel::Info,
+        format!("✅ 路由自动注册完成（inventory 模式）：total={}", count),
+        None,
+    );
 
     router
 }

@@ -1,3 +1,4 @@
+pub mod actor;
 pub mod rule_engine;
 pub mod strategies;
 
@@ -47,8 +48,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
 
+pub use self::actor::{Actor, ActorRegistry, ExpertAgentActorAdapter};
 use self::strategies::{SemanticCandidate, SemanticRouter};
 use crate::event::{AgentEventData, EventBus};
 use crate::graph::{Graph, GraphOutput, GraphState};
@@ -329,6 +330,8 @@ pub struct Orchestrator {
     event_bus: Option<Arc<EventBus>>,
     semantic_router: SemanticRouter,
     rule_engine: RuleEngine,
+    /// 全局演员池（Actor 竞标制）
+    actor_registry: ActorRegistry,
 }
 
 impl Orchestrator {
@@ -339,6 +342,7 @@ impl Orchestrator {
             event_bus: None,
             semantic_router: SemanticRouter::new_disabled(),
             rule_engine: RuleEngine::with_defaults(),
+            actor_registry: ActorRegistry::new(),
         }
     }
 
@@ -381,6 +385,16 @@ impl Orchestrator {
         self.agent_registry.register(agent);
     }
 
+    /// 注册 Actor（演员）到全局演员池
+    pub fn register_actor(&mut self, actor: Arc<dyn actor::Actor>) {
+        self.actor_registry.register(actor);
+    }
+
+    /// 获取 Actor 注册表引用（用于图调度器）
+    pub fn actor_registry(&self) -> &ActorRegistry {
+        &self.actor_registry
+    }
+
     pub fn agent_count(&self) -> usize {
         self.agent_registry.agent_count()
     }
@@ -399,6 +413,10 @@ impl Orchestrator {
         self.graph_registry.register(graph);
     }
 
+    pub fn set_default_graph(&self, name: &str) {
+        self.graph_registry.set_default(name);
+    }
+
     pub async fn dispatch(
         &self,
         ctx: &mut AgentContext,
@@ -406,6 +424,8 @@ impl Orchestrator {
     ) -> OrchestrationResult {
         let input = &ctx.input.clone();
 
+        // 只保留图匹配 + 事件发布
+        // Actor 竞标制：图节点发布任务要求，Actor 池自评竞标
         self.emit_event(
             ctx,
             AgentEventData::UserMessage {
@@ -414,196 +434,45 @@ impl Orchestrator {
         )
         .await;
 
-        // 优先尝试图路由（语义路由 + 关键词匹配）
-        if let Some(graph) = self.try_semantic_graph_routing(input).await {
-            tracing::debug!("语义路由匹配到图: {}", graph.name());
-            return self.dispatch_via_graph(ctx, state, &graph).await;
-        }
-
-        let graph = self.graph_registry.find_matching_graph(input).await;
-        if let Some(graph) = graph {
-            return self.dispatch_via_graph(ctx, state, &graph).await;
-        }
-
-        // 无图匹配，使用 RuleEngine 三层调度
-        let agents = self.agent_registry.list_agents();
-
-        // Layer 1: 任务分析
-        let profile = match self.rule_engine.analyze_task(input) {
-            Ok(p) => p,
-            Err(e) => {
-                return OrchestrationResult {
-                    strategy: "rule_engine_layer1_failed".into(),
-                    expert_chain: Vec::new(),
-                    output: e.to_string(),
-                    tokens: TokenUsage::default(),
-                    expert_outputs: Vec::new(),
-                    success: false,
-                };
+        // 优先使用指定图（从 ctx.metadata 中获取）
+        if let Some(graph_name) = ctx.metadata.get("graph_name") {
+            if let Some(graph) = self.graph_registry.get(graph_name) {
+                tracing::debug!("指定图: {}", graph_name);
+                return self.dispatch_via_graph(ctx, state, &graph).await;
             }
+            tracing::warn!("指定的图不存在: {}", graph_name);
+            // 不存在则继续走匹配流程
+        }
+
+        // 图匹配：优先语义路由，其次关键词匹配
+        let matched_graph = self.try_semantic_graph_routing(input).await;
+        let matched_graph = match matched_graph {
+            Some(graph) => Some(graph),
+            None => self.graph_registry.find_matching_graph(input).await,
         };
 
-        // Layer 2: 调度决策
-        let plan = match self.rule_engine.decide_strategy(&profile, &agents) {
-            Ok(p) => p,
-            Err(e) => {
-                return OrchestrationResult {
-                    strategy: "rule_engine_layer2_failed".into(),
-                    expert_chain: Vec::new(),
-                    output: e.to_string(),
-                    tokens: TokenUsage::default(),
-                    expert_outputs: Vec::new(),
-                    success: false,
-                };
+        match matched_graph {
+            Some(graph) => {
+                tracing::debug!("图匹配成功: {}", graph.name());
+                self.dispatch_via_graph(ctx, state, &graph).await
             }
-        };
-
-        if plan.steps.is_empty() {
-            // 尝试语义路由作为兜底
-            if let Some(agent) = self.try_semantic_agent_routing(input).await {
-                return self.execute_agent(ctx, state, agent).await;
-            }
-            return OrchestrationResult {
-                strategy: "fallback".to_string(),
-                expert_chain: Vec::new(),
-                output: "未找到匹配的专家".to_string(),
-                tokens: TokenUsage::default(),
-                expert_outputs: Vec::new(),
-                success: false,
-            };
-        }
-
-        // 发布匹配事件
-        self.emit_event(
-            ctx,
-            AgentEventData::ChainSelected {
-                chain_name: format!("rule_engine:{:?}", plan.strategy),
-                strategy: format!("{:?}", plan.strategy),
-            },
-        )
-        .await;
-
-        // Layer 3: 执行监控
-        self.execute_with_rule_engine(ctx, state, &plan).await
-    }
-
-    /// 通过 RuleEngine 执行调度计划（Layer 3）
-    async fn execute_with_rule_engine(
-        &self,
-        ctx: &mut AgentContext,
-        state: &ExpertState,
-        plan: &DispatchPlan,
-    ) -> OrchestrationResult {
-        let start = Instant::now();
-        let mut results: Vec<String> = Vec::new();
-        let mut expert_chain: Vec<String> = Vec::new();
-        let mut step_index = 0usize;
-
-        for step in &plan.steps {
-            // 检查步骤数限制
-            if let Err(e) = self.rule_engine.check_max_steps(step_index) {
-                tracing::warn!("[执行监控·Layer3] {}", e);
-                break;
-            }
-
-            // 检查总超时
-            if let Err(e) = self.rule_engine.check_timeout(start.elapsed()) {
-                tracing::warn!("[执行监控·Layer3] {}", e);
-                break;
-            }
-
-            let agent = match self.agent_registry.get_by_id(&step.agent_id) {
-                Some(a) => a,
-                None => {
-                    tracing::warn!("[执行监控·Layer3] 专家 {} 未找到", step.agent_id);
-                    if !self.rule_engine.should_continue() {
-                        break;
-                    }
-                    continue;
-                }
-            };
-
-            // 设置输入
-            if step.use_previous_output && !results.is_empty() {
-                ctx.input = results.last().cloned().unwrap_or_default();
-            }
-
-            // 单步超时
-            let step_timeout = self.rule_engine.per_step_timeout();
-
-            self.emit_event(
-                ctx,
-                AgentEventData::AgentStarted {
-                    agent_id: agent.id().to_string(),
-                    input: ctx.input.clone(),
-                },
-            )
-            .await;
-
-            let agent_id = agent.id().to_string();
-            let exec_result = tokio::time::timeout(step_timeout, agent.run(ctx, state)).await;
-
-            let duration_ms = start.elapsed().as_millis() as u64;
-
-            match exec_result {
-                Ok(Ok(output)) => {
-                    results.push(output.clone());
-                    expert_chain.push(agent_id.clone());
-                    self.emit_event(
-                        ctx,
-                        AgentEventData::AgentCompleted {
-                            agent_id,
-                            output,
-                            duration_ms,
-                        },
-                    )
-                    .await;
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!("[执行监控·Layer3] 专家 {} 执行失败: {}", agent_id, e);
-                    self.emit_event(
-                        ctx,
-                        AgentEventData::AgentFailed {
-                            agent_id,
-                            error: e.to_string(),
-                            duration_ms,
-                        },
-                    )
-                    .await;
-                    if !self.rule_engine.should_continue() {
-                        break;
-                    }
-                }
-                Err(_) => {
-                    tracing::warn!("[执行监控·Layer3] 专家 {} 执行超时", agent_id);
-                    self.emit_event(
-                        ctx,
-                        AgentEventData::AgentFailed {
-                            agent_id,
-                            error: "执行超时".to_string(),
-                            duration_ms: step_timeout.as_millis() as u64,
-                        },
-                    )
-                    .await;
-                    if !self.rule_engine.should_continue() {
-                        break;
+            None => {
+                // 无匹配时尝试使用默认图
+                if let Some(default_graph) = self.graph_registry.get_default() {
+                    tracing::debug!("使用默认图: {}", default_graph.name());
+                    self.dispatch_via_graph(ctx, state, &default_graph).await
+                } else {
+                    tracing::warn!("未匹配到任何图，且无默认图");
+                    OrchestrationResult {
+                        strategy: "fallback".to_string(),
+                        expert_chain: Vec::new(),
+                        output: "未匹配到合适的图，请检查图注册或输入内容".to_string(),
+                        tokens: TokenUsage::default(),
+                        expert_outputs: Vec::new(),
+                        success: false,
                     }
                 }
             }
-
-            step_index += 1;
-        }
-
-        let output = self.rule_engine.merge_results(&results);
-        let success = !results.is_empty();
-
-        OrchestrationResult {
-            strategy: format!("rule_engine:{:?}", plan.strategy),
-            expert_chain,
-            output,
-            tokens: TokenUsage::default(),
-            expert_outputs: results,
-            success,
         }
     }
 
@@ -631,23 +500,47 @@ impl Orchestrator {
             graph_state.set("session_id", sid.clone());
         }
 
-        match self.execute_graph(graph, graph_state).await {
-            Ok(output) => OrchestrationResult {
-                strategy: format!("graph:{}", graph.name()),
-                expert_chain: output.execution_path,
-                output: output.output,
-                tokens: TokenUsage::default(),
-                expert_outputs: Vec::new(),
-                success: output.success,
-            },
-            Err(e) => OrchestrationResult {
-                strategy: format!("graph:{}", graph.name()),
-                expert_chain: Vec::new(),
-                output: e.to_string(),
-                tokens: TokenUsage::default(),
-                expert_outputs: Vec::new(),
-                success: false,
-            },
+        match self
+            .execute_graph(graph, graph_state, &self.actor_registry, _state)
+            .await
+        {
+            Ok(output) => {
+                tracing::debug!(
+                    "📊 dispatch_via_graph 完成: graph={}, success={}, output_len={}, error={:?}",
+                    graph.name(),
+                    output.success,
+                    output.output.len(),
+                    output.error,
+                );
+                let final_output = if output.success || output.error.is_none() {
+                    output.output
+                } else {
+                    output.error.clone().unwrap_or(output.output)
+                };
+                OrchestrationResult {
+                    strategy: format!("graph:{}", graph.name()),
+                    expert_chain: output.execution_path,
+                    output: final_output,
+                    tokens: TokenUsage::default(),
+                    expert_outputs: Vec::new(),
+                    success: output.success,
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "📊 dispatch_via_graph 失败: graph={}, error={}",
+                    graph.name(),
+                    e
+                );
+                OrchestrationResult {
+                    strategy: format!("graph:{}", graph.name()),
+                    expert_chain: Vec::new(),
+                    output: e.to_string(),
+                    tokens: TokenUsage::default(),
+                    expert_outputs: Vec::new(),
+                    success: false,
+                }
+            }
         }
     }
 
@@ -658,20 +551,6 @@ impl Orchestrator {
             match trace_id {
                 Some(tid) => bus.emit_with_trace(data, tid, session_id).await,
                 None => bus.emit(data).await,
-            }
-        }
-    }
-
-    /// 从 GraphState 读 trace_id 发布事件（用于 GraphOrchestrator.execute_graph，无 AgentContext）
-    async fn emit_event_with_state(&self, state: &GraphState, data: AgentEventData) {
-        if let Some(ref bus) = self.event_bus {
-            let trace_id = state.get("trace_id");
-            let session_id = state.get("session_id");
-            match trace_id {
-                Some(tid) if !tid.is_empty() => {
-                    bus.emit_with_trace(data, tid, session_id).await;
-                }
-                _ => bus.emit(data).await,
             }
         }
     }
@@ -698,75 +577,6 @@ impl Orchestrator {
             self.graph_registry.get_by_id(&result.target_id)
         } else {
             None
-        }
-    }
-
-    async fn try_semantic_agent_routing(&self, input: &str) -> Option<Arc<dyn ExpertAgent>> {
-        if !self.semantic_router.enabled() {
-            return None;
-        }
-        let candidates = self.agent_registry.list_candidates();
-        if candidates.is_empty() {
-            return None;
-        }
-        if let Some(result) = self
-            .semantic_router
-            .match_candidate(input, candidates)
-            .await
-        {
-            tracing::debug!(
-                "语义路由匹配专家: {} (置信度: {:.2}) - {}",
-                result.target_id,
-                result.confidence,
-                result.reasoning
-            );
-            self.agent_registry.get_by_id(&result.target_id)
-        } else {
-            None
-        }
-    }
-
-    async fn execute_agent(
-        &self,
-        ctx: &mut AgentContext,
-        state: &ExpertState,
-        agent: Arc<dyn ExpertAgent>,
-    ) -> OrchestrationResult {
-        let input = &ctx.input;
-
-        self.emit_event(
-            ctx,
-            AgentEventData::AgentStarted {
-                agent_id: agent.id().to_string(),
-                input: input.clone(),
-            },
-        )
-        .await;
-
-        let start = std::time::Instant::now();
-        let output = agent
-            .run(ctx, state)
-            .await
-            .unwrap_or_else(|e| e.to_string());
-        let duration_ms = start.elapsed().as_millis() as u64;
-
-        self.emit_event(
-            ctx,
-            AgentEventData::AgentCompleted {
-                agent_id: agent.id().to_string(),
-                output: output.clone(),
-                duration_ms,
-            },
-        )
-        .await;
-
-        OrchestrationResult {
-            strategy: "direct".to_string(),
-            expert_chain: vec![agent.id().to_string()],
-            output: output.clone(),
-            tokens: TokenUsage::default(),
-            expert_outputs: vec![output],
-            success: true,
         }
     }
 }
@@ -842,12 +652,14 @@ impl AgentRegistry {
 
 pub struct GraphRegistry {
     graphs: RwLock<HashMap<String, Arc<Graph>>>,
+    default_graph_name: RwLock<Option<String>>,
 }
 
 impl GraphRegistry {
     pub fn new() -> Self {
         Self {
             graphs: RwLock::new(HashMap::new()),
+            default_graph_name: RwLock::new(None),
         }
     }
 
@@ -855,6 +667,17 @@ impl GraphRegistry {
         let name = graph.name().to_string();
         let arc_graph = Arc::new(graph);
         self.graphs.write().unwrap().insert(name, arc_graph);
+    }
+
+    /// 设置默认图（当无图匹配时使用）
+    pub fn set_default(&self, name: &str) {
+        *self.default_graph_name.write().unwrap() = Some(name.to_string());
+    }
+
+    /// 获取默认图
+    pub fn get_default(&self) -> Option<Arc<Graph>> {
+        let name = self.default_graph_name.read().unwrap().clone()?;
+        self.graphs.read().unwrap().get(&name).cloned()
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<Graph>> {
@@ -867,6 +690,12 @@ impl GraphRegistry {
 
     pub async fn find_matching_graph(&self, input: &str) -> Option<Arc<Graph>> {
         let graphs = self.graphs.read().unwrap();
+        let available: Vec<String> = graphs.keys().cloned().collect();
+        tracing::debug!(
+            "find_matching_graph: 可用的图={:?}, input={}",
+            available,
+            input
+        );
         if graphs.is_empty() {
             return None;
         }
@@ -874,34 +703,68 @@ impl GraphRegistry {
             return graphs.values().next().cloned();
         }
 
+        // 排除默认图（它只作为兜底，不参与关键词匹配）
+        let default_name = self.default_graph_name.read().unwrap().clone();
+        let non_default: Vec<&Arc<Graph>> = graphs
+            .values()
+            .filter(|g| Some(g.name().to_string()) != default_name)
+            .collect();
+
+        if non_default.is_empty() {
+            return None;
+        }
+
         let input_lower = input.to_lowercase();
-        for (name, graph) in &*graphs {
-            if input_lower.contains(&name.to_lowercase()) {
-                return Some(graph.clone());
+        for graph in &non_default {
+            if input_lower.contains(&graph.name().to_lowercase()) {
+                return Some((*graph).clone());
             }
         }
 
-        let code_keywords = ["代码", "编程", "开发", "写代码", "code", "programming"];
+        let code_keywords = [
+            "代码",
+            "编程",
+            "开发",
+            "写代码",
+            "code",
+            "programming",
+            "rust",
+            "项目",
+        ];
         let review_keywords = ["评审", "审查", "审核", "review", "audit"];
+        let edit_keywords = ["修改", "编辑", "添加", "增加", "重构", "改造", "改", "edit"];
 
-        for (name, graph) in &*graphs {
-            if name.to_lowercase().contains("code") || name.to_lowercase().contains("dev") {
+        for graph in &non_default {
+            let name = graph.name().to_lowercase();
+            if name.contains("code")
+                || name.contains("dev")
+                || name.contains("programming")
+                || name.contains("rust")
+            {
                 for kw in &code_keywords {
                     if input_lower.contains(kw) {
-                        return Some(graph.clone());
+                        return Some((*graph).clone());
                     }
                 }
             }
-            if name.to_lowercase().contains("review") || name.to_lowercase().contains("audit") {
+            if name.contains("review") || name.contains("audit") {
                 for kw in &review_keywords {
                     if input_lower.contains(kw) {
-                        return Some(graph.clone());
+                        return Some((*graph).clone());
+                    }
+                }
+            }
+            if name.contains("edit") {
+                for kw in &edit_keywords {
+                    if input_lower.contains(kw) {
+                        return Some((*graph).clone());
                     }
                 }
             }
         }
 
-        graphs.values().next().cloned()
+        // 非默认图中取第一个
+        non_default.first().map(|g| (*g).clone())
     }
 
     pub fn list_candidates(&self) -> Vec<SemanticCandidate> {
@@ -925,7 +788,13 @@ impl GraphRegistry {
 #[async_trait]
 pub trait GraphOrchestrator: Send + Sync {
     async fn route_by_graph(&self, input: &str) -> Option<Arc<Graph>>;
-    async fn execute_graph(&self, graph: &Graph, state: GraphState) -> crate::Result<GraphOutput>;
+    async fn execute_graph(
+        &self,
+        graph: &Graph,
+        state: GraphState,
+        actor_registry: &ActorRegistry,
+        expert_state: &ExpertState,
+    ) -> crate::Result<GraphOutput>;
     fn register_graph(&self, graph: Graph);
     fn get_graph(&self, name: &str) -> Option<Arc<Graph>>;
     fn list_graphs(&self) -> Vec<String>;
@@ -937,62 +806,26 @@ impl GraphOrchestrator for Orchestrator {
         self.graph_registry.find_matching_graph(input).await
     }
 
-    async fn execute_graph(&self, graph: &Graph, state: GraphState) -> crate::Result<GraphOutput> {
-        // 走 run_event_driven 时 GraphStarted/GraphCompleted 由 scheduler 负责 emit（带 trace_id）
-        // 走 graph.run() 时 scheduler 不参与，由这里补 emit
-        let use_event_driven = graph.event_bus().is_some();
-
-        if !use_event_driven {
-            self.emit_event_with_state(
-                &state,
-                AgentEventData::GraphStarted {
-                    graph_name: graph.name().to_string(),
-                    run_id: uuid::Uuid::new_v4().to_string(),
-                    entry_node: graph.entry.clone().unwrap_or_default(),
-                },
-            )
+    async fn execute_graph(
+        &self,
+        graph: &Graph,
+        state: GraphState,
+        actor_registry: &ActorRegistry,
+        expert_state: &ExpertState,
+    ) -> crate::Result<GraphOutput> {
+        // GraphStarted/GraphCompleted 由 scheduler 内部负责 emit（带 trace_id）
+        let result = graph
+            .run_event_driven(state, actor_registry, expert_state)
             .await;
+
+        if let Ok(ref output) = result {
+            tracing::debug!(
+                "📊 execute_graph 完成: graph={}, success={}, execution_path={:?}",
+                graph.name(),
+                output.success,
+                output.execution_path,
+            );
         }
-
-        let result = if use_event_driven {
-            graph.run_event_driven(state).await
-        } else {
-            graph.run(state).await
-        };
-
-        if !use_event_driven {
-            if let Ok(output) = &result {
-                let trace_id = output.state.get("trace_id");
-                let session_id = output.state.get("session_id");
-                if let Some(ref bus) = self.event_bus {
-                    match trace_id {
-                        Some(tid) if !tid.is_empty() => {
-                            bus.emit_with_trace(
-                                AgentEventData::GraphCompleted {
-                                    run_id: uuid::Uuid::new_v4().to_string(),
-                                    success: output.success,
-                                    total_steps: output.total_steps,
-                                    duration_ms: output.duration_ms,
-                                },
-                                tid,
-                                session_id,
-                            )
-                            .await;
-                        }
-                        _ => {
-                            bus.emit(AgentEventData::GraphCompleted {
-                                run_id: uuid::Uuid::new_v4().to_string(),
-                                success: output.success,
-                                total_steps: output.total_steps,
-                                duration_ms: output.duration_ms,
-                            })
-                            .await;
-                        }
-                    }
-                }
-            }
-        }
-
         Ok(result?)
     }
 

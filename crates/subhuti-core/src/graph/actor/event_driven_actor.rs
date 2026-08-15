@@ -132,6 +132,7 @@ impl EventHandler for EventDrivenActor {
                         AgentEventData::NodeCompleted {
                             run_id: run_id.clone(),
                             node_name: self.name.clone(),
+                            actor_name: self.name.clone(),
                             output: result.output.clone(),
                             success: true,
                             duration_ms,

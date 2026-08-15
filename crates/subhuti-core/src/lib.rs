@@ -10,6 +10,7 @@
 
 pub mod common;
 pub mod component;
+pub mod engine;
 pub mod event;
 pub mod graph;
 pub mod guardrails;
@@ -25,6 +26,7 @@ pub use component::{
     ComponentState, ExecutionContext, ExpertAgentAdapter, GraphNodeComponentAdapter,
     GuardrailAdapter, Pipeline, PipelineBuilder, ValidatorAdapter,
 };
+pub use engine::Subhuti;
 pub use event::{
     bus::EventBus,
     handler::{EventFilter, EventHandler, EventSubscription},
@@ -38,13 +40,17 @@ pub use graph::{
     NodeMessage, NodeResult, Route, StateReducer, SupervisionStrategy, Supervisor,
 };
 pub use memory::Memory;
-pub use observe::trace::Trace;
+pub use observe::{
+    record_fn_log, FnCallData, FnTracer, LogEntry, LogLevel, SpanData, TraceHandle,
+    TraceObserverPort, TraceStatus,
+};
 pub use orchestrator::{
-    AgentContext, AgentRegistry, DefaultDispatchRule, DefaultExecutionRule,
+    Actor, ActorRegistry, AgentContext, AgentRegistry, DefaultDispatchRule, DefaultExecutionRule,
     DefaultTaskAnalysisRule, DispatchPlan, DispatchRule, DispatchStrategy, EventBusRef,
-    ExecutionResult, ExecutionRule, ExpertAgent, ExpertState, FrameworkExpertInfo, FromState,
-    GraphOrchestrator, Llm, MemoryRef, OrchestrationResult, Orchestrator, ResultStrategy,
-    RuleConfig, RuleEngine, Step, TaskAnalysisRule, TaskProfile, TokenUsage,
+    ExecutionResult, ExecutionRule, ExpertAgent, ExpertAgentActorAdapter, ExpertState,
+    FrameworkExpertInfo, FromState, GraphOrchestrator, Llm, MemoryRef, OrchestrationResult,
+    Orchestrator, ResultStrategy, RuleConfig, RuleEngine, Step, TaskAnalysisRule, TaskProfile,
+    TokenUsage,
 };
 pub use runtime::{
     LLMConfig, LLMProvider, LLMResponse, Message, Role, Session, Tool, ToolCall, ToolCallResult,

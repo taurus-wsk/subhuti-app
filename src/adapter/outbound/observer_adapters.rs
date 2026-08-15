@@ -13,7 +13,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::application::{
-    SessionObserverPort, SessionRecordParams, SpanData, TraceHandle, TraceObserverPort,
+    FnCallData, LogEntry, SessionObserverPort, SessionRecordParams, SpanData, TraceHandle,
+    TraceObserverPort,
 };
 
 /// 追踪观察者适配器（自包含内存存储）
@@ -26,6 +27,8 @@ use crate::application::{
 pub struct SubhutiTraceObserverAdapter {
     traces: Mutex<Vec<TraceHandle>>,
     spans: Mutex<HashMap<String, Vec<SpanData>>>,
+    fn_calls: Mutex<HashMap<String, Vec<FnCallData>>>,
+    fn_logs: Mutex<HashMap<String, Vec<LogEntry>>>,
 }
 
 impl SubhutiTraceObserverAdapter {
@@ -34,6 +37,8 @@ impl SubhutiTraceObserverAdapter {
         Self {
             traces: Mutex::new(Vec::new()),
             spans: Mutex::new(HashMap::new()),
+            fn_calls: Mutex::new(HashMap::new()),
+            fn_logs: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -64,6 +69,112 @@ impl TraceObserverPort for SubhutiTraceObserverAdapter {
     fn record_span(&self, trace_id: &str, span: SpanData) {
         let mut guard = self.spans.lock().expect("span mutex poisoned");
         guard.entry(trace_id.to_string()).or_default().push(span);
+    }
+
+    fn record_fn_call(&self, trace_id: &str, fn_call: FnCallData) {
+        let mut guard = self.fn_calls.lock().expect("fn_call mutex poisoned");
+        guard.entry(trace_id.to_string()).or_default().push(fn_call);
+    }
+
+    fn record_fn_log(&self, trace_id: &str, log: LogEntry) {
+        let mut guard = self.fn_logs.lock().expect("fn_log mutex poisoned");
+        guard.entry(trace_id.to_string()).or_default().push(log);
+    }
+
+    fn get_fn_logs(&self, trace_id: &str) -> Vec<LogEntry> {
+        let guard = self.fn_logs.lock().expect("fn_log mutex poisoned");
+        guard.get(trace_id).cloned().unwrap_or_default()
+    }
+
+    fn get_fn_call_tree(&self, trace_id: &str) -> Option<serde_json::Value> {
+        let guard = self.fn_calls.lock().expect("fn_call mutex poisoned");
+        let calls = guard.get(trace_id)?;
+        let logs_guard = self.fn_logs.lock().expect("fn_log mutex poisoned");
+        let logs = logs_guard.get(trace_id).cloned().unwrap_or_default();
+
+        let mut sorted = calls.clone();
+        sorted.sort_by_key(|c| c.timestamp);
+
+        // 获取匹配 fn_name 的日志
+        fn logs_for_fn(logs: &[LogEntry], fn_name: &str) -> Vec<serde_json::Value> {
+            logs.iter()
+                .filter(|l| l.fn_name.as_deref() == Some(fn_name))
+                .map(|l| {
+                    serde_json::json!({
+                        "level": l.level.to_string(),
+                        "message": l.message,
+                        "timestamp": l.timestamp.to_rfc3339(),
+                    })
+                })
+                .collect()
+        }
+
+        // 递归构建 JSON 树
+        fn build_children(
+            parent_name: &str,
+            calls: &[FnCallData],
+            logs: &[LogEntry],
+        ) -> Vec<serde_json::Value> {
+            calls
+                .iter()
+                .filter(|c| c.parent_fn_name.as_deref() == Some(parent_name))
+                .map(|c| {
+                    let children = build_children(&c.fn_name, calls, logs);
+                    let node_logs = logs_for_fn(logs, &c.fn_name);
+                    let mut json = serde_json::json!({
+                        "fn_name": c.fn_name,
+                        "input": c.input,
+                        "output": c.output,
+                        "input_bytes": c.input_bytes,
+                        "output_bytes": c.output_bytes,
+                        "duration_ms": c.duration_ms,
+                        "success": c.success,
+                        "memory_entry": c.memory_entry,
+                        "memory_exit": c.memory_exit,
+                        "memory_diff": c.memory_entry.zip(c.memory_exit).map(|(en, ex)| if en > ex { en - ex } else { ex - en }),
+                        "logs": node_logs,
+                        "extra": c.extra,
+                    });
+                    if !children.is_empty() {
+                        json["children"] = serde_json::Value::Array(children);
+                    }
+                    json
+                })
+                .collect()
+        }
+
+        // 找到根节点（parent_fn_name = None）
+        let roots: Vec<serde_json::Value> = sorted
+            .iter()
+            .filter(|c| c.parent_fn_name.is_none())
+            .map(|c| {
+                let children = build_children(&c.fn_name, &sorted, &logs);
+                let node_logs = logs_for_fn(&logs, &c.fn_name);
+                let mut json = serde_json::json!({
+                    "fn_name": c.fn_name,
+                    "input": c.input,
+                    "output": c.output,
+                    "input_bytes": c.input_bytes,
+                    "output_bytes": c.output_bytes,
+                    "duration_ms": c.duration_ms,
+                    "success": c.success,
+                    "memory_entry": c.memory_entry,
+                    "memory_exit": c.memory_exit,
+                    "memory_diff": c.memory_entry.zip(c.memory_exit).map(|(en, ex)| if en > ex { en - ex } else { ex - en }),
+                    "logs": node_logs,
+                    "extra": c.extra,
+                });
+                if !children.is_empty() {
+                    json["children"] = serde_json::Value::Array(children);
+                }
+                json
+            })
+            .collect();
+
+        Some(serde_json::json!({
+            "trace_id": trace_id,
+            "fn_calls": roots,
+        }))
     }
 
     fn list_summaries(&self) -> Vec<serde_json::Value> {

@@ -1,40 +1,48 @@
-//! # 事件驱动调度器
+//! # 事件驱动调度器（竞标制）
 //!
 //! 豆包设计哲学的核心实现：
 //!
 //! - **图是骨架**：调度器持有图结构定义，决定节点顺序和路由
-//! - **事件是血液**：节点完成 → 发事件 → 调度器订阅 → 驱动下一节点
-//! - **Actor 是细胞**：每个节点是一个 Actor，靠事件驱动执行
+//! - **Actor 是演员**：全局 Actor 池通过竞标制竞争节点
+//! - **竞标是核心**：节点发布任务要求 → 所有 Actor 自评分数 → 最高分上台
 //!
-//! ## 事件流
+//! ## 竞标流程
 //!
 //! ```text
-//! GraphStarted ──► NodeExecuteRequested ──► Actor 执行
-//!                                               │
-//!                          ┌────────────────────┘
-//!                          ▼
-//!                    NodeCompleted ──► 调度器订阅
-//!                          │
-//!                          ▼
-//!                    确定下一节点（图路由）
-//!                          │
-//!                          ▼
-//!                    NodeExecuteRequested ──► 下一个 Actor
-//!                          ...
-//!                    GraphCompleted
+//! 图节点需要执行
+//!   → 调度器获取节点任务标签
+//!   → 调度器从 ActorRegistry 竞标（find_best）
+//!   → 调度器发布 ActorTaskRequested（可观测性）
+//!   → 调度器发布 NodeTaskAssigned（可观测性）
+//!   → 调度器直接调用 actor.perform()
+//!   → 调度器发布 NodeCompleted/NodeFailed
+//!   → 调度器事件循环接收 → 驱动下一节点
 //! ```
+//!
+//! ## 与旧架构的区别
+//!
+//! | 旧架构（预分配） | 新架构（竞标制） |
+//! |-----------------|-----------------|
+//! | 每个节点创建固定 EventDrivenActor | 全局 Actor 池竞标上岗 |
+//! | 节点预绑定 ExpertAgent | 节点只定义任务标签，Actor 自评匹配 |
+//! | 通过 EventBus 间接执行 | 调度器直接调用 actor.perform() |
+//! | 调度器 ←→ Actor 双向事件通信 | 调度器单向发布事件（可观测性） |
 
 use super::super::engine::{Graph, GraphError, GraphOutput};
 use super::super::state::GraphState;
 use crate::event::{AgentEventData, Event, EventBus, EventHandler};
+use crate::orchestrator::actor::ActorRegistry;
+use crate::orchestrator::{AgentContext, ExpertState};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
 
 /// 节点事件（内部传递，通过通道避免锁竞争）
 enum NodeEvent {
     Completed {
         node_name: String,
+        actor_name: String,
         output: String,
         success: bool,
         duration_ms: u64,
@@ -59,6 +67,7 @@ impl EventHandler for NodeEventHandler {
             AgentEventData::NodeCompleted {
                 run_id,
                 node_name,
+                actor_name,
                 output,
                 success,
                 duration_ms,
@@ -69,6 +78,7 @@ impl EventHandler for NodeEventHandler {
                     .sender
                     .send(NodeEvent::Completed {
                         node_name: node_name.clone(),
+                        actor_name: actor_name.clone(),
                         output: output.clone(),
                         success: *success,
                         duration_ms: *duration_ms,
@@ -99,21 +109,38 @@ impl EventHandler for NodeEventHandler {
     }
 }
 
-/// 事件驱动调度器
+/// 事件驱动调度器（竞标制）
 ///
-/// 订阅 NodeCompleted/NodeFailed 事件，根据图定义驱动节点执行。
-/// 调度器本身不直接调用 Actor，而是通过事件总线发布 NodeExecuteRequested。
+/// 核心变化：
+/// - 不再为每个节点创建 EventDrivenActor
+/// - 全局 Actor 池（ActorRegistry）中的 Actor 竞标每个节点
+/// - 节点定义任务标签，Actor 自评分数，最高分上台
+/// - 调度器直接执行 Actor，通过 EventBus 发布事件（可观测性）
 pub struct EventDrivenScheduler {
     /// 关联的图
     graph: Arc<Graph>,
     /// 事件总线
     event_bus: Arc<EventBus>,
+    /// 全局演员池（竞标用）
+    actor_registry: Arc<ActorRegistry>,
+    /// 专家共享状态（Actor 执行时需要）
+    expert_state: ExpertState,
 }
 
 impl EventDrivenScheduler {
     /// 创建事件驱动调度器
-    pub fn new(graph: Arc<Graph>, event_bus: Arc<EventBus>) -> Self {
-        Self { graph, event_bus }
+    pub fn new(
+        graph: Arc<Graph>,
+        event_bus: Arc<EventBus>,
+        actor_registry: &ActorRegistry,
+        expert_state: &ExpertState,
+    ) -> Self {
+        Self {
+            graph,
+            event_bus,
+            actor_registry: Arc::new(actor_registry.clone()),
+            expert_state: expert_state.clone(),
+        }
     }
 
     /// 事件驱动执行图
@@ -149,7 +176,7 @@ impl EventDrivenScheduler {
         }) as Arc<dyn EventHandler>;
         let scheduler_subscription_id = self.event_bus.subscribe(handler).await;
 
-        // 发布 GraphStarted 事件（带 trace_id 上下文，供 TraceEventBridge 桥接）
+        // 发布 GraphStarted 事件（带 trace_id 上下文）
         self.emit_with_trace(
             AgentEventData::GraphStarted {
                 graph_name: self.graph.name.clone(),
@@ -161,7 +188,7 @@ impl EventDrivenScheduler {
         )
         .await;
 
-        // 调度器本地状态（单任务独占，无锁）
+        // 调度器本地状态
         let mut current_state = state;
         let mut execution_path = Vec::new();
         let mut node_visit_count: HashMap<String, usize> = HashMap::new();
@@ -172,36 +199,38 @@ impl EventDrivenScheduler {
         let mut pending_count = 1usize; // 入口节点
         let mut completed_nodes: HashSet<String> = HashSet::new();
 
-        // 发布入口节点的执行请求（携带初始状态 + trace 上下文）
-        self.emit_execute_request(
-            &run_id,
+        // 竞标执行入口节点
+        self.execute_node_with_bidding(
             &entry,
             1,
-            &current_state,
-            trace_id.as_deref(),
-            session_id.as_deref(),
+            &run_id,
+            &mut current_state,
+            &trace_id,
+            &session_id,
+            &mut pending_count,
         )
         .await;
 
-        let start = std::time::Instant::now();
+        let start = Instant::now();
 
         // 主循环：接收节点事件，驱动下一节点
         loop {
             match node_event_rx.recv().await {
                 Some(NodeEvent::Completed {
                     node_name,
+                    actor_name,
                     output,
                     success: completed_success,
                     duration_ms,
                     state_updates,
                 }) => {
                     pending_count -= 1;
-                    execution_path.push(node_name.clone());
+                    execution_path.push(actor_name);
                     step += 1;
                     completed_nodes.insert(node_name.clone());
 
                     tracing::debug!(
-                        "📥 节点完成: {} (ok={}, {}ms), pending={}",
+                        "节点完成: {} (ok={}, {}ms), pending={}",
                         node_name,
                         completed_success,
                         duration_ms,
@@ -215,11 +244,11 @@ impl EventDrivenScheduler {
                         if !output.is_empty() {
                             final_output = output;
                         }
-                        // 合并状态更新到调度器状态（使用图的 reducer 策略）
+                        // 合并状态更新
                         current_state.merge_with_reducers(state_updates, &self.graph.reducers);
                     }
 
-                    // 确定下一批节点（只在成功时，基于合并后的状态判断路由）
+                    // 确定下一批节点
                     let next_nodes: Vec<String> = if completed_success {
                         self.graph
                             .determine_next_all(&node_name, &current_state, None)
@@ -243,22 +272,23 @@ impl EventDrivenScheduler {
                         }
                     }
 
+                    // 增加待完成计数
                     pending_count += valid_next.len();
 
-                    // 如果没有待完成节点，结束
                     if pending_count == 0 {
                         break;
                     }
 
-                    // 发布下一批节点的执行请求（携带当前合并后的状态 + trace 上下文）
+                    // 竞标执行下一批节点
                     for next in valid_next {
-                        self.emit_execute_request(
-                            &run_id,
+                        self.execute_node_with_bidding(
                             &next,
                             step + 1,
-                            &current_state,
-                            trace_id.as_deref(),
-                            session_id.as_deref(),
+                            &run_id,
+                            &mut current_state,
+                            &trace_id,
+                            &session_id,
+                            &mut pending_count,
                         )
                         .await;
                     }
@@ -284,7 +314,7 @@ impl EventDrivenScheduler {
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
-        // 发布 GraphCompleted 事件（带 trace_id 上下文）
+        // 发布 GraphCompleted 事件
         self.emit_with_trace(
             AgentEventData::GraphCompleted {
                 run_id: run_id.clone(),
@@ -311,38 +341,189 @@ impl EventDrivenScheduler {
         })
     }
 
-    /// 发布节点执行请求事件（携带当前状态 + trace 上下文）
-    async fn emit_execute_request(
+    /// 竞标执行节点
+    ///
+    /// 1. 获取节点任务标签
+    /// 2. 从 ActorRegistry 竞标（所有 Actor 自评分数，最高分者中标）
+    /// 3. 发布 ActorTaskRequested（可观测性）
+    /// 4. 发布 NodeTaskAssigned（可观测性）
+    /// 5. 直接调用 actor.perform() 执行
+    /// 6. 发布 NodeCompleted/NodeFailed
+    async fn execute_node_with_bidding(
         &self,
-        run_id: &str,
         node_name: &str,
-        step: usize,
-        state: &GraphState,
-        trace_id: Option<&str>,
-        session_id: Option<&str>,
+        _step: usize,
+        run_id: &str,
+        current_state: &GraphState,
+        trace_id: &Option<String>,
+        session_id: &Option<String>,
+        _pending_count: &mut usize,
     ) {
+        // 1. 获取节点任务标签
+        // 如果节点没有标签，使用输入消息内容作为标签（兜底匹配）
+        let mut task_tags = self
+            .graph
+            .node_tags
+            .get(node_name)
+            .cloned()
+            .unwrap_or_default();
+        if task_tags.is_empty() {
+            let input = current_state.get("input").unwrap_or_default();
+            if !input.is_empty() {
+                task_tags = vec![input];
+                tracing::debug!("节点无标签，使用输入消息作为竞标标签");
+            }
+        }
+
         tracing::debug!(
-            "📤 请求节点执行: run={}, node={}, step={}, state_keys={}, trace_id={:?}",
-            run_id,
+            "竞标节点: {} (tags={:?}), 可用 Actor 数: {}",
             node_name,
-            step,
-            state.data().len(),
-            trace_id,
+            task_tags,
+            self.actor_registry.count()
         );
+
+        // 2. 发布 ActorTaskRequested（可观测性）
         self.emit_with_trace(
-            AgentEventData::NodeExecuteRequested {
+            AgentEventData::ActorTaskRequested {
                 run_id: run_id.to_string(),
                 node_name: node_name.to_string(),
-                step,
-                state: state.data().clone(),
+                task_tags: task_tags.clone(),
+                task_description: String::new(),
+                step: _step,
+                state: current_state.data().clone(),
             },
-            trace_id,
-            session_id,
+            trace_id.as_deref(),
+            session_id.as_deref(),
+        )
+        .await;
+
+        // 3. 从 ActorRegistry 竞标：取前 3 名候补（分数 >= 60）
+        let candidates = self.actor_registry.find_top_candidates(&task_tags, 3).await;
+
+        if candidates.is_empty() {
+            tracing::warn!(
+                "竞标失败: 无 Actor 匹配节点 {} (tags={:?})",
+                node_name,
+                task_tags
+            );
+
+            self.emit_with_trace(
+                AgentEventData::NodeFailed {
+                    run_id: run_id.to_string(),
+                    node_name: node_name.to_string(),
+                    error: format!("无 Actor 匹配节点 {} (tags={:?})", node_name, task_tags),
+                    duration_ms: 0,
+                },
+                trace_id.as_deref(),
+                session_id.as_deref(),
+            )
+            .await;
+            return;
+        }
+
+        // 4. 按候补顺序尝试执行（有候补就有重试）
+        let mut last_error = String::new();
+        for (idx, (actor, score)) in candidates.iter().enumerate() {
+            tracing::debug!(
+                "候补 #{}/{}: node={}, actor={} (score={})",
+                idx + 1,
+                candidates.len(),
+                node_name,
+                actor.name(),
+                score
+            );
+
+            // 发布 NodeTaskAssigned
+            self.emit_with_trace(
+                AgentEventData::NodeTaskAssigned {
+                    run_id: run_id.to_string(),
+                    node_name: node_name.to_string(),
+                    actor_id: actor.id().to_string(),
+                    actor_name: actor.name().to_string(),
+                    score: *score,
+                    state: current_state.data().clone(),
+                },
+                trace_id.as_deref(),
+                session_id.as_deref(),
+            )
+            .await;
+
+            // 执行 Actor
+            let input = current_state.get("input").unwrap_or_default();
+            let mut ctx = AgentContext::new(&input, run_id);
+            if let Some(tid) = trace_id {
+                ctx.set_metadata("trace_id", tid);
+            }
+            if let Some(sid) = session_id {
+                ctx.set_metadata("session_id", sid);
+            }
+
+            let start = Instant::now();
+            let result = actor.perform(&mut ctx, &self.expert_state).await;
+            let duration_ms = start.elapsed().as_millis() as u64;
+
+            match result {
+                Ok(output) => {
+                    tracing::debug!(
+                        "Actor '{}' 执行成功: node={}, duration={}ms",
+                        actor.name(),
+                        node_name,
+                        duration_ms
+                    );
+
+                    self.emit_with_trace(
+                        AgentEventData::NodeCompleted {
+                            run_id: run_id.to_string(),
+                            node_name: node_name.to_string(),
+                            actor_name: actor.name().to_string(),
+                            output,
+                            success: true,
+                            duration_ms,
+                            next_nodes: vec![],
+                            state_updates: HashMap::new(),
+                        },
+                        trace_id.as_deref(),
+                        session_id.as_deref(),
+                    )
+                    .await;
+                    return; // 成功，结束
+                }
+                Err(e) => {
+                    last_error = e.to_string();
+                    tracing::warn!(
+                        "Actor '{}' 执行失败 (候补 #{}/{}): node={}, error={}",
+                        actor.name(),
+                        idx + 1,
+                        candidates.len(),
+                        node_name,
+                        last_error
+                    );
+                    // 继续尝试下一个候补
+                }
+            }
+        }
+
+        // 所有候补都失败，发布 NodeFailed
+        tracing::error!(
+            "节点 {} 所有候补 Actor 均失败 (共 {} 个): last_error={}",
+            node_name,
+            candidates.len(),
+            last_error
+        );
+        self.emit_with_trace(
+            AgentEventData::NodeFailed {
+                run_id: run_id.to_string(),
+                node_name: node_name.to_string(),
+                error: format!("所有候补 Actor 均失败: {}", last_error),
+                duration_ms: 0,
+            },
+            trace_id.as_deref(),
+            session_id.as_deref(),
         )
         .await;
     }
 
-    /// 带 trace_id 上下文发布事件（trace_id 为空时降级为普通 emit）
+    /// 带 trace_id 上下文发布事件
     async fn emit_with_trace(
         &self,
         data: AgentEventData,

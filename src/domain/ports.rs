@@ -52,11 +52,13 @@ pub trait OrchestrationEnginePort: Send + Sync + 'static {
     ///
     /// - `trace_id`: 追踪 ID（写入框架 ctx.metadata，事件 emit 时带 trace 上下文）
     /// - `session_id`: 会话 ID（同上，写入 ctx.metadata 供事件关联）
+    /// - `graph`: 指定图名称（为空时自动匹配）
     fn orchestrate(
         &self,
         message: &str,
         user_id: &str,
         chain: &str,
+        graph: &str,
         trace_id: &str,
         session_id: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = OrchestrateResponse> + Send>>;
@@ -72,6 +74,34 @@ pub trait OrchestrationEnginePort: Send + Sync + 'static {
         &self,
         message: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<ExpertInfo>> + Send>>;
+}
+
+/// 工具链端口（出站端口）
+///
+/// Rust 工具链调用能力：编译检查、Clippy、格式化。
+/// 由出站适配层实现，供领域专家在代码生成验证闭环中使用。
+pub trait ToolchainPort: Send + Sync + 'static {
+    /// 运行 cargo check（快速编译检查，不生成二进制）
+    fn check(
+        &self,
+        project_path: &str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::domain::dto::ToolchainResult> + Send>,
+    >;
+
+    /// 运行 cargo clippy（代码质量检查）
+    fn clippy(
+        &self,
+        project_path: &str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::domain::dto::ToolchainResult> + Send>,
+    >;
+
+    /// 格式化代码（rustfmt）
+    fn format(
+        &self,
+        code: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send>>;
 }
 
 /// 技能执行端口（出站端口）

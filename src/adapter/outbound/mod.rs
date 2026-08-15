@@ -8,7 +8,7 @@
 //! - 应用层仅依赖端口接口，不依赖具体实现
 
 use crate::domain::dto::{ExpertInfo, SkillInfo};
-use subhuti::FrameworkExpertInfo;
+use subhuti_core::FrameworkExpertInfo;
 
 /// 将框架层 `FrameworkExpertInfo` → 应用层 `ExpertInfo` 的共享转换
 ///
@@ -46,4 +46,5 @@ pub mod graphs;
 pub mod observer_adapters;
 pub mod postgres_repository;
 pub mod rules;
+pub mod rust_toolchain_adapter;
 pub mod subhuti_framework_initializer;

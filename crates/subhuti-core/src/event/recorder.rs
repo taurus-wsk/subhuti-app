@@ -700,6 +700,17 @@ impl AgentEventData {
                 total_steps,
                 ..
             } => format!("graph done, ok={}, {} steps", success, total_steps),
+            Self::ActorTaskRequested { node_name, .. } => {
+                format!("actor task: node={}", node_name)
+            }
+            Self::ActorBid {
+                actor_id, score, ..
+            } => {
+                format!("actor bid: {} score={}", actor_id, score)
+            }
+            Self::NodeTaskAssigned { actor_name, .. } => {
+                format!("task assigned: {}", actor_name)
+            }
         }
     }
 }

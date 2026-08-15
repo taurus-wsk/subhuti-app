@@ -1,20 +1,8 @@
 //! # Observe
 //!
 //! 观测和追踪接口定义。
+//! observer 模块提供函数调用链路追踪的统一基础设施。
 
-use serde::{Deserialize, Serialize};
+pub mod observer;
 
-pub mod session;
-pub mod trace;
-
-pub use session::*;
-pub use trace::*;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TraceStatus {
-    Success,
-    Failed,
-    InProgress,
-    Cancelled,
-}
+pub use observer::*;

@@ -36,7 +36,7 @@
 //!     .entry("planner")
 //!     .build();
 //!
-//! let result = graph.run(GraphState::new()).await?;
+//! let result = graph.run_with_id("example", &mut GraphState::new()).await?;
 //! ```
 
 pub mod actor;

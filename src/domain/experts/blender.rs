@@ -9,6 +9,7 @@
 
 use async_trait::async_trait;
 
+use crate::application::observer::{record_fn_log, LogLevel};
 use crate::domain::traits::{
     DomainExecutionContext, DomainExpert, DomainMessage, DomainResult, DomainRole, DomainSkill,
 };
@@ -105,7 +106,13 @@ impl DomainExpert for BlenderExpert {
 
         // 如果有配置，使用配置；否则使用默认提示词
         let system_prompt = if let Some(cfg) = config {
-            tracing::debug!("加载到 Blender 专家配置: {}", cfg);
+            record_fn_log(
+                None,
+                "",
+                LogLevel::Debug,
+                format!("加载到 Blender 专家配置: {}", cfg),
+                None,
+            );
             format!("你是一位 Blender 3D 动画制作专家。{}", cfg)
         } else {
             "你是一位 Blender 3D 动画制作专家。\
@@ -136,7 +143,13 @@ impl DomainExpert for BlenderExpert {
             exec_ctx.ctx.session_id.as_deref().unwrap_or("default")
         );
         if let Err(e) = exec_ctx.repository.save(&result_key, &response).await {
-            tracing::warn!("保存 Blender 专家结果失败: {}", e);
+            record_fn_log(
+                None,
+                "",
+                LogLevel::Warn,
+                format!("保存 Blender 专家结果失败: {}", e),
+                None,
+            );
         }
 
         Ok(response)
@@ -226,7 +239,13 @@ impl DomainExpert for BlenderExpert {
             exec_ctx.ctx.session_id.as_deref().unwrap_or("default")
         );
         if let Err(e) = exec_ctx.repository.save(&result_key, &response).await {
-            tracing::warn!("保存 Blender 技能执行结果失败: {}", e);
+            record_fn_log(
+                None,
+                "",
+                LogLevel::Warn,
+                format!("保存 Blender 技能执行结果失败: {}", e),
+                None,
+            );
         }
 
         Ok(response)

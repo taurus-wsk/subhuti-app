@@ -11,11 +11,13 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 
-use subhuti::{
-    orchestrator::{AgentContext, ExpertAgent, ExpertState, FromState, Llm, SkillInfo},
-    Result,
+use subhuti_core::orchestrator::{
+    AgentContext, ExpertAgent, ExpertState, FromState, Llm, SkillInfo,
 };
+use subhuti_core::Result;
 
+use crate::application::observer::{record_fn_log, LogLevel};
+use crate::domain::ports::ToolchainPort;
 use crate::domain::traits::{
     DomainContext, DomainError, DomainExecutionContext, DomainExpert, DomainLlm, DomainMessage,
     DomainRepository, DomainResult, DomainRole,
@@ -33,6 +35,8 @@ where
     skills: Vec<SkillInfo>,
     /// 数据仓库（通过依赖注入传入，供领域专家使用）
     repository: Arc<dyn DomainRepository>,
+    /// Rust 工具链（可选，供 RustExpert 等需要编译验证的专家使用）
+    toolchain: Option<Arc<dyn ToolchainPort>>,
 }
 
 impl<D: ?Sized> DomainExpertAdapter<D>
@@ -40,7 +44,11 @@ where
     D: DomainExpert,
 {
     /// 创建新的适配器实例
-    pub fn new(domain_expert: Arc<D>, repository: Arc<dyn DomainRepository>) -> Self {
+    pub fn new(
+        domain_expert: Arc<D>,
+        repository: Arc<dyn DomainRepository>,
+        toolchain: Option<Arc<dyn ToolchainPort>>,
+    ) -> Self {
         // 预计算并缓存技能信息，避免每次调用 skills() 时重复转换
         let skills = domain_expert
             .skills()
@@ -57,6 +65,7 @@ where
             domain_expert,
             skills,
             repository,
+            toolchain,
         }
     }
 
@@ -135,12 +144,19 @@ where
             } else {
                 Some(params.clone())
             },
+            toolchain: self.toolchain.clone(),
         };
 
         // 6. 根据是否有技能ID选择执行方式
         let result = if !skill_id.is_empty() {
             // 执行指定技能
-            tracing::debug!("执行技能: {}，参数: {}", skill_id, params);
+            record_fn_log(
+                None,
+                "",
+                LogLevel::Debug,
+                format!("执行技能: {}，参数: {}", skill_id, params),
+                None,
+            );
             self.domain_expert
                 .execute_skill(&skill_id, &params, exec_ctx)
                 .await
@@ -152,7 +168,7 @@ where
         // 7. 转换结果（在适配器中手动转换领域错误为框架错误）
         match result {
             Ok(output) => Ok(output),
-            Err(e) => Err(subhuti::Error::Any(anyhow::anyhow!(e))),
+            Err(e) => Err(subhuti_core::Error::Any(anyhow::anyhow!(e))),
         }
     }
 }
@@ -161,22 +177,22 @@ where
 ///
 /// 将 Subhuti 框架的 LLM 转换为领域层的 DomainLlm 接口。
 struct SubhutiLlmAdapter {
-    llm: Arc<dyn subhuti::runtime::llm::LLM>,
+    llm: Arc<dyn subhuti_core::LLM>,
 }
 
 #[async_trait]
 impl DomainLlm for SubhutiLlmAdapter {
     async fn chat(&self, messages: Vec<DomainMessage>) -> DomainResult<String> {
         // 将领域消息转换为框架消息
-        let framework_messages: Vec<subhuti::runtime::llm::Message> = messages
+        let framework_messages: Vec<subhuti_core::Message> = messages
             .into_iter()
             .map(|m| {
                 let role = match m.role {
-                    DomainRole::System => subhuti::runtime::llm::Role::System,
-                    DomainRole::User => subhuti::runtime::llm::Role::User,
-                    DomainRole::Assistant => subhuti::runtime::llm::Role::Assistant,
+                    DomainRole::System => subhuti_core::Role::System,
+                    DomainRole::User => subhuti_core::Role::User,
+                    DomainRole::Assistant => subhuti_core::Role::Assistant,
                 };
-                subhuti::runtime::llm::Message {
+                subhuti_core::Message {
                     role,
                     content: m.content,
                     tool_call_id: None,

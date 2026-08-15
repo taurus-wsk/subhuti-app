@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use subhuti::Subhuti;
+use subhuti_core::engine::Subhuti;
 
 use crate::adapter::outbound::framework_to_app_expert;
 use crate::domain::dto::{SkillInfo, SkillResponse};
@@ -60,7 +60,7 @@ impl SkillExecutionPort for SubhutiSkillExecutor {
             match subhuti.find_agent_by_skill(&skill_id).await {
                 Some((expert_id, _agent)) => {
                     // 创建上下文并设置技能信息到 metadata
-                    let mut ctx = subhuti::orchestrator::AgentContext::new(
+                    let mut ctx = subhuti_core::orchestrator::AgentContext::new(
                         &format!("执行技能 {}，参数：{}", skill_id, args),
                         "skill_executor",
                     );

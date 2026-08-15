@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "crates/subhuti",
     "crates/subhuti-core",
     "crates/subhuti-infra",
     "crates/subhuti-plugin-sdk",
@@ -23,7 +22,8 @@ name = "subhuti-app"
 path = "src/bin/subhuti_app.rs"
 
 [dependencies]
-subhuti = { path = "crates/subhuti" }
+subhuti-core = { path = "crates/subhuti-core" }
+subhuti-infra = { path = "crates/subhuti-infra" }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "time"] }
@@ -57,6 +57,9 @@ futures = "0.3"
 
 # 环境变量加载
 dotenvy = "0.15"
+
+# 内存统计（函数调用链路追踪 - 内存变化采集）
+memory-stats = "1.0"
 
 # TOML 配置解析
 toml = "0.8"
