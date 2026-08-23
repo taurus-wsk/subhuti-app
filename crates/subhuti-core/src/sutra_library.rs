@@ -81,6 +81,29 @@ pub trait SutraLibraryPort: Send + Sync {
         domain: &str,
         session_id: Option<String>,
     ) -> String;
+
+    // ─── 知识库 CRUD ────────────────────────────────────────────
+
+    /// 获取所有知识库列表
+    ///
+    /// 返回 JSON 格式的知识库列表，包含 id、name、description、tags、expert_id 等字段
+    async fn list_knowledge_bases(&self) -> String;
+
+    /// 获取指定知识库的所有切片内容
+    ///
+    /// # 参数
+    /// - `kb_id`: 知识库 ID
+    ///
+    /// 返回 JSON 格式的切片列表，包含 id、title、content、metadata 等字段
+    async fn list_chunks(&self, kb_id: &str) -> String;
+
+    /// 根据 expert_id 获取关联的知识库
+    ///
+    /// # 参数
+    /// - `expert_id`: 专家 ID（如 "rust-expert"）
+    ///
+    /// 返回 JSON 格式的知识库列表
+    async fn get_knowledge_base_by_expert(&self, expert_id: &str) -> String;
 }
 
 /// 空实现（未配置藏经阁时使用）
@@ -167,5 +190,17 @@ impl SutraLibraryPort for EmptySutraLibrary {
         _session_id: Option<String>,
     ) -> String {
         "⚠️ 藏经阁引擎未配置".to_string()
+    }
+
+    async fn list_knowledge_bases(&self) -> String {
+        "⚠️ 藏经阁引擎未配置，无法查询知识库".to_string()
+    }
+
+    async fn list_chunks(&self, _kb_id: &str) -> String {
+        "⚠️ 藏经阁引擎未配置，无法查询知识库切片".to_string()
+    }
+
+    async fn get_knowledge_base_by_expert(&self, _expert_id: &str) -> String {
+        "⚠️ 藏经阁引擎未配置，无法查询专家知识库".to_string()
     }
 }

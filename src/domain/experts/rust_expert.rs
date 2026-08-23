@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 
 use crate::domain::traits::{
     DomainContext, DomainError, DomainExecutionContext, DomainExpert, DomainMessage, DomainResult,
-    DomainRole, DomainSkill,
+    DomainRole, DomainSkill, PlanStep, SkillPlan,
 };
 
 /// Rust 编程专家
@@ -86,6 +86,18 @@ impl RustExpert {
                     name: "代码重构".to_string(),
                     description: "将代码重构为符合六边形架构和编码规范的版本".to_string(),
                     parameters: vec!["code: 待重构的代码（必填）".to_string()],
+                },
+                DomainSkill {
+                    id: "rust-skill-list".to_string(),
+                    name: "技能列表".to_string(),
+                    description: "查询并展示当前专家可用的所有技能列表及其详细说明".to_string(),
+                    parameters: vec!["format: 输出格式（可选，支持 markdown/plain）".to_string()],
+                },
+                DomainSkill {
+                    id: "rust-knowledge-query".to_string(),
+                    name: "知识库查询".to_string(),
+                    description: "查询 Rust 专家的知识库内容，包括四层知识库（Rust基础、设计模式、编码规范、项目结构）".to_string(),
+                    parameters: vec!["topic: 查询的主题或关键词（可选，为空则展示所有知识库目录）".to_string()],
                 },
             ],
         }
@@ -156,7 +168,7 @@ impl RustExpert {
 
     // ─── 四层知识库：内嵌为系统提示词 ────────────────────────────
 
-    /// 构建完整的系统提示词
+    /// 构建完整的系统提示词（静态版本，作为 fallback）
     fn build_system_prompt(&self) -> String {
         format!(
             "{}\n\n{}\n\n{}\n\n{}",
@@ -165,6 +177,138 @@ impl RustExpert {
             self.layer3_personal_conventions(),
             self.layer4_project_context()
         )
+    }
+
+    /// 从藏经阁动态加载知识库内容并构建系统提示词
+    ///
+    /// 优先从藏经阁加载知识库切片，如果加载失败则 fallback 到静态知识库
+    async fn build_system_prompt_dynamic(&self, exec_ctx: &DomainExecutionContext) -> String {
+        // 尝试从藏经阁加载知识库
+        if let Some(sutra) = &exec_ctx.sutra_library {
+            let expert_id = self.id();
+
+            // 1. 根据 expert_id 获取关联的知识库
+            let kb_result = sutra.get_knowledge_base_by_expert(expert_id).await;
+            if !kb_result.contains("⚠️") && !kb_result.is_empty() {
+                tracing::info!("从藏经阁加载知识库: expert_id={}", expert_id);
+
+                // 解析知识库列表
+                if let Ok(kbases) = serde_json::from_str::<Vec<serde_json::Value>>(&kb_result) {
+                    if !kbases.is_empty() {
+                        let mut all_content = String::new();
+
+                        // 2. 遍历每个知识库，获取其切片内容
+                        for kb in &kbases {
+                            if let Some(kb_id) = kb.get("id").and_then(|v| v.as_str()) {
+                                let kb_name = kb
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("未知知识库");
+                                all_content.push_str(&format!("\n## 知识库: {}\n\n", kb_name));
+
+                                let chunks_result = sutra.list_chunks(kb_id).await;
+                                if let Ok(chunks) =
+                                    serde_json::from_str::<Vec<serde_json::Value>>(&chunks_result)
+                                {
+                                    for chunk in &chunks {
+                                        let title = chunk
+                                            .get("title")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("未命名");
+                                        let content = chunk
+                                            .get("content")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                                        all_content
+                                            .push_str(&format!("### {}\n{}\n\n", title, content));
+                                    }
+                                }
+                            }
+                        }
+
+                        if !all_content.is_empty() {
+                            tracing::info!(
+                                "成功从藏经阁加载知识库内容: {} 字节",
+                                all_content.len()
+                            );
+                            // 截断预算：防止知识库全量内容撑爆模型上下文窗口（触发 400 超限）
+                            const MAX_CHARS: usize = 12_000;
+                            if all_content.chars().count() > MAX_CHARS {
+                                let cut_at = all_content
+                                    .char_indices()
+                                    .take(MAX_CHARS)
+                                    .map(|(i, _)| i)
+                                    .last()
+                                    .unwrap_or(0);
+                                all_content.truncate(cut_at);
+                                all_content
+                                    .push_str("\n\n[知识库内容已按 token 预算截断，如需更多资料请使用 rust-knowledge-query 技能按需召回]");
+                                tracing::warn!(
+                                    "知识库内容超过预算，已截断到 {} 字符",
+                                    all_content.chars().count()
+                                );
+                            }
+                            return all_content;
+                        }
+                    }
+                }
+            }
+        }
+
+        // fallback: 使用静态知识库
+        tracing::info!("藏经阁不可用，使用静态知识库");
+        self.build_system_prompt()
+    }
+
+    /// 获取技能列表信息（用于注入到系统提示词中）
+    fn format_skills_info(&self) -> String {
+        let mut result = String::new();
+
+        for skill in &self.skills {
+            result.push_str(&format!(
+                "- **{}** (ID: {}): {}\n",
+                skill.name, skill.id, skill.description
+            ));
+        }
+
+        result
+    }
+
+    /// 格式化技能列表用于直接响应（不依赖 LLM）
+    fn format_skills_for_response(&self) -> String {
+        let mut result = String::from("我是 Rust 编程专家，拥有以下技能：\n\n");
+
+        for skill in &self.skills {
+            result.push_str(&format!(
+                "- **{}** (ID: `{}`): {}\n",
+                skill.name, skill.id, skill.description
+            ));
+        }
+
+        result.push_str("\n您可以告诉我使用哪个技能来完成任务。");
+        result
+    }
+
+    /// 格式化技能列表用于系统提示词
+    fn format_skills_for_prompt(&self) -> String {
+        let mut result =
+            String::from("## 你拥有以下技能（必须严格按照此列表回答，不要编造列表外的技能）：\n\n");
+
+        for skill in &self.skills {
+            result.push_str(&format!(
+                "- **{}** (ID: {}): {}\n",
+                skill.name, skill.id, skill.description
+            ));
+        }
+
+        result.push_str("\n### 强制要求：\n");
+        result.push_str("1. 必须用中文回答\n");
+        result.push_str(
+            "2. 当用户问「你有什么技能」时，必须逐个列出以上6个技能，每个技能都要包含ID和名称\n",
+        );
+        result.push_str("3. 格式必须是列表形式，如：- **自由对话** (ID: rust-chat)：描述\n");
+        result.push_str("4. 不要添加列表中不存在的技能\n");
+        result
     }
 
     /// 第一层：通用 Rust 基础知识
@@ -294,11 +438,23 @@ src/
         exec_ctx: DomainExecutionContext,
         question: &str,
     ) -> DomainResult<String> {
+        let is_knowledge_q = is_knowledge_query(question);
+
+        tracing::info!(
+            "skill_chat: knowledge_query={}, question={}",
+            is_knowledge_q,
+            question
+        );
+
         // 如果用户自定义了 system_prompt，优先使用
         let sys = if let Some(ref custom) = exec_ctx.ctx.system_prompt {
             custom.clone()
+        } else if is_knowledge_q {
+            // 用户询问知识库/专家能力相关问题 → 从藏经阁动态加载知识库
+            tracing::info!("检测到知识库查询，从藏经阁动态加载知识库");
+            self.build_system_prompt_dynamic(&exec_ctx).await
         } else {
-            // 闲聊模式：使用轻量级系统提示词，不加载完整知识库
+            // 闲聊模式：使用轻量级系统提示词
             "你是 Rust 编程专家，擅长 Rust 语言、系统编程、Web 后端、架构设计等领域。\
              \n\n请用简洁、专业的方式回答用户的问题。如果用户问的是 Rust 相关问题，请给出详细解答。\
              \n如果用户只是打招呼或闲聊，请友好回应但保持专业。\
@@ -400,6 +556,9 @@ src/
             ));
         }
 
+        // 获取技能列表信息
+        let skills_info = self.format_skills_info();
+
         // ── 1. LLM 生成计划（markdown 清单） ────────────────────
         output.push_str("## 📋 执行计划\n\n");
         let plan_prompt = format!(
@@ -407,6 +566,7 @@ src/
             当前项目状态：\n\
             - Cargo.toml 存在: {}\n\
             - 已存在的 Rust 文件: {}\n\n\
+            ## 你的可用技能\n{}\n\
             用户任务：{}\n\n\
             请先制定一个详细的执行计划，以 markdown 任务清单（`- [ ]`）格式列出每一步。\n\
             例如：\n\
@@ -417,6 +577,7 @@ src/
             ws,
             if has_project { "是" } else { "否" },
             existing_files.join(", "),
+            skills_info,
             task,
         );
         let plan = llm
@@ -512,6 +673,7 @@ src/
              \n当前项目状态：\n\
              - Cargo.toml 存在: {}\n\
              - 已存在的 Rust 文件: {}\n\
+             \n## 你的可用技能\n{}\n\
              \n你的任务：{}\n\
              \n## 输出格式\n\
              生成代码时，每个文件用以下格式标记：\n\
@@ -528,6 +690,7 @@ src/
             ws,
             if has_project { "是" } else { "否" },
             existing_files.join(", "),
+            skills_info,
             task,
         );
         let user_prompt = format!(
@@ -624,11 +787,18 @@ src/
         exec_ctx: DomainExecutionContext,
         requirement: &str,
     ) -> DomainResult<String> {
+        // 获取技能列表信息
+        let skills_info = self.format_skills_info();
+
         // 如果用户自定义了 system_prompt，优先使用
         let sys = if let Some(ref custom) = exec_ctx.ctx.system_prompt {
             custom.clone()
         } else {
-            self.build_system_prompt()
+            format!(
+                "{}\n\n## 可用技能\n{}",
+                self.build_system_prompt_dynamic(&exec_ctx).await,
+                skills_info
+            )
         };
 
         // 如果设置了 workspace_folder，附加到指令中
@@ -640,13 +810,14 @@ src/
 
         let gen_instruction = format!(
             "你是 Rust 编程专家。根据以下需求生成完整、可编译的 Rust 代码。{ws_hint}\n\n\
+             ## 你的可用技能\n{}\n\
              生成要求：\n\
              1. 严格遵守六边形架构分层\n\
              2. DTO 派生 Serialize/Deserialize\n\
              3. 不要省略任何必要的 use 语句\n\
              4. 用 ```rust 代码块标注文件路径\n\n\
              ---\n需求：{}",
-            requirement,
+            skills_info, requirement,
         );
 
         self.generate_with_verify(exec_ctx, &sys, &gen_instruction, requirement)
@@ -659,9 +830,11 @@ src/
         exec_ctx: DomainExecutionContext,
         code: &str,
     ) -> DomainResult<String> {
+        let skills_info = self.format_skills_info();
         let sys = format!(
-            "{}\n\n你是 Rust 代码审查专家。检查：架构分层、错误处理、异步安全、命名一致性、不必要的 clone、潜在死锁。",
-            self.build_system_prompt()
+            "{}\n\n## 可用技能\n{}\n\n你是 Rust 代码审查专家。检查：架构分层、错误处理、异步安全、命名一致性、不必要的 clone、潜在死锁。",
+            self.build_system_prompt_dynamic(&exec_ctx).await,
+            skills_info
         );
         let msg = format!("请审查以下 Rust 代码：\n\n```rust\n{}\n```", code);
         exec_ctx.llm.chat(self.build_messages(&sys, &msg)).await
@@ -673,13 +846,15 @@ src/
         exec_ctx: DomainExecutionContext,
         input: &str,
     ) -> DomainResult<String> {
+        let skills_info = self.format_skills_info();
         let sys = format!(
-            "{}\n\n你是 Rust 编译错误修复专家。\n常见错误修复策略：\n\
+            "{}\n\n## 可用技能\n{}\n\n你是 Rust 编译错误修复专家。\n常见错误修复策略：\n\
              - E0597 (borrow lifetime): 减少不必要的借用\n\
              - E0382 (move): 使用 clone 或引用\n\
              - E0277 (trait bound): 添加必要的 trait 约束\n\
              - E0507 (move out): 使用 clone 或 ref",
-            self.build_system_prompt()
+            self.build_system_prompt_dynamic(&exec_ctx).await,
+            skills_info
         );
         let msg = format!("## 代码与编译错误\n\n{}", input);
         exec_ctx.llm.chat(self.build_messages(&sys, &msg)).await
@@ -691,13 +866,350 @@ src/
         exec_ctx: DomainExecutionContext,
         code: &str,
     ) -> DomainResult<String> {
+        let skills_info = self.format_skills_info();
         let sys = format!(
-            "{}\n\n你是 Rust 代码重构专家。将代码重构为符合六边形架构和编码规范的版本。\n\
+            "{}\n\n## 可用技能\n{}\n\n你是 Rust 代码重构专家。将代码重构为符合六边形架构和编码规范的版本。\n\
              目标：分离端口定义和实现、引入 trait 抽象、使用 Arc<dyn Port> 依赖注入、添加文档注释。",
-            self.build_system_prompt()
+            self.build_system_prompt_dynamic(&exec_ctx).await,
+            skills_info
         );
         let msg = format!("请重构以下 Rust 代码：\n\n```rust\n{}\n```", code);
         exec_ctx.llm.chat(self.build_messages(&sys, &msg)).await
+    }
+
+    /// 技能: rust-skill-list — 查询并返回技能列表（不调用LLM）
+    async fn skill_skill_list(
+        &self,
+        _exec_ctx: DomainExecutionContext,
+        _params: &str,
+    ) -> DomainResult<String> {
+        tracing::info!("[skill_skill_list] 返回技能列表");
+        Ok(self.format_skills_for_response())
+    }
+
+    /// 技能: rust-knowledge-query — 查询知识库内容（通过藏经阁引擎召回）
+    async fn skill_knowledge_query(
+        &self,
+        exec_ctx: DomainExecutionContext,
+        topic: &str,
+    ) -> DomainResult<String> {
+        // 解析参数，支持 JSON 格式和纯字符串格式
+        let topic = Self::extract_param(topic, "topic");
+        tracing::info!(
+            "[skill_knowledge_query] 查询知识库, topic={}, has_sutra={}",
+            topic,
+            exec_ctx.sutra_library.is_some()
+        );
+
+        let topic = topic.trim();
+
+        // 如果没有指定主题，从藏经阁获取知识库列表
+        if topic.is_empty() || topic == "all" || topic == "目录" || topic == "list" {
+            // 尝试从藏经阁获取知识库列表
+            if let Some(sutra) = &exec_ctx.sutra_library {
+                let expert_id = self.id();
+                tracing::info!(
+                    "[skill_knowledge_query] 从藏经阁加载知识库: expert_id={}",
+                    expert_id
+                );
+                let kb_result = sutra.get_knowledge_base_by_expert(expert_id).await;
+                tracing::info!("[skill_knowledge_query] get_knowledge_base_by_expert 返回: len={}, has_warning={}", kb_result.len(), kb_result.contains("⚠️"));
+                if !kb_result.contains("⚠️") && !kb_result.is_empty() {
+                    // 格式化知识库列表
+                    if let Ok(kbases) = serde_json::from_str::<Vec<serde_json::Value>>(&kb_result) {
+                        tracing::info!("[skill_knowledge_query] 解析到 {} 个知识库", kbases.len());
+                        if !kbases.is_empty() {
+                            return Ok(self.format_kbases_catalog(&kbases, sutra).await);
+                        }
+                    }
+                }
+            }
+            // fallback: 返回静态目录
+            tracing::info!("[skill_knowledge_query] 使用静态目录 fallback");
+            Ok(self.format_knowledge_catalog())
+        } else {
+            // 根据主题从藏经阁召回知识库内容
+            if let Some(sutra) = &exec_ctx.sutra_library {
+                // 1. 先尝试使用 library_retrieve 进行语义召回
+                let retrieve_result = sutra.library_retrieve(topic, 5).await;
+                if !retrieve_result.contains("⚠️") && !retrieve_result.contains("未找到") {
+                    tracing::info!("[skill_knowledge_query] 藏经阁召回成功");
+                    // 还需要获取详细内容，尝试从知识库切片中查找
+                    let expert_id = self.id();
+                    let kb_result = sutra.get_knowledge_base_by_expert(expert_id).await;
+                    if !kb_result.contains("⚠️") && !kb_result.is_empty() {
+                        if let Ok(kbases) =
+                            serde_json::from_str::<Vec<serde_json::Value>>(&kb_result)
+                        {
+                            let detailed =
+                                self.search_knowledge_in_sutra(&kbases, sutra, topic).await;
+                            if !detailed.is_empty() {
+                                return Ok(format!(
+                                    "{}\n\n---\n\n## 详细知识库内容\n\n{}",
+                                    retrieve_result, detailed
+                                ));
+                            }
+                        }
+                    }
+                    return Ok(retrieve_result);
+                }
+
+                // 2. 如果召回失败，尝试直接搜索知识库切片
+                let expert_id = self.id();
+                let kb_result = sutra.get_knowledge_base_by_expert(expert_id).await;
+                if !kb_result.contains("⚠️") && !kb_result.is_empty() {
+                    if let Ok(kbases) = serde_json::from_str::<Vec<serde_json::Value>>(&kb_result) {
+                        let detailed = self.search_knowledge_in_sutra(&kbases, sutra, topic).await;
+                        if !detailed.is_empty() {
+                            return Ok(detailed);
+                        }
+                    }
+                }
+            }
+
+            // fallback: 使用静态搜索
+            Ok(self.search_knowledge(topic))
+        }
+    }
+
+    /// 格式化知识库目录（从藏经阁动态获取）
+    async fn format_kbases_catalog(
+        &self,
+        kbases: &[serde_json::Value],
+        sutra: &Arc<dyn subhuti_core::SutraLibraryPort>,
+    ) -> String {
+        let mut result = String::from("## Rust 编程专家知识库目录\n\n");
+
+        for kb in kbases {
+            let kb_name = kb.get("name").and_then(|v| v.as_str()).unwrap_or("未知");
+            let kb_desc = kb.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            let kb_id = kb.get("id").and_then(|v| v.as_str()).unwrap_or("");
+
+            result.push_str(&format!("### 📚 {}\n{}\n\n", kb_name, kb_desc));
+
+            // 获取该知识库的切片列表
+            let chunks_result = sutra.list_chunks(kb_id).await;
+            if let Ok(chunks) = serde_json::from_str::<Vec<serde_json::Value>>(&chunks_result) {
+                for chunk in &chunks {
+                    let title = chunk
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("未命名");
+                    result.push_str(&format!("- {}\n", title));
+                }
+            }
+            result.push('\n');
+        }
+
+        result
+    }
+
+    /// 从藏经阁知识库中搜索指定主题
+    async fn search_knowledge_in_sutra(
+        &self,
+        kbases: &[serde_json::Value],
+        sutra: &Arc<dyn subhuti_core::SutraLibraryPort>,
+        topic: &str,
+    ) -> String {
+        let topic_lower = topic.to_lowercase();
+        let mut result = String::new();
+
+        for kb in kbases {
+            let kb_name = kb.get("name").and_then(|v| v.as_str()).unwrap_or("未知");
+            let kb_id = kb.get("id").and_then(|v| v.as_str()).unwrap_or("");
+
+            let chunks_result = sutra.list_chunks(kb_id).await;
+            if let Ok(chunks) = serde_json::from_str::<Vec<serde_json::Value>>(&chunks_result) {
+                let mut matched_chunks = Vec::new();
+
+                for chunk in &chunks {
+                    let title = chunk
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+                    let content = chunk
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+
+                    // 简单的关键词匹配
+                    if title.contains(&topic_lower) || content.contains(&topic_lower) {
+                        matched_chunks.push(chunk);
+                    }
+                }
+
+                if !matched_chunks.is_empty() {
+                    result.push_str(&format!("### 📚 {} — 相关内容\n\n", kb_name));
+                    for chunk in &matched_chunks {
+                        let title = chunk
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("未命名");
+                        let content = chunk.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                        result.push_str(&format!("**{}**\n{}\n\n", title, content));
+                    }
+                }
+            }
+        }
+
+        if result.is_empty() {
+            format!("未在藏经阁知识库中找到与「{}」相关的内容。", topic)
+        } else {
+            result
+        }
+    }
+
+    /// 从参数中提取指定字段的值，支持 JSON 格式和纯字符串格式
+    fn extract_param(params: &str, field: &str) -> String {
+        let trimmed = params.trim();
+
+        // 尝试解析 JSON 格式
+        if trimmed.starts_with('{') {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                if let Some(value) = json.get(field) {
+                    if let Some(s) = value.as_str() {
+                        return s.to_string();
+                    }
+                }
+                // 如果没有指定字段，尝试获取第一个字符串值
+                if let Some(obj) = json.as_object() {
+                    for (_, v) in obj {
+                        if let Some(s) = v.as_str() {
+                            return s.to_string();
+                        }
+                    }
+                }
+            }
+        }
+
+        // 否则返回原始字符串
+        trimmed.to_string()
+    }
+
+    /// 格式化知识库目录结构
+    fn format_knowledge_catalog(&self) -> String {
+        r#"## Rust 编程专家知识库目录
+
+### 📚 第一层：Rust 基础知识
+- Tokens 异步运行时
+- Serde 序列化/反序列化
+- 错误处理（Result、panic、自定义错误）
+- Arc<Mutex<T>> 并发原语
+- Trait Object 动态分发
+
+### 🏗️ 第二层：设计模式范式库
+- 六边形分层架构（domain → application → adapter）
+- 入站端口装饰器（横切逻辑：trace、鉴权、限流）
+- 事件总线与观察者模式
+- 仓储模式（Repository）
+- DDD 聚合根与领域事件
+
+### 📐 第三层：个人编码规范
+- 架构约束（六边形分层、端口分离）
+- 命名规范（Port/Service/Adapter 后缀）
+- 错误处理规范
+- 异步约定
+- 文件组织规范
+
+### 📂 第四层：项目上下文
+- 项目目录结构
+- 领域层/应用层/适配层职责
+- 核心组件说明
+
+---
+
+💡 提示：可以使用以下关键词查询具体内容：
+- "设计模式"、"架构"、"DDD" → 查询第二层
+- "命名"、"规范"、"错误处理" → 查询第三层
+- "tokio"、"serde"、"async" → 查询第一层"#
+            .to_string()
+    }
+
+    /// 搜索知识库内容
+    fn search_knowledge(&self, topic: &str) -> String {
+        let topic_lower = topic.to_lowercase();
+
+        // 检查匹配的层级
+        let mut matched_layers = Vec::new();
+
+        // 第二层关键词匹配
+        let layer2_keywords = [
+            "设计模式",
+            "架构",
+            "DDD",
+            "六边形",
+            "仓储",
+            "聚合",
+            "事件",
+            "装饰器",
+            "模式",
+        ];
+        if layer2_keywords
+            .iter()
+            .any(|kw| topic_lower.contains(kw) || topic.contains(kw))
+        {
+            matched_layers.push("第二层：设计模式范式库");
+        }
+
+        // 第三层关键词匹配
+        let layer3_keywords = ["命名", "规范", "错误处理", "异步", "文件组织", "约束"];
+        if layer3_keywords
+            .iter()
+            .any(|kw| topic_lower.contains(kw) || topic.contains(kw))
+        {
+            matched_layers.push("第三层：个人编码规范");
+        }
+
+        // 第一层关键词匹配
+        let layer1_keywords = [
+            "tokio",
+            "serde",
+            "async",
+            "await",
+            "arc",
+            "mutex",
+            "trait",
+            "rust基础",
+        ];
+        if layer1_keywords.iter().any(|kw| topic_lower.contains(kw)) {
+            matched_layers.push("第一层：Rust 基础知识");
+        }
+
+        // 第四层关键词匹配
+        let layer4_keywords = ["项目结构", "目录", "文件", "组件", "项目"];
+        if layer4_keywords
+            .iter()
+            .any(|kw| topic_lower.contains(kw) || topic.contains(kw))
+        {
+            matched_layers.push("第四层：项目上下文");
+        }
+
+        // 如果没有匹配，返回所有知识库
+        if matched_layers.is_empty() {
+            format!(
+                "## 未找到与「{}」相关的专题，以下是完整知识库内容：\n\n{}\n\n---\n\n{}\n\n---\n\n{}\n\n---\n\n{}",
+                topic,
+                self.layer1_rust_basics(),
+                self.layer2_design_patterns(),
+                self.layer3_personal_conventions(),
+                self.layer4_project_context()
+            )
+        } else {
+            let mut result = format!("## 知识库查询结果：「{}」\n\n", topic);
+            for name in &matched_layers {
+                let content = match *name {
+                    "第一层：Rust 基础知识" => self.layer1_rust_basics(),
+                    "第二层：设计模式范式库" => self.layer2_design_patterns(),
+                    "第三层：个人编码规范" => self.layer3_personal_conventions(),
+                    "第四层：项目上下文" => self.layer4_project_context(),
+                    _ => String::new(),
+                };
+                result.push_str(&format!("### {}\n\n{}\n\n---\n\n", name, content));
+            }
+            result
+        }
     }
 
     // ─── 验证修复闭环 ─────────────────────────────────────────────
@@ -1013,6 +1525,71 @@ fn is_coding_request(input: &str) -> bool {
     true
 }
 
+/// 判断是否为知识库/专家能力查询
+///
+/// 当用户询问知识库内容、专家能力、系统设定等时，返回 true
+/// 用于决定是否加载完整的四层知识库
+fn is_knowledge_query(input: &str) -> bool {
+    let input_lower = input.to_lowercase();
+
+    let knowledge_keywords = [
+        "知识库",
+        "知识",
+        "你会什么",
+        "你能做什么",
+        "你有什么能力",
+        "能力",
+        "技能",
+        "skill",
+        "skills",
+        "专家",
+        "是什么",
+        "介绍",
+        "系统提示",
+        "system prompt",
+        "system_prompt",
+        "四层",
+        "layer",
+        "layer1",
+        "layer2",
+        "layer3",
+        "layer4",
+        "设计模式",
+        "架构",
+        "编码规范",
+        "规范",
+        "rust知识",
+        "rust 知识",
+        "rust知识库",
+        "rust 专家",
+        "编程专家",
+    ];
+
+    knowledge_keywords.iter().any(|kw| input_lower.contains(kw))
+}
+
+/// 判断是否为技能查询
+///
+/// 当用户询问专家拥有的技能、能力列表等时，返回 true
+fn is_skill_query(input: &str) -> bool {
+    let input_lower = input.to_lowercase();
+
+    let skill_keywords = [
+        "技能",
+        "skill",
+        "skills",
+        "会什么",
+        "能做什么",
+        "有什么",
+        "功能",
+        "能力列表",
+        "怎么用",
+        "使用方法",
+    ];
+
+    skill_keywords.iter().any(|kw| input_lower.contains(kw))
+}
+
 // ─── DomainExpert 实现 ──────────────────────────────────────────
 
 #[async_trait]
@@ -1034,31 +1611,24 @@ impl DomainExpert for RustExpert {
     }
 
     async fn run(&self, exec_ctx: DomainExecutionContext) -> DomainResult<String> {
-        // 如果有指定技能，分发到对应处理
-        if let Some(ref skill_id) = exec_ctx.skill_id {
+        let input = &exec_ctx.ctx.input;
+        let has_skill_id = exec_ctx.skill_id.is_some();
+
+        tracing::info!("[run] 输入={}, has_skill_id={}", input, has_skill_id);
+
+        // 如果有指定技能，直接分发到对应处理（跳过规划）
+        if has_skill_id {
             let params = exec_ctx
                 .skill_params
                 .clone()
                 .unwrap_or_else(|| exec_ctx.ctx.input.clone());
-            let sid = skill_id.clone();
+            let sid = exec_ctx.skill_id.clone().unwrap();
             self.execute_skill(&sid, &params, exec_ctx).await
         } else {
-            // 默认：检测输入是否为编码请求
-            let input = exec_ctx.ctx.input.clone();
-            let has_ws = exec_ctx.ctx.workspace_folder.is_some()
-                && exec_ctx.file_system.is_some()
-                && exec_ctx.command.is_some();
-
-            if is_coding_request(&input) && has_ws {
-                // 有工作目录 + 文件系统/命令端口 → 使用项目编码技能
-                self.skill_coding(exec_ctx, &input).await
-            } else if is_coding_request(&input) {
-                // 无工作目录 → 纯代码生成（不操作文件系统）
-                self.skill_generate(exec_ctx, &input).await
-            } else {
-                // 非编码请求 → 闲聊
-                self.skill_chat(exec_ctx, &input).await
-            }
+            // 默认：使用 LLM 自动规划模式
+            // 让 LLM 分析用户意图，自主选择技能组合（包括 rust-skill-list 查询技能列表）
+            tracing::info!("[run] 使用 LLM 规划模式，自主选择技能");
+            self.plan_and_execute(exec_ctx).await
         }
     }
 
@@ -1075,6 +1645,8 @@ impl DomainExpert for RustExpert {
             "rust-review" => self.skill_review(exec_ctx, params).await,
             "rust-fix" => self.skill_fix(exec_ctx, params).await,
             "rust-refactor" => self.skill_refactor(exec_ctx, params).await,
+            "rust-skill-list" => self.skill_skill_list(exec_ctx, params).await,
+            "rust-knowledge-query" => self.skill_knowledge_query(exec_ctx, params).await,
             _ => {
                 // 未知技能，走默认 run
                 let new_ctx = DomainExecutionContext {
@@ -1118,9 +1690,39 @@ mod tests {
     }
 
     #[test]
-    fn test_has_six_skills() {
+    fn test_has_eight_skills() {
         let expert = RustExpert::new();
-        assert_eq!(expert.skills().len(), 6);
+        assert_eq!(expert.skills().len(), 8);
+    }
+
+    #[test]
+    fn test_skill_list_skill_exists() {
+        let expert = RustExpert::new();
+        let skill_list = expert.skills();
+        let skill = skill_list.iter().find(|s| s.id == "rust-skill-list");
+        assert!(skill.is_some(), "rust-skill-list 技能应该存在");
+        let skill = skill.unwrap();
+        assert_eq!(skill.name, "技能列表");
+    }
+
+    #[test]
+    fn test_knowledge_query_skill_exists() {
+        let expert = RustExpert::new();
+        let skill_list = expert.skills();
+        let skill = skill_list.iter().find(|s| s.id == "rust-knowledge-query");
+        assert!(skill.is_some(), "rust-knowledge-query 技能应该存在");
+        let skill = skill.unwrap();
+        assert_eq!(skill.name, "知识库查询");
+    }
+
+    #[test]
+    fn test_knowledge_catalog_not_empty() {
+        let expert = RustExpert::new();
+        let catalog = expert.format_knowledge_catalog();
+        assert!(catalog.contains("知识库目录"));
+        assert!(catalog.contains("Rust 基础知识"));
+        assert!(catalog.contains("设计模式"));
+        assert!(catalog.contains("编码规范"));
     }
 
     #[test]
@@ -1145,6 +1747,24 @@ mod tests {
         assert!(is_coding_request("如何实现async trait"));
         assert!(is_coding_request("这个代码报错怎么修复"));
         assert!(is_coding_request("Rust的六边形架构怎么设计"));
+    }
+
+    #[test]
+    fn test_is_knowledge_query() {
+        // 知识库查询 → true
+        assert!(is_knowledge_query("rust知识库中大概写了什么"));
+        assert!(is_knowledge_query("介绍一下你的知识库"));
+        assert!(is_knowledge_query("你有什么能力"));
+        assert!(is_knowledge_query("你会什么"));
+        assert!(is_knowledge_query("介绍一下Rust专家"));
+        assert!(is_knowledge_query("设计模式有哪些"));
+        assert!(is_knowledge_query("编码规范是什么"));
+        assert!(is_knowledge_query("你的skill有哪些"));
+        // 闲聊/普通对话 → false
+        assert!(!is_knowledge_query("你好"));
+        assert!(!is_knowledge_query("我是张三"));
+        assert!(!is_knowledge_query("今天天气怎么样"));
+        assert!(!is_knowledge_query("帮我写一个函数"));
     }
 
     // ─── write_files_from_llm_output 测试 ────────────────────────

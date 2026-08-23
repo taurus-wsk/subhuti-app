@@ -9,7 +9,73 @@ use subhuti_core::runtime::llm::{
 use tracing::debug;
 
 fn map_reqwest_error(e: reqwest::Error) -> subhuti_core::Error {
-    subhuti_core::Error::Any(anyhow::anyhow!("HTTP error: {}", e))
+    // 归类网络层错误，方便前端/日志快速定位根因
+    let mut kind = if e.is_timeout() {
+        "网络超时"
+    } else if e.is_connect() {
+        "连接失败"
+    } else if e.is_request() {
+        "请求未发送成功"
+    } else if e.is_body() {
+        "响应体读取失败"
+    } else if e.is_decode() {
+        "响应解析失败"
+    } else if e.is_builder() {
+        "请求构建错误"
+    } else if e.is_redirect() {
+        "重定向失败"
+    } else {
+        "HTTP/传输错误"
+    }
+    .to_string();
+
+    // 记录 HTTP 状态码：若错误携带 status（如 4xx 上下文超限/401/429），优先展示，
+    // 便于区分「服务端拒绝(4xx)」与「网络层失败(无 status)」
+    if let Some(status) = e.status() {
+        kind = format!("HTTP {} ", status.as_u16());
+    }
+
+    // 递归收集底层错误链（hyper/tonic 的连接、TLS、超时等具体原因）
+    let mut detail = String::new();
+    let mut source = std::error::Error::source(&e);
+    while let Some(s) = source {
+        let msg = s.to_string();
+        if !msg.is_empty() && !detail.contains(&msg) {
+            detail.push_str(&format!(" <- {}", msg));
+        }
+        source = s.source();
+    }
+
+    let full = format!("[{}] {}", kind, e);
+    if detail.is_empty() {
+        subhuti_core::Error::Any(anyhow::anyhow!("LLM HTTP {}: {}", kind, full))
+    } else {
+        subhuti_core::Error::Any(anyhow::anyhow!("LLM HTTP {}: {}{}", kind, full, detail))
+    }
+}
+
+/// 对成功发送但返回非 2xx 的响应，提取 status + 响应体片段构成清晰错误。
+/// 用于 OpenAI 兼容接口（智谱走 parse_zhipu_json 已有同样逻辑）。
+async fn ensure_http_success(
+    response: reqwest::Response,
+) -> subhuti_core::Result<reqwest::Response> {
+    if response.status().is_success() {
+        return Ok(response);
+    }
+    let status = response.status();
+    // 只截取响应体前 2000 字符，避免超长 body 淹没错误信息
+    let body_text = response.text().await.unwrap_or_default();
+    let snippet: String = body_text.chars().take(2000).collect();
+    let hint = if snippet.is_empty() {
+        "（无响应体）".to_string()
+    } else {
+        snippet
+    };
+    Err(subhuti_core::Error::Any(anyhow::anyhow!(
+        "LLM HTTP {} (status): {}",
+        status.as_u16(),
+        hint
+    )))
 }
 
 /// 智谱 API 返回的标准错误体
@@ -334,6 +400,7 @@ impl LLM for OpenAIClient {
             .send()
             .await
             .map_err(map_reqwest_error)?;
+        let response = ensure_http_success(response).await?;
 
         let result: OpenAICompletionResponse = response.json().await.map_err(map_reqwest_error)?;
         Ok(result.choices[0].message.content.clone())
@@ -375,6 +442,7 @@ impl LLM for OpenAIClient {
             .send()
             .await
             .map_err(map_reqwest_error)?;
+        let response = ensure_http_success(response).await?;
 
         let result: OpenAICompletionResponse = response.json().await.map_err(map_reqwest_error)?;
         let message = &result.choices[0].message;

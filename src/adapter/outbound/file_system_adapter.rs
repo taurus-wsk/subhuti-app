@@ -51,6 +51,12 @@ impl FileSystemPort for LocalFileSystemAdapter {
         let path = Self::resolve_path(path);
         let content = content.to_string();
         Box::pin(async move {
+            // 幂等写：文件已存在且内容完全相同则跳过，避免重复/覆盖产生多余产物
+            if let Ok(existing) = tokio::fs::read_to_string(&path).await {
+                if existing == content {
+                    return Ok(());
+                }
+            }
             // 自动创建父目录
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent)

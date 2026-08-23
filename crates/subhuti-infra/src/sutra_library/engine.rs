@@ -882,6 +882,60 @@ impl SutraLibraryPort for MemoryEnginePort {
         self.feedback_analyzer.record_execution(log);
         format!("✅ 已记录执行日志: query_hash={}", query_hash)
     }
+
+    // ─── 知识库 CRUD 实现 ──────────────────────────────────────
+
+    async fn list_knowledge_bases(&self) -> String {
+        let pg = match &self.pg {
+            Some(pg) => pg,
+            None => return "⚠️ 未配置 PostgreSQL，无法查询知识库".to_string(),
+        };
+
+        match pg.list_knowledge_bases().await {
+            Ok(bases) => match serde_json::to_string_pretty(&bases) {
+                Ok(json) => json,
+                Err(e) => format!("⚠️ 序列化知识库列表失败: {}", e),
+            },
+            Err(e) => format!("⚠️ 查询知识库列表失败: {}", e),
+        }
+    }
+
+    async fn list_chunks(&self, kb_id: &str) -> String {
+        let pg = match &self.pg {
+            Some(pg) => pg,
+            None => return "⚠️ 未配置 PostgreSQL，无法查询知识库切片".to_string(),
+        };
+
+        match pg.list_chunks(kb_id).await {
+            Ok(chunks) => match serde_json::to_string_pretty(&chunks) {
+                Ok(json) => json,
+                Err(e) => format!("⚠️ 序列化切片列表失败: {}", e),
+            },
+            Err(e) => format!("⚠️ 查询知识库切片失败: {}", e),
+        }
+    }
+
+    async fn get_knowledge_base_by_expert(&self, expert_id: &str) -> String {
+        let pg = match &self.pg {
+            Some(pg) => pg,
+            None => return "⚠️ 未配置 PostgreSQL，无法查询专家知识库".to_string(),
+        };
+
+        // 先获取所有知识库，然后过滤出 expert_id 匹配的
+        match pg.list_knowledge_bases().await {
+            Ok(bases) => {
+                let filtered: Vec<_> = bases
+                    .into_iter()
+                    .filter(|b| b.expert_id == expert_id || b.expert_id.is_empty())
+                    .collect();
+                match serde_json::to_string_pretty(&filtered) {
+                    Ok(json) => json,
+                    Err(e) => format!("⚠️ 序列化知识库列表失败: {}", e),
+                }
+            }
+            Err(e) => format!("⚠️ 查询知识库失败: {}", e),
+        }
+    }
 }
 
 // ─── 工具函数 ───────────────────────────────────────────────
