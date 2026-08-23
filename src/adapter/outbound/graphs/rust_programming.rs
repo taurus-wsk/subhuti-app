@@ -434,7 +434,13 @@ fn make_write_files_node(
             let project_name = state
                 .get("project_name")
                 .unwrap_or_else(|| "rust-project".to_string());
-            let project_path = format!("/Users/hezenghui/RustroverProjects/{}", project_name);
+            // 优先使用 workspace_folder（用户设置的项目工作目录），否则使用硬编码路径
+            let workspace_folder = state.get("workspace_folder").unwrap_or_default();
+            let project_path = if workspace_folder.is_empty() {
+                format!("/Users/hezenghui/RustroverProjects/{}", project_name)
+            } else {
+                format!("{}/{}", workspace_folder, project_name)
+            };
 
             match write_project_files_with_events(
                 &project_path,

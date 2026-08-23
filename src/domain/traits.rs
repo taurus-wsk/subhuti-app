@@ -11,7 +11,10 @@
 
 use async_trait::async_trait;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
+use crate::domain::ports::CommandPort;
+use crate::domain::ports::FileSystemPort;
 use crate::domain::ports::ToolchainPort;
 
 /// 领域技能信息（纯领域 DTO）
@@ -33,6 +36,12 @@ pub struct DomainContext {
     pub input: String,
     pub session_id: Option<String>,
     pub user_id: Option<String>,
+    /// 项目工作目录路径（前端聊天设置传入）
+    pub workspace_folder: Option<String>,
+    /// 自定义系统提示词（前端聊天设置传入，覆盖专家默认 system prompt）
+    pub system_prompt: Option<String>,
+    /// 历史消息（从框架 Session 传递，用于多轮对话上下文）
+    pub history: Vec<DomainMessage>,
 }
 
 /// 领域执行上下文（纯领域类型）
@@ -52,6 +61,14 @@ pub struct DomainExecutionContext {
     pub skill_params: Option<String>,
     /// Rust 工具链（可选，RustExpert 等需要编译验证的专家使用）
     pub toolchain: Option<Arc<dyn ToolchainPort>>,
+    /// 藏经阁记忆引擎（可选，专家可访问结构化记忆系统）
+    pub sutra_library: Option<Arc<dyn subhuti_core::SutraLibraryPort>>,
+    /// 文件系统操作（可选，用于读写项目文件、搜索文件等）
+    pub file_system: Option<Arc<dyn FileSystemPort>>,
+    /// 命令行执行（可选，用于运行 cargo build、git 等命令）
+    pub command: Option<Arc<dyn CommandPort>>,
+    /// 进度报告通道（可选，用于实时推送执行进度到 SSE 流）
+    pub progress_tx: Option<mpsc::Sender<String>>,
 }
 
 impl std::fmt::Debug for DomainExecutionContext {
@@ -60,6 +77,10 @@ impl std::fmt::Debug for DomainExecutionContext {
             .field("ctx", &self.ctx)
             .field("skill_id", &self.skill_id)
             .field("skill_params", &self.skill_params)
+            .field("has_sutra_library", &self.sutra_library.is_some())
+            .field("has_file_system", &self.file_system.is_some())
+            .field("has_command", &self.command.is_some())
+            .field("has_progress_tx", &self.progress_tx.is_some())
             .finish()
     }
 }
@@ -147,7 +168,7 @@ pub struct DomainMessage {
 }
 
 /// 领域消息角色
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DomainRole {
     System,
     User,

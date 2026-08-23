@@ -53,14 +53,20 @@ pub trait OrchestrationEnginePort: Send + Sync + 'static {
     /// - `trace_id`: 追踪 ID（写入框架 ctx.metadata，事件 emit 时带 trace 上下文）
     /// - `session_id`: 会话 ID（同上，写入 ctx.metadata 供事件关联）
     /// - `graph`: 指定图名称（为空时自动匹配）
+    /// - `expert_id`: 指定专家 ID（优先级最高，直接路由到该专家）
+    /// - `workspace_folder`: 项目工作目录路径（透传给专家）
+    /// - `system_prompt`: 自定义系统提示词（覆盖专家默认 system prompt）
     fn orchestrate(
         &self,
         message: &str,
         user_id: &str,
         chain: &str,
         graph: &str,
+        expert_id: &str,
         trace_id: &str,
         session_id: &str,
+        workspace_folder: &str,
+        system_prompt: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = OrchestrateResponse> + Send>>;
 
     /// 分析任务
@@ -124,4 +130,80 @@ pub trait SkillExecutionPort: Send + Sync + 'static {
         trace_id: &str,
         session_id: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SkillResponse> + Send>>;
+}
+
+/// 文件系统操作端口（出站端口）
+///
+/// 供领域专家在项目工作目录中读写文件、搜索文件。
+/// 由出站适配层实现，使用本地文件系统或远程存储。
+pub trait FileSystemPort: Send + Sync + 'static {
+    /// 读取文件内容
+    fn read_file(
+        &self,
+        path: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>;
+
+    /// 写入文件内容（自动创建父目录）
+    fn write_file(
+        &self,
+        path: &str,
+        content: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
+
+    /// 列出目录内容（仅文件名，不递归）
+    fn list_dir(
+        &self,
+        path: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<String>, String>> + Send>>;
+
+    /// 搜索文件（glob 模式匹配，如 "**/*.rs"）
+    fn search_files(
+        &self,
+        pattern: &str,
+        root: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<String>, String>> + Send>>;
+
+    /// 检查路径是否存在
+    fn exists(
+        &self,
+        path: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>;
+
+    /// 创建目录（递归）
+    fn create_dir(
+        &self,
+        path: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
+
+    /// 删除文件
+    fn delete_file(
+        &self,
+        path: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
+}
+
+/// 命令执行结果
+#[derive(Debug, Clone)]
+pub struct CommandOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+}
+
+/// 命令行执行端口（出站端口）
+///
+/// 供领域专家在工作目录中执行 shell 命令（如 cargo build、git 等）。
+/// 由出站适配层实现，使用 tokio::process::Command。
+pub trait CommandPort: Send + Sync + 'static {
+    /// 执行命令并返回输出
+    ///
+    /// - `command`: 命令名称（如 "cargo", "git"）
+    /// - `args`: 命令参数列表
+    /// - `cwd`: 工作目录
+    fn run_command(
+        &self,
+        command: &str,
+        args: &[String],
+        cwd: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<CommandOutput, String>> + Send>>;
 }

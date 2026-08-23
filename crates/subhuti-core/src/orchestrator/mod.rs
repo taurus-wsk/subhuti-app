@@ -54,7 +54,9 @@ use self::strategies::{SemanticCandidate, SemanticRouter};
 use crate::event::{AgentEventData, EventBus};
 use crate::graph::{Graph, GraphOutput, GraphState};
 use crate::memory::Memory;
-use crate::runtime::{llm::LLM, session::Session};
+use crate::runtime::llm::{Role, LLM};
+use crate::runtime::session::Session;
+use crate::sutra_library::SutraLibraryPort;
 use crate::vertical::{AssetLibrary, ProjectMemory, ToolRegistry, WorkflowStore};
 pub use rule_engine::{
     DefaultDispatchRule, DefaultExecutionRule, DefaultTaskAnalysisRule, DispatchPlan, DispatchRule,
@@ -94,6 +96,16 @@ impl AgentContext {
             input: input.to_string(),
             ctx_id: ctx_id.to_string(),
             session: Session::new(ctx_id),
+            metadata: HashMap::new(),
+        }
+    }
+
+    /// 使用已有的 Session 创建 AgentContext（用于会话历史持久化）
+    pub fn with_session(input: &str, ctx_id: &str, session: Session) -> Self {
+        Self {
+            input: input.to_string(),
+            ctx_id: ctx_id.to_string(),
+            session,
             metadata: HashMap::new(),
         }
     }
@@ -155,6 +167,7 @@ pub struct ExpertState {
     project_memory: Option<Arc<dyn ProjectMemory>>,
     tool_registry: Option<Arc<dyn ToolRegistry>>,
     workflow_store: Option<Arc<dyn WorkflowStore>>,
+    sutra_library: Option<Arc<dyn SutraLibraryPort>>,
 }
 
 impl ExpertState {
@@ -217,6 +230,14 @@ impl ExpertState {
     pub fn workflow_store_cloned(&self) -> Option<Arc<dyn WorkflowStore>> {
         self.workflow_store.clone()
     }
+
+    pub fn sutra_library(&self) -> Option<&Arc<dyn SutraLibraryPort>> {
+        self.sutra_library.as_ref()
+    }
+
+    pub fn sutra_library_cloned(&self) -> Option<Arc<dyn SutraLibraryPort>> {
+        self.sutra_library.clone()
+    }
 }
 
 pub struct ExpertStateBuilder {
@@ -227,6 +248,7 @@ pub struct ExpertStateBuilder {
     project_memory: Option<Arc<dyn ProjectMemory>>,
     tool_registry: Option<Arc<dyn ToolRegistry>>,
     workflow_store: Option<Arc<dyn WorkflowStore>>,
+    sutra_library: Option<Arc<dyn SutraLibraryPort>>,
 }
 
 impl ExpertStateBuilder {
@@ -239,6 +261,7 @@ impl ExpertStateBuilder {
             project_memory: None,
             tool_registry: None,
             workflow_store: None,
+            sutra_library: None,
         }
     }
 
@@ -277,6 +300,11 @@ impl ExpertStateBuilder {
         self
     }
 
+    pub fn sutra_library(mut self, lib: Arc<dyn SutraLibraryPort>) -> Self {
+        self.sutra_library = Some(lib);
+        self
+    }
+
     pub fn build(self) -> ExpertState {
         ExpertState {
             llm: self.llm,
@@ -286,6 +314,7 @@ impl ExpertStateBuilder {
             project_memory: self.project_memory,
             tool_registry: self.tool_registry,
             workflow_store: self.workflow_store,
+            sutra_library: self.sutra_library,
         }
     }
 }
@@ -424,6 +453,9 @@ impl Orchestrator {
     ) -> OrchestrationResult {
         let input = &ctx.input.clone();
 
+        // 将用户消息添加到会话历史
+        ctx.session.add_message(Role::User, input);
+
         // 只保留图匹配 + 事件发布
         // Actor 竞标制：图节点发布任务要求，Actor 池自评竞标
         self.emit_event(
@@ -435,14 +467,75 @@ impl Orchestrator {
         .await;
 
         // 优先使用指定图（从 ctx.metadata 中获取）
-        if let Some(graph_name) = ctx.metadata.get("graph_name") {
+        let result = if let Some(graph_name) = ctx.metadata.get("graph_name") {
             if let Some(graph) = self.graph_registry.get(graph_name) {
                 tracing::debug!("指定图: {}", graph_name);
-                return self.dispatch_via_graph(ctx, state, &graph).await;
+                self.dispatch_via_graph(ctx, state, &graph).await
+            } else {
+                tracing::warn!("指定的图不存在: {}，尝试按专家 ID/标签匹配", graph_name);
+
+                // 图名不存在 → 尝试按专家 ID/标签匹配（graph_name 可以是专家 ID 或标签）
+                // 1. 尝试按专家 ID 精确匹配
+                if let Some(actor) = self.actor_registry.get_by_id(graph_name) {
+                    tracing::debug!("按专家 ID 匹配: {} → {}", graph_name, actor.name());
+                    self.dispatch_via_actor(ctx, state, actor).await
+                }
+                // 2. 尝试按专家标签匹配（标签包含 graph_name 的专家）
+                else {
+                    let actors = self.actor_registry.list();
+                    let mut matched_actor = None;
+                    for actor in actors.iter() {
+                        if actor
+                            .tags()
+                            .iter()
+                            .any(|t| t.eq_ignore_ascii_case(graph_name))
+                        {
+                            tracing::debug!("按专家标签匹配: {} → {}", graph_name, actor.name());
+                            matched_actor = Some(actor.clone());
+                            break;
+                        }
+                    }
+                    // 3. 如果有 expert_id metadata，直接按 expert_id 匹配
+                    if matched_actor.is_none() {
+                        if let Some(expert_id) = ctx.metadata.get("expert_id") {
+                            if let Some(actor) = self.actor_registry.get_by_id(expert_id) {
+                                tracing::debug!(
+                                    "按 expert_id 匹配: {} → {}",
+                                    expert_id,
+                                    actor.name()
+                                );
+                                matched_actor = Some(actor);
+                            }
+                        }
+                    }
+                    if let Some(actor) = matched_actor {
+                        self.dispatch_via_actor(ctx, state, actor).await
+                    } else {
+                        // 都找不到则继续走图匹配流程
+                        self.dispatch_without_graph(ctx, state).await
+                    }
+                }
             }
-            tracing::warn!("指定的图不存在: {}", graph_name);
-            // 不存在则继续走匹配流程
+        } else {
+            // 未指定图名，走关键词匹配
+            self.dispatch_without_graph(ctx, state).await
+        };
+
+        // 将助手回复添加到会话历史
+        if result.success {
+            ctx.session.add_message(Role::Assistant, &result.output);
         }
+
+        result
+    }
+
+    /// 无指定图时的 dispatch 流程：先尝试语义路由，再尝试关键词匹配
+    async fn dispatch_without_graph(
+        &self,
+        ctx: &mut AgentContext,
+        state: &ExpertState,
+    ) -> OrchestrationResult {
+        let input = &ctx.input.clone();
 
         // 图匹配：优先语义路由，其次关键词匹配
         let matched_graph = self.try_semantic_graph_routing(input).await;
@@ -457,16 +550,40 @@ impl Orchestrator {
                 self.dispatch_via_graph(ctx, state, &graph).await
             }
             None => {
-                // 无匹配时尝试使用默认图
-                if let Some(default_graph) = self.graph_registry.get_default() {
-                    tracing::debug!("使用默认图: {}", default_graph.name());
-                    self.dispatch_via_graph(ctx, state, &default_graph).await
+                // 无匹配图时，尝试按标签匹配专家（Actor）
+                tracing::debug!("无匹配图，尝试按专家标签匹配: input={}", input);
+                let actors = self.actor_registry.list();
+
+                // 尝试找到第一个能处理该输入的专家
+                // 优先匹配标签包含 "code" 或 "rust" 的专家
+                let mut matched_actor = None;
+                for actor in actors.iter() {
+                    let tags = actor.tags();
+                    if tags.iter().any(|t| {
+                        let tl = t.to_lowercase();
+                        tl.contains("code") || tl.contains("rust") || tl.contains("programming")
+                    }) {
+                        tracing::debug!("按标签匹配到专家: {}", actor.name());
+                        matched_actor = Some(actor.clone());
+                        break;
+                    }
+                }
+
+                // 如果没有匹配到特定专家，尝试使用第一个可用专家
+                if matched_actor.is_none() {
+                    matched_actor = actors.first().cloned();
+                }
+
+                if let Some(actor) = matched_actor {
+                    tracing::debug!("使用专家: {}", actor.name());
+                    self.dispatch_via_actor(ctx, state, actor).await
                 } else {
-                    tracing::warn!("未匹配到任何图，且无默认图");
+                    // 没有可用专家
+                    tracing::warn!("未匹配到任何图或专家");
                     OrchestrationResult {
                         strategy: "fallback".to_string(),
                         expert_chain: Vec::new(),
-                        output: "未匹配到合适的图，请检查图注册或输入内容".to_string(),
+                        output: "未匹配到合适的专家，请检查专家注册或输入内容".to_string(),
                         tokens: TokenUsage::default(),
                         expert_outputs: Vec::new(),
                         success: false,
@@ -498,6 +615,9 @@ impl Orchestrator {
         }
         if let Some(sid) = ctx.metadata.get("session_id") {
             graph_state.set("session_id", sid.clone());
+        }
+        if let Some(ws) = ctx.metadata.get("workspace_folder") {
+            graph_state.set("workspace_folder", ws.clone());
         }
 
         match self
@@ -535,6 +655,85 @@ impl Orchestrator {
                 OrchestrationResult {
                     strategy: format!("graph:{}", graph.name()),
                     expert_chain: Vec::new(),
+                    output: e.to_string(),
+                    tokens: TokenUsage::default(),
+                    expert_outputs: Vec::new(),
+                    success: false,
+                }
+            }
+        }
+    }
+
+    /// 直接通过专家（Actor）执行
+    ///
+    /// 当 graph_name 不匹配任何图时，按专家 ID/标签找到 Actor 并直接执行。
+    async fn dispatch_via_actor(
+        &self,
+        ctx: &mut AgentContext,
+        state: &ExpertState,
+        actor: Arc<dyn Actor>,
+    ) -> OrchestrationResult {
+        let actor_name = actor.name().to_string();
+        let actor_id = actor.id().to_string();
+
+        self.emit_event(
+            ctx,
+            AgentEventData::ChainSelected {
+                chain_name: actor_name.clone(),
+                strategy: "expert".to_string(),
+            },
+        )
+        .await;
+
+        // 发布专家开始执行事件
+        self.emit_event(
+            ctx,
+            AgentEventData::AgentStarted {
+                agent_id: actor_id.clone(),
+                input: ctx.input.clone(),
+            },
+        )
+        .await;
+
+        match actor.perform(ctx, state).await {
+            Ok(output) => {
+                self.emit_event(
+                    ctx,
+                    AgentEventData::AgentCompleted {
+                        agent_id: actor_id.clone(),
+                        output: output.clone(),
+                        duration_ms: 0,
+                    },
+                )
+                .await;
+                tracing::debug!(
+                    "dispatch_via_actor 完成: actor={}, output_len={}",
+                    actor_name,
+                    output.len()
+                );
+                OrchestrationResult {
+                    strategy: format!("expert:{}", actor_id),
+                    expert_chain: vec![actor_name],
+                    output,
+                    tokens: TokenUsage::default(),
+                    expert_outputs: Vec::new(),
+                    success: true,
+                }
+            }
+            Err(e) => {
+                self.emit_event(
+                    ctx,
+                    AgentEventData::AgentFailed {
+                        agent_id: actor_id.clone(),
+                        error: e.to_string(),
+                        duration_ms: 0,
+                    },
+                )
+                .await;
+                tracing::warn!("dispatch_via_actor 失败: actor={}, error={}", actor_name, e);
+                OrchestrationResult {
+                    strategy: format!("expert:{}", actor_id),
+                    expert_chain: vec![actor_name],
                     output: e.to_string(),
                     tokens: TokenUsage::default(),
                     expert_outputs: Vec::new(),
@@ -699,8 +898,60 @@ impl GraphRegistry {
         if graphs.is_empty() {
             return None;
         }
+
+        // 编程相关关键词（命中这些关键词才路由到编程图）
+        let code_keywords: &[&str] = &[
+            "代码",
+            "编程",
+            "开发",
+            "写代码",
+            "code",
+            "programming",
+            "rust",
+            "项目",
+            "创建",
+            "编译",
+            "运行",
+            "构建",
+            "测试",
+            "实现",
+            "函数",
+            "bug",
+            "错误",
+            "安装",
+            "配置",
+            "依赖",
+            "库",
+            "框架",
+            "接口",
+            "api",
+            "模块",
+            "struct",
+            "fn",
+            "cargo",
+            "src",
+            "main.rs",
+            "lib.rs",
+            "package",
+            "toml",
+            "项目",
+            "工程",
+            "应用",
+            "程序",
+            "脚本",
+            "命令行",
+            "cli",
+        ];
+        let input_lower = input.to_lowercase();
+        let is_code_query = code_keywords.iter().any(|kw| input_lower.contains(kw));
+
+        // 只有一个图时：如果是编程相关查询则返回，否则返回 None 走普通对话
         if graphs.len() == 1 {
-            return graphs.values().next().cloned();
+            if is_code_query {
+                return graphs.values().next().cloned();
+            }
+            tracing::debug!("单图模式但输入非编程相关，跳过图匹配: {}", input);
+            return None;
         }
 
         // 排除默认图（它只作为兜底，不参与关键词匹配）
@@ -714,23 +965,12 @@ impl GraphRegistry {
             return None;
         }
 
-        let input_lower = input.to_lowercase();
         for graph in &non_default {
             if input_lower.contains(&graph.name().to_lowercase()) {
                 return Some((*graph).clone());
             }
         }
 
-        let code_keywords = [
-            "代码",
-            "编程",
-            "开发",
-            "写代码",
-            "code",
-            "programming",
-            "rust",
-            "项目",
-        ];
         let review_keywords = ["评审", "审查", "审核", "review", "audit"];
         let edit_keywords = ["修改", "编辑", "添加", "增加", "重构", "改造", "改", "edit"];
 
@@ -741,7 +981,7 @@ impl GraphRegistry {
                 || name.contains("programming")
                 || name.contains("rust")
             {
-                for kw in &code_keywords {
+                for kw in code_keywords {
                     if input_lower.contains(kw) {
                         return Some((*graph).clone());
                     }
@@ -763,8 +1003,8 @@ impl GraphRegistry {
             }
         }
 
-        // 非默认图中取第一个
-        non_default.first().map(|g| (*g).clone())
+        // 避免无关键词匹配时错误兜底到第一个图
+        None
     }
 
     pub fn list_candidates(&self) -> Vec<SemanticCandidate> {

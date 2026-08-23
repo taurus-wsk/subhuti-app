@@ -145,6 +145,12 @@ pub struct OrchestrateRequest {
     pub chain: Option<String>,
     /// 指定要使用的图名称（为空时自动匹配）
     pub graph: Option<String>,
+    /// 指定要使用的专家 ID（优先级高于 graph，直接路由到该专家）
+    pub expert_id: Option<String>,
+    /// 项目工作目录路径（前端聊天设置传入，透传给专家）
+    pub workspace_folder: Option<String>,
+    /// 自定义系统提示词（前端聊天设置传入，覆盖专家默认 system prompt）
+    pub system_prompt: Option<String>,
 }
 
 // ─── 工具函数 ──────────────────────────────────────────────────
@@ -158,7 +164,7 @@ fn uuid_v4() -> String {
 /// 把协议中立的 StreamEvent 流转为 SSE Event 流
 ///
 /// 职责：分块大小、sleep 节奏、SSE 事件 JSON 格式 —— 全部在适配器层。
-/// 应用层只发语义事件（Start/Chunk/Done/Error），不关心传输细节。
+/// 应用层只发语义事件（Start/Thought/Plan/Step/Chunk/Done/Error），不关心传输细节。
 fn stream_to_sse(
     receiver: mpsc::Receiver<StreamEvent>,
 ) -> impl futures::Stream<Item = Result<Event, axum::BoxError>> {
@@ -169,11 +175,36 @@ fn stream_to_sse(
                 StreamEvent::Start => {
                     yield Ok(Event::default().data(r#"{"type":"start"}"#));
                 }
+                StreamEvent::Thought { message } => {
+                    let json = serde_json::json!({
+                        "type": "thought",
+                        "message": message,
+                    }).to_string();
+                    yield Ok(Event::default().data(json));
+                }
+                StreamEvent::Plan { message } => {
+                    let json = serde_json::json!({
+                        "type": "plan",
+                        "message": message,
+                    }).to_string();
+                    yield Ok(Event::default().data(json));
+                }
+                StreamEvent::Step { message, expert } => {
+                    let json = serde_json::json!({
+                        "type": "step",
+                        "message": message,
+                        "expert": expert,
+                    }).to_string();
+                    yield Ok(Event::default().data(json));
+                }
                 StreamEvent::Chunk { content } => {
                     // 分块策略 + 节奏（适配器职责，可按需调整）
+                    // 按字符切分而非字节，避免 UTF-8 多字节字符被截断导致 panic
                     let chunk_size = 64;
-                    for i in (0..content.len()).step_by(chunk_size) {
-                        let chunk = &content[i..std::cmp::min(i + chunk_size, content.len())];
+                    let chars: Vec<char> = content.chars().collect();
+                    for i in (0..chars.len()).step_by(chunk_size) {
+                        let end = std::cmp::min(i + chunk_size, chars.len());
+                        let chunk: String = chars[i..end].iter().collect();
                         let json = serde_json::json!({
                             "type": "data",
                             "content": chunk,
@@ -233,10 +264,13 @@ async fn chat_stream_handler(
         session_id: Some(session_id.clone()),
         chain: req.chain.clone(),
         graph: req.graph.clone(),
+        expert_id: req.expert_id.clone(),
         trace_id: None,
+        workspace_folder: req.workspace_folder.clone(),
+        system_prompt: req.system_prompt.clone(),
     });
 
-    Sse::new(stream_to_sse(receiver)).keep_alive(KeepAlive::default())
+    Sse::new(stream_to_sse(receiver))
 }
 
 inventory::submit! {
@@ -283,7 +317,10 @@ async fn orchestrate_handler(
             session_id: Some(session_id.clone()),
             chain: req.chain.clone(),
             graph: req.graph.clone(),
+            expert_id: req.expert_id.clone(),
             trace_id: None,
+            workspace_folder: req.workspace_folder.clone(),
+            system_prompt: req.system_prompt.clone(),
         })
         .await;
 
@@ -568,15 +605,18 @@ pub struct HttpAdapterFactory {
     skill_port: Arc<dyn SkillPort>,
     trace_observer: Arc<dyn TraceObserverPort>,
     session_observer: Arc<dyn SessionObserverPort>,
+    pg_storage: Option<Arc<subhuti_infra::sutra_library::storage::PgStorage>>,
 }
 
 impl HttpAdapterFactory {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         chat_port: Arc<dyn ChatPort>,
         expert_query_port: Arc<dyn ExpertQueryPort>,
         skill_port: Arc<dyn SkillPort>,
         trace_observer: Arc<dyn TraceObserverPort>,
         session_observer: Arc<dyn SessionObserverPort>,
+        pg_storage: Option<Arc<subhuti_infra::sutra_library::storage::PgStorage>>,
     ) -> Self {
         Self {
             chat_port,
@@ -584,6 +624,7 @@ impl HttpAdapterFactory {
             skill_port,
             trace_observer,
             session_observer,
+            pg_storage,
         }
     }
 
@@ -595,6 +636,7 @@ impl HttpAdapterFactory {
             skill_port: self.skill_port.clone(),
             trace_observer: self.trace_observer.clone(),
             session_observer: self.session_observer.clone(),
+            pg_storage: self.pg_storage.clone(),
         }
     }
 

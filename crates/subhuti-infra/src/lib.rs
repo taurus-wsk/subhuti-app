@@ -12,6 +12,7 @@ pub mod config;
 pub mod debug;
 pub mod llm;
 pub mod memory;
+pub mod sutra_library;
 pub mod tool;
 pub mod vertical;
 

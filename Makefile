@@ -4,7 +4,7 @@
 # 用法: make [target]
 # ============================================================
 
-.PHONY: help build test test-watch serve serve-debug serve-mock serve-status serve-logs serve-stop serve-restart docker docker-build docker-stop fmt clippy check clean install release-test trace orch-experts orch-analyze orch-match orch-run orch-all cache-clean cache-stats routes _py_init
+.PHONY: help build test test-watch serve serve-debug serve-debug-log serve-mock serve-status serve-logs serve-stop serve-restart docker docker-build docker-stop fmt clippy check clean install release-test trace orch-experts orch-analyze orch-match orch-run orch-all cache-clean cache-stats routes _py_init
 
 # 默认目标
 .DEFAULT_GOAL := help
@@ -27,6 +27,8 @@ help:
 	@echo "  test-watch     监控文件变化自动测试"
 	@echo "  serve          启动 HTTP 服务器 (release)"
 	@echo "  serve-debug    启动 HTTP 服务器 (debug模式，默认使用 config/subhuti.md mock数据)"
+	@echo "                 可选: make serve-debug LOG=1  启动并持续查看日志"
+	@echo "  serve-debug-log 快捷启动 debug + 持续查看日志 (Ctrl+C 退出，服务继续运行)"
 	@echo "  serve-status   查看服务状态"
 	@echo "  serve-logs     查看服务日志"
 	@echo "  serve-stop     停止服务"
@@ -81,6 +83,8 @@ help:
 	@echo ""
 	@echo "$(GREEN)🚀 服务启动:$(NC)"
 	@echo "  serve-debug                                本地调试 (debug build)"
+	@echo "  serve-debug-log                            启动并持续查看日志 (Ctrl+C 退出，服务继续)"
+	@echo "  serve-debug LOG=1                          同上，环境变量方式"
 	@echo "  serve                                      生产模式 (release build)"
 	@echo "  serve-mock                                 Mock 模式 (不打真实 API, 调 HTTP/编排逻辑用)"
 	@echo ""
@@ -98,6 +102,7 @@ help:
 	@echo ""
 	@echo "$(CYAN)📝 复制即用的调试示例:$(NC)"
 	@echo "  make serve-debug                          # 启动调试服务"
+	@echo "  make serve-debug-log                      # 启动 + 实时查看日志"
 	@echo ""
 	@echo "$(CYAN)所有命令可选覆盖:$(NC)"
 	@echo "  HTTP_ADDR=http://127.0.0.1:8615            服务地址（默认 localhost:8615）"
@@ -121,14 +126,26 @@ test-watch:
 	cargo watch -x test
 
 BUILD_MODE ?= release
+LOG ?= 0
 
 serve:
 	@echo "$(GREEN)🚀 启动 HTTP 服务器 ($(BUILD_MODE))...$(NC)"
 	./scripts/build/dev.sh start $(BUILD_MODE)
 
+# 默认后台启动，日志异步写入 logs/subhuti.log
 serve-debug:
 	@echo "$(GREEN)🚀 启动 HTTP 服务器 (debug)...$(NC)"
-	BUILD_MODE=debug ./scripts/build/dev.sh start debug
+	@if [ "$(LOG)" = "1" ]; then \
+		echo "$(CYAN)📋 日志实时查看模式 (LOG=1)$(NC)"; \
+		BUILD_MODE=debug ./scripts/build/dev.sh start-log debug; \
+	else \
+		BUILD_MODE=debug ./scripts/build/dev.sh start debug; \
+	fi
+
+# 快捷：启动 debug 并持续查看日志（Ctrl+C 退出，服务继续运行）
+serve-debug-log:
+	@echo "$(GREEN)🚀 启动 HTTP 服务器 (debug, 日志模式)...$(NC)"
+	BUILD_MODE=debug ./scripts/build/dev.sh start-log debug
 
 # 🧪 Mock 模式启动（用 MockLLM 替代真实 LLM，不打网络，适合调试 HTTP/编排逻辑）
 serve-mock:

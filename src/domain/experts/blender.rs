@@ -97,15 +97,69 @@ impl DomainExpert for BlenderExpert {
     }
 
     async fn run(&self, exec_ctx: DomainExecutionContext) -> DomainResult<String> {
-        // 示例：从数据仓库加载专家配置或历史记录
+        // ── 藏经阁记忆引擎使用示例 ──
+        // 如果配置了藏经阁引擎，专家可以自动存取结构化记忆
+        let mut retrieved_history: Option<String> = None;
+        if let Some(ref sutra) = exec_ctx.sutra_library {
+            // 确保 Blender 知识集合存在
+            let collections = sutra.list_collections();
+            if !collections.contains("blender_knowledge") && !collections.contains("⚠️") {
+                sutra.create_collection(
+                    "blender_knowledge",
+                    "blender",
+                    "Blender 3D 建模/动画/材质/渲染知识",
+                );
+            }
+
+            // 存储当前会话输入到临时记忆
+            let session_id = exec_ctx.ctx.session_id.as_deref().unwrap_or("default");
+            sutra.add_session(session_id, &exec_ctx.ctx.input, "blender");
+
+            // 使用新版召回流水线搜索相关记忆（五阶段：BaseSearch → Space → Graph → 合并 → 排序）
+            let history = sutra.library_retrieve(&exec_ctx.ctx.input, 3).await;
+            if !history.contains("未找到") && !history.contains("⚠️") {
+                record_fn_log(
+                    None,
+                    "",
+                    LogLevel::Debug,
+                    format!(
+                        "Blender 新版召回检索到相关记忆:\n{}",
+                        &history[..history.len().min(200)]
+                    ),
+                    None,
+                );
+                retrieved_history = Some(history);
+            }
+        }
+
+        // 构建系统提示词，将检索到的历史知识注入上下文
+        let mut system_prompt = String::from(
+            "你是一位 Blender 3D 动画制作专家。\
+            你精通建模、材质、灯光、动画、渲染、粒子系统、几何节点等各个方面。\
+            你会根据用户的问题，提供详细的操作步骤和技巧。\
+            回答时请使用中文，并在需要时提供 Python 脚本代码。",
+        );
+
+        // 如果检索到相关历史记忆，注入到 system prompt 中
+        if let Some(history) = &retrieved_history {
+            // 清理 Markdown 格式，保留纯文本信息
+            let clean = history
+                .replace("🔍", "")
+                .replace('*', "")
+                .trim()
+                .to_string();
+            system_prompt.push_str(&format!(
+                "\n\n以下是藏经阁中与用户问题相关的历史知识，请参考这些信息来回答：\n{}",
+                clean,
+            ));
+        }
+
+        // 从数据仓库加载专家配置并覆盖提示词
         let config_key = format!(
             "blender_expert_config_{}",
             exec_ctx.ctx.session_id.as_deref().unwrap_or("default")
         );
-        let config = exec_ctx.repository.load(&config_key).await?;
-
-        // 如果有配置，使用配置；否则使用默认提示词
-        let system_prompt = if let Some(cfg) = config {
+        if let Some(cfg) = exec_ctx.repository.load(&config_key).await? {
             record_fn_log(
                 None,
                 "",
@@ -113,16 +167,11 @@ impl DomainExpert for BlenderExpert {
                 format!("加载到 Blender 专家配置: {}", cfg),
                 None,
             );
-            format!("你是一位 Blender 3D 动画制作专家。{}", cfg)
-        } else {
-            "你是一位 Blender 3D 动画制作专家。\
-            你精通建模、材质、灯光、动画、渲染、粒子系统、几何节点等各个方面。\
-            你会根据用户的问题，提供详细的操作步骤和技巧。\
-            回答时请使用中文，并在需要时提供 Python 脚本代码。"
-                .to_string()
-        };
+            system_prompt = format!("你是一位 Blender 3D 动画制作专家。{}", cfg);
+        }
 
         // 构建消息列表
+        let user_input = exec_ctx.ctx.input.clone();
         let messages = vec![
             DomainMessage {
                 role: DomainRole::System,
@@ -136,6 +185,18 @@ impl DomainExpert for BlenderExpert {
 
         // 调用 LLM
         let response = exec_ctx.llm.chat(messages).await?;
+
+        // 记录执行日志到反馈分析器（反馈闭环入口）
+        if let Some(ref sutra) = exec_ctx.sutra_library {
+            let session_id = exec_ctx.ctx.session_id.as_deref().unwrap_or("default");
+            sutra.record_execution(
+                &user_input,
+                true, // task_success: LLM 返回即视为成功
+                "default",
+                "blender",
+                Some(session_id.to_string()),
+            );
+        }
 
         // 示例：保存专家执行结果到数据仓库
         let result_key = format!(
@@ -218,6 +279,7 @@ impl DomainExpert for BlenderExpert {
         };
 
         // 构建消息列表（包含技能参数）
+        let user_input = exec_ctx.ctx.input.clone();
         let messages = vec![
             DomainMessage {
                 role: DomainRole::System,
@@ -231,6 +293,18 @@ impl DomainExpert for BlenderExpert {
 
         // 调用 LLM
         let response = exec_ctx.llm.chat(messages).await?;
+
+        // 记录执行日志到反馈分析器
+        if let Some(ref sutra) = exec_ctx.sutra_library {
+            let session_id = exec_ctx.ctx.session_id.as_deref().unwrap_or("default");
+            sutra.record_execution(
+                &user_input,
+                true,
+                "default",
+                "blender",
+                Some(session_id.to_string()),
+            );
+        }
 
         // 保存执行结果
         let result_key = format!(

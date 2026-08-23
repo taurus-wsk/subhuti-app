@@ -29,6 +29,15 @@ use crate::domain::dto::{
 pub enum StreamEvent {
     /// 流开始
     Start,
+    /// 思考步骤（路由专家、分析任务等）
+    Thought { message: String },
+    /// 计划步骤（选择图、制定执行计划）
+    Plan { message: String },
+    /// 执行步骤（专家执行、LLM 调用等）
+    Step {
+        message: String,
+        expert: Option<String>,
+    },
     /// 数据块（应用层发完整内容，适配器决定分块策略）
     Chunk { content: String },
     /// 流结束（output 为完整输出，meta 为结果元数据，适配器透传）

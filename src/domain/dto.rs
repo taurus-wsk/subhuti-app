@@ -18,8 +18,14 @@ pub struct OrchestrateRequest {
     pub chain: Option<String>,
     /// 指定要使用的图名称（为空时自动匹配）
     pub graph: Option<String>,
+    /// 指定要使用的专家 ID（优先级高于 graph，直接路由到该专家）
+    pub expert_id: Option<String>,
     /// 追踪 ID（TraceAppService 装饰器生成并注入，一路透传到框架 ctx.metadata）
     pub trace_id: Option<String>,
+    /// 项目工作目录路径（前端聊天设置传入，透传给专家）
+    pub workspace_folder: Option<String>,
+    /// 自定义系统提示词（前端聊天设置传入，覆盖专家默认 system prompt）
+    pub system_prompt: Option<String>,
 }
 
 /// 调度响应（领域 DTO）

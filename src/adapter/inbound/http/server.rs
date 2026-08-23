@@ -86,6 +86,7 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
         composition.skill_port,
         composition.trace_observer.clone(),
         composition.session_observer.clone(),
+        composition.pg_storage.clone(),
     );
 
     // 创建 AppState（依赖注入容器）

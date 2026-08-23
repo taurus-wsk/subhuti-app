@@ -11,6 +11,7 @@
 
 pub mod experts;
 pub mod health;
+pub mod knowledge;
 pub mod sessions;
 pub mod traces;
 
@@ -39,6 +40,8 @@ pub struct AppState {
     pub trace_observer: Arc<dyn TraceObserverPort>,
     /// 出站端口：会话观察者（记录会话信息）
     pub session_observer: Arc<dyn SessionObserverPort>,
+    /// 知识库存储（可选，PG 降级模式下为 None）
+    pub pg_storage: Option<Arc<subhuti_infra::sutra_library::storage::PgStorage>>,
 }
 
 // ─── FromRef<()> for AppState ──────────────────────────────────

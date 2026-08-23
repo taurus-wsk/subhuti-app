@@ -13,6 +13,7 @@ use crate::orchestrator::{
     FrameworkExpertInfo, OrchestrationResult, Orchestrator, TaskAnalysisRule,
 };
 use crate::runtime::LLM;
+use crate::sutra_library::SutraLibraryPort;
 use crate::vertical::{AssetLibrary, ProjectMemory, ToolRegistry, WorkflowStore};
 
 /// Subhuti 引擎调度器
@@ -28,6 +29,11 @@ pub struct Subhuti {
     tool_registry: Arc<dyn ToolRegistry>,
     workflow_store: Arc<dyn WorkflowStore>,
     llm: Option<Arc<dyn LLM>>,
+    sutra_library: std::sync::RwLock<Option<Arc<dyn SutraLibraryPort>>>,
+    /// Session 存储：根据 session_id 持久化会话历史
+    sessions: std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<String, crate::runtime::session::Session>>,
+    >,
 }
 
 impl Subhuti {
@@ -54,12 +60,44 @@ impl Subhuti {
             tool_registry,
             workflow_store,
             llm: None,
+            sutra_library: std::sync::RwLock::new(None),
+            sessions: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
         }
+    }
+
+    /// 获取或创建 Session
+    pub async fn get_or_create_session(
+        &self,
+        session_id: &str,
+    ) -> crate::runtime::session::Session {
+        let mut sessions = self.sessions.write().await;
+        if let Some(session) = sessions.get(session_id) {
+            session.clone()
+        } else {
+            let session = crate::runtime::session::Session::new(session_id);
+            sessions.insert(session_id.to_string(), session.clone());
+            session
+        }
+    }
+
+    /// 保存 Session（将修改后的 Session 存回存储）
+    pub async fn save_session(&self, session: crate::runtime::session::Session) {
+        let mut sessions = self.sessions.write().await;
+        sessions.insert(session.id().to_string(), session);
     }
 
     /// 注入 LLM 实例
     pub fn set_llm(&mut self, llm: Arc<dyn LLM>) {
         self.llm = Some(llm);
+    }
+
+    /// 注入藏经阁记忆引擎
+    pub fn set_sutra_library(&self, lib: Arc<dyn SutraLibraryPort>) {
+        if let Ok(mut guard) = self.sutra_library.write() {
+            *guard = Some(lib);
+        }
     }
 
     /// 获取当前 LLM 实例
@@ -105,11 +143,27 @@ impl Subhuti {
     /// 使用自定义上下文执行编排
     pub async fn dispatch_with_context(&self, mut ctx: AgentContext) -> OrchestrationResult {
         let state = self.build_expert_state();
-        self.orchestrator
-            .lock()
-            .await
-            .dispatch(&mut ctx, &state)
-            .await
+
+        tracing::info!("[dispatch_with_context] 开始获取 orchestrator 锁");
+        let mut orchestrator = self.orchestrator.lock().await;
+        tracing::info!("[dispatch_with_context] 已获取 orchestrator 锁，开始执行 dispatch");
+
+        // 克隆必要的数据，以便在释放锁后继续执行
+        let input = ctx.input.clone();
+        let session = ctx.session.clone();
+        let metadata = ctx.metadata.clone();
+
+        // 在锁内执行 dispatch（因为需要访问 orchestrator 内部状态）
+        let result = orchestrator.dispatch(&mut ctx, &state).await;
+
+        tracing::info!("[dispatch_with_context] dispatch 执行完成，准备释放锁");
+        drop(orchestrator); // 显式释放锁
+
+        // 保存 Session（会话历史持久化）- 锁外执行
+        self.save_session(ctx.session.clone()).await;
+
+        tracing::info!("[dispatch_with_context] 完成");
+        result
     }
 
     /// 构建共享 ExpertState（供图节点等使用）
@@ -122,6 +176,9 @@ impl Subhuti {
             .workflow_store(self.workflow_store.clone());
         if let Some(ref llm) = self.llm {
             builder = builder.llm(llm.clone());
+        }
+        if let Some(ref lib) = *self.sutra_library.read().unwrap() {
+            builder = builder.sutra_library(lib.clone());
         }
         builder.build()
     }

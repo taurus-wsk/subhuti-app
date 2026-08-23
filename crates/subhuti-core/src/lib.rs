@@ -18,6 +18,7 @@ pub mod memory;
 pub mod observe;
 pub mod orchestrator;
 pub mod runtime;
+pub mod sutra_library;
 pub mod vertical;
 
 pub use common::types::CtxId;
@@ -56,6 +57,7 @@ pub use runtime::{
     LLMConfig, LLMProvider, LLMResponse, Message, Role, Session, Tool, ToolCall, ToolCallResult,
     ToolInfo, ToolResponse, ToolResult, LLM,
 };
+pub use sutra_library::{EmptySutraLibrary, SutraLibraryPort};
 pub use vertical::{
     Asset, AssetLibrary, ProjectInfo, ProjectMemory, ProjectNote, ToolCommand, ToolCommandInfo,
     ToolIntegration, ToolRegistry, Workflow, WorkflowStore,

@@ -14,9 +14,11 @@ use std::sync::Mutex;
 use subhuti_core::engine::Subhuti;
 use subhuti_core::event::EventBus;
 use subhuti_core::memory::Memory;
+use subhuti_core::sutra_library::SutraLibraryPort;
 use subhuti_core::vertical::{AssetLibrary, ProjectMemory, ToolRegistry, WorkflowStore};
 use subhuti_core::LLMConfig;
 use subhuti_core::LLMProvider;
+use subhuti_infra::sutra_library::create_sutra_engine;
 use subhuti_infra::vertical::{
     MemoryAssetLibrary, MemoryProjectMemory, MemoryToolRegistry, MemoryWorkflowStore,
 };
@@ -32,6 +34,8 @@ use crate::adapter::outbound::subhuti_expert_repository::SubhutiExpertRepository
 use crate::adapter::outbound::subhuti_orchestration_engine::SubhutiOrchestrationEngine;
 use crate::adapter::outbound::subhuti_skill_executor::SubhutiSkillExecutor;
 use crate::application::observer::{record_fn_log, LogLevel, TraceObserverPort};
+use crate::domain::ports::CommandPort;
+use crate::domain::ports::FileSystemPort;
 use crate::domain::ports::ToolchainPort;
 use crate::domain::ports::{ExpertRepositoryPort, OrchestrationEnginePort, SkillExecutionPort};
 use crate::domain::traits::{DomainExpert, DomainRepository};
@@ -239,11 +243,32 @@ impl SubhutiFrameworkInitializer {
             subhuti.set_llm(llm_to_inject);
         }
 
+        // ── 初始化藏经阁引擎（内存版，PG 初始化在 CompositionRoot 中完成） ──
+        let (_sutra_engine, _sutra_skill) = create_sutra_engine(None);
+        subhuti.set_sutra_library(_sutra_engine as Arc<dyn SutraLibraryPort>);
+
         Self {
             subhuti: Arc::new(subhuti),
             app_config,
             trace_observer: Mutex::new(None),
         }
+    }
+
+    /// 初始化藏经阁引擎的 PG 持久化（在 CompositionRoot 创建 PG Pool 后调用）
+    pub async fn init_sutra_library_pg(&self, pg_pool: sqlx::PgPool) {
+        let pool = Arc::new(pg_pool);
+        let pg = Arc::new(subhuti_infra::sutra_library::storage::PgStorage::new(
+            pool.clone(),
+        ));
+        if let Err(e) = pg.ensure_tables().await {
+            tracing::warn!("SutraLibrary: PG table init failed: {}", e);
+        } else {
+            tracing::info!("✅ 藏经阁引擎 PG 表已就绪");
+        }
+        // 重建带 PG 的引擎
+        let (sutra_engine, _sutra_skill) = create_sutra_engine(Some((*pool).clone()));
+        self.subhuti
+            .set_sutra_library(sutra_engine as Arc<dyn SutraLibraryPort>);
     }
 
     /// 设置 trace_observer（用于函数调用链路追踪）
@@ -300,6 +325,8 @@ impl SubhutiFrameworkInitializer {
         expert: Arc<dyn DomainExpert>,
         repository: Arc<dyn DomainRepository>,
         toolchain: Option<Arc<dyn ToolchainPort>>,
+        file_system: Option<Arc<dyn FileSystemPort>>,
+        command: Option<Arc<dyn CommandPort>>,
     ) {
         let subhuti = self.subhuti.clone();
         let expert_name = expert.name().to_string();
@@ -309,7 +336,11 @@ impl SubhutiFrameworkInitializer {
             crate::adapter::outbound::domain_expert_adapter::DomainExpertAdapter<dyn DomainExpert>,
         > = Arc::new(
             crate::adapter::outbound::domain_expert_adapter::DomainExpertAdapter::new(
-                expert, repository, toolchain,
+                expert,
+                repository,
+                toolchain,
+                file_system,
+                command,
             ),
         );
 

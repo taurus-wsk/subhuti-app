@@ -9,7 +9,9 @@
 //! - Subhuti 框架通过 ExpertAgent 接口调用专家
 
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 
 use subhuti_core::orchestrator::{
     AgentContext, ExpertAgent, ExpertState, FromState, Llm, SkillInfo,
@@ -17,11 +19,49 @@ use subhuti_core::orchestrator::{
 use subhuti_core::Result;
 
 use crate::application::observer::{record_fn_log, LogLevel};
+use crate::domain::ports::CommandPort;
+use crate::domain::ports::FileSystemPort;
 use crate::domain::ports::ToolchainPort;
 use crate::domain::traits::{
     DomainContext, DomainError, DomainExecutionContext, DomainExpert, DomainLlm, DomainMessage,
     DomainRepository, DomainResult, DomainRole,
 };
+
+// ─── 全局进度通道注册表 ──────────────────────────────────────────
+//
+// 用于在请求级别将 progress_tx 传递给 DomainExpertAdapter，
+// 避免修改 Orchestrator 接口。key 为 session_id。
+
+use std::sync::OnceLock;
+
+static PROGRESS_TX_REGISTRY: OnceLock<Mutex<HashMap<String, mpsc::Sender<String>>>> =
+    OnceLock::new();
+
+fn get_registry() -> &'static Mutex<HashMap<String, mpsc::Sender<String>>> {
+    PROGRESS_TX_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 注册进度通道（在请求开始时调用）
+pub fn register_progress_tx(session_id: &str, tx: mpsc::Sender<String>) {
+    if let Ok(mut map) = get_registry().lock() {
+        map.insert(session_id.to_string(), tx);
+    }
+}
+
+/// 注销进度通道（在请求结束时调用）
+pub fn unregister_progress_tx(session_id: &str) {
+    if let Ok(mut map) = get_registry().lock() {
+        map.remove(session_id);
+    }
+}
+
+/// 获取进度通道（在 DomainExpertAdapter::dispatch 中调用）
+fn get_progress_tx(session_id: &str) -> Option<mpsc::Sender<String>> {
+    get_registry()
+        .lock()
+        .ok()
+        .and_then(|map| map.get(session_id).cloned())
+}
 
 /// 领域专家适配器
 ///
@@ -37,6 +77,12 @@ where
     repository: Arc<dyn DomainRepository>,
     /// Rust 工具链（可选，供 RustExpert 等需要编译验证的专家使用）
     toolchain: Option<Arc<dyn ToolchainPort>>,
+    /// 文件系统操作（可选，用于读写项目文件、搜索文件等）
+    file_system: Option<Arc<dyn FileSystemPort>>,
+    /// 命令行执行（可选，用于运行 cargo build、git 等命令）
+    command: Option<Arc<dyn CommandPort>>,
+    /// 进度报告通道（可选，用于实时推送执行进度）
+    progress_tx: Option<mpsc::Sender<String>>,
 }
 
 impl<D: ?Sized> DomainExpertAdapter<D>
@@ -48,6 +94,8 @@ where
         domain_expert: Arc<D>,
         repository: Arc<dyn DomainRepository>,
         toolchain: Option<Arc<dyn ToolchainPort>>,
+        file_system: Option<Arc<dyn FileSystemPort>>,
+        command: Option<Arc<dyn CommandPort>>,
     ) -> Self {
         // 预计算并缓存技能信息，避免每次调用 skills() 时重复转换
         let skills = domain_expert
@@ -66,7 +114,16 @@ where
             skills,
             repository,
             toolchain,
+            file_system,
+            command,
+            progress_tx: None,
         }
+    }
+
+    /// 设置进度报告通道（用于实时推送执行进度到 SSE 流）
+    pub fn with_progress_tx(mut self, tx: mpsc::Sender<String>) -> Self {
+        self.progress_tx = Some(tx);
+        self
     }
 
     /// 获取底层领域专家实例
@@ -110,10 +167,40 @@ where
         let domain_llm = Arc::new(SubhutiLlmAdapter { llm: llm.clone() });
 
         // 3. 构建领域上下文
+        // 从框架 Session 提取历史消息并转换为 DomainMessage
+        let history = ctx
+            .session
+            .messages()
+            .into_iter()
+            .filter_map(|msg| {
+                let role = match msg.role {
+                    subhuti_core::runtime::llm::Role::System => DomainRole::System,
+                    subhuti_core::runtime::llm::Role::User => DomainRole::User,
+                    subhuti_core::runtime::llm::Role::Assistant => DomainRole::Assistant,
+                    subhuti_core::runtime::llm::Role::Tool => return None, // 跳过 Tool 消息
+                };
+                Some(DomainMessage {
+                    role,
+                    content: msg.content,
+                })
+            })
+            .collect();
+
         let domain_ctx = DomainContext {
             input: ctx.input.clone(),
             session_id: Some(ctx.session.id().to_string()),
             user_id: None,
+            workspace_folder: ctx
+                .metadata
+                .get("workspace_folder")
+                .cloned()
+                .filter(|s| !s.is_empty()),
+            system_prompt: ctx
+                .metadata
+                .get("system_prompt")
+                .cloned()
+                .filter(|s| !s.is_empty()),
+            history,
         };
 
         // 4. 检查是否指定了技能执行
@@ -130,6 +217,9 @@ where
             .clone();
 
         // 5. 构建领域执行上下文（封装所有依赖，避免参数膨胀）
+        // 从全局注册表获取 progress_tx（按 session_id 查找）
+        let session_id = ctx.session.id().to_string();
+        let progress_tx = get_progress_tx(&session_id).or_else(|| self.progress_tx.clone());
         let exec_ctx = DomainExecutionContext {
             ctx: domain_ctx,
             llm: domain_llm,
@@ -145,6 +235,10 @@ where
                 Some(params.clone())
             },
             toolchain: self.toolchain.clone(),
+            sutra_library: state.sutra_library_cloned(),
+            file_system: self.file_system.clone(),
+            command: self.command.clone(),
+            progress_tx,
         };
 
         // 6. 根据是否有技能ID选择执行方式

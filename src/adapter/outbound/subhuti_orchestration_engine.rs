@@ -42,16 +42,22 @@ impl OrchestrationEnginePort for SubhutiOrchestrationEngine {
         user_id: &str,
         chain: &str,
         graph: &str,
+        expert_id: &str,
         trace_id: &str,
         session_id: &str,
+        workspace_folder: &str,
+        system_prompt: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = OrchestrateResponse> + Send>> {
         let subhuti = self.subhuti.clone();
         let message = message.to_string();
         let user_id = user_id.to_string();
         let chain = chain.to_string();
         let graph = graph.to_string();
+        let expert_id = expert_id.to_string();
         let trace_id = trace_id.to_string();
         let session_id = session_id.to_string();
+        let workspace_folder = workspace_folder.to_string();
+        let system_prompt = system_prompt.to_string();
         let trace_observer = self.trace_observer.clone();
 
         // 序列化输入用于 FnTracer
@@ -62,6 +68,8 @@ impl OrchestrationEnginePort for SubhutiOrchestrationEngine {
             "graph": &graph,
             "trace_id": &trace_id,
             "session_id": &session_id,
+            "workspace_folder": &workspace_folder,
+            "system_prompt": &system_prompt,
         })
         .to_string();
 
@@ -86,8 +94,16 @@ impl OrchestrationEnginePort for SubhutiOrchestrationEngine {
 
             let start = std::time::Instant::now();
 
+            // 获取或创建 Session（用于会话历史持久化）
+            let session = if !session_id.is_empty() {
+                subhuti.get_or_create_session(&session_id).await
+            } else {
+                subhuti_core::runtime::session::Session::new(&user_id)
+            };
+
             // 创建上下文并设置技能信息到 metadata
-            let mut ctx = subhuti_core::orchestrator::AgentContext::new(&message, &user_id);
+            let mut ctx =
+                subhuti_core::orchestrator::AgentContext::with_session(&message, &user_id, session);
 
             // 如果指定了技能链，设置技能信息
             if !chain.is_empty() {
@@ -95,8 +111,15 @@ impl OrchestrationEnginePort for SubhutiOrchestrationEngine {
             }
 
             // 如果指定了图名称，设置图信息（dispatch 时优先使用指定图）
-            if !graph.is_empty() {
+            // "default" 是前端未选择知识库时的默认值，此时不设置 graph_name，
+            // 让 Orchestrator 走关键词匹配逻辑找到正确的图。
+            if !graph.is_empty() && graph != "default" {
                 ctx.set_metadata("graph_name", &graph);
+            }
+
+            // 如果指定了专家 ID，设置专家信息（dispatch 时直接路由到该专家）
+            if !expert_id.is_empty() {
+                ctx.set_metadata("expert_id", &expert_id);
             }
 
             // 注入 trace_id / session_id 供框架 emit_event 使用（事件 emit 时带 trace 上下文）
@@ -105,6 +128,14 @@ impl OrchestrationEnginePort for SubhutiOrchestrationEngine {
             }
             if !session_id.is_empty() {
                 ctx.set_metadata("session_id", &session_id);
+            }
+
+            // 注入 workspace_folder / system_prompt（前端聊天设置传入，透传给专家）
+            if !workspace_folder.is_empty() {
+                ctx.set_metadata("workspace_folder", &workspace_folder);
+            }
+            if !system_prompt.is_empty() {
+                ctx.set_metadata("system_prompt", &system_prompt);
             }
 
             if let Some(ref obs) = trace_observer {

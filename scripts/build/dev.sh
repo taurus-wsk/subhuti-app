@@ -109,6 +109,15 @@ stop() {
     echo "✅ 已停止"
 }
 
+start_log() {
+    # 先启动服务，然后持续 tail 日志
+    start
+    echo ""
+    echo "📋 持续查看日志 (Ctrl+C 退出，服务继续运行)..."
+    echo "─────────────────────────────────────────────────────────────"
+    logs
+}
+
 restart() {
     stop
     sleep 1
@@ -146,15 +155,20 @@ is_running() {
 }
 
 case "${1:-start}" in
-    build)   build ;;
-    start)   start ;;
-    stop)    stop ;;
-    restart) restart ;;
-    status)  status ;;
-    logs)    logs ;;
-    test)    test_health ;;
+    build)      build ;;
+    start)      start ;;
+    start-log)  start_log ;;
+    stop)       stop ;;
+    restart)    restart ;;
+    status)     status ;;
+    logs)       logs ;;
+    test)       test_health ;;
     *)
-        echo "用法: ./dev.sh [build|start|stop|restart|status|logs|test]"
+        echo "用法: ./dev.sh [build|start|start-log|stop|restart|status|logs|test]"
+        echo ""
+        echo "  start       后台启动服务（默认）"
+        echo "  start-log   启动后持续查看日志（Ctrl+C 退出，服务继续运行）"
+        echo "  logs        查看已有服务的日志"
         exit 1
         ;;
 esac

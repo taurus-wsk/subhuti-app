@@ -27,6 +27,8 @@ use crate::application::orchestration_service::OrchestrationService;
 use crate::application::ports::{ChatPort, ExpertQueryPort, SkillPort};
 use crate::application::trace_decorator::TraceAppService;
 use crate::domain::experts;
+use crate::domain::ports::CommandPort;
+use crate::domain::ports::FileSystemPort;
 use crate::domain::ports::ToolchainPort;
 use crate::domain::traits::DomainRepository;
 use crate::infra::config::AppConfig;
@@ -42,6 +44,8 @@ pub struct Composition {
     /// 观察者（给 traces/sessions 查询路由用）
     pub trace_observer: Arc<dyn TraceObserverPort>,
     pub session_observer: Arc<dyn SessionObserverPort>,
+    /// 知识库 PG 存储（可选，降级模式下为 None）
+    pub pg_storage: Option<Arc<subhuti_infra::sutra_library::storage::PgStorage>>,
 }
 
 /// 组合根：组装应用实例的唯一入口
@@ -60,9 +64,14 @@ impl CompositionRoot {
     /// 7. 调用 build_adapters() 获取出站端口适配器
     /// 8. 构造 OrchestrationService + 观察者，打包为 Composition
     pub async fn build(app_config: &AppConfig) -> anyhow::Result<Composition> {
+        // 0. 先创建框架初始化器（用于后续藏经阁引擎初始化）
+        let app_config_arc = Arc::new(app_config.clone());
+        let framework_initializer = Arc::new(SubhutiFrameworkInitializer::new(app_config_arc));
+
         // 1. 创建领域数据仓库：
         //    - test_mode=true 用内存仓库
         //    - test_mode=false 优先 PostgreSQL，连接失败自动降级为内存仓库，保证 LLM 初始化等流程能继续
+        let mut pg_pool_opt: Option<Arc<sqlx::PgPool>> = None;
         let repository: Arc<dyn DomainRepository> = if app_config.test_mode.enabled {
             record_fn_log(
                 None,
@@ -99,6 +108,7 @@ impl CompositionRoot {
                             None,
                         );
                     }
+                    pg_pool_opt = Some(pool.clone());
                     record_fn_log(
                         None,
                         "",
@@ -131,14 +141,31 @@ impl CompositionRoot {
             }
         };
 
-        // 2. 创建框架初始化器（出站适配层，持有 Subhuti 对象）
-        let app_config_arc = Arc::new(app_config.clone());
-        let framework_initializer = Arc::new(SubhutiFrameworkInitializer::new(app_config_arc));
+        // 1.5 初始化藏经阁引擎 PG 持久化（如果 PG 连接成功）
+        let pg_storage: Option<Arc<subhuti_infra::sutra_library::storage::PgStorage>> =
+            if let Some(pool) = pg_pool_opt {
+                framework_initializer
+                    .init_sutra_library_pg((*pool).clone())
+                    .await;
+                let storage = Arc::new(subhuti_infra::sutra_library::storage::PgStorage::new(
+                    pool.clone(),
+                ));
+                Some(storage)
+            } else {
+                record_fn_log(
+                    None,
+                    "",
+                    LogLevel::Info,
+                    "藏经阁引擎使用内存模式（无 PG 持久化）",
+                    None,
+                );
+                None
+            };
 
-        // 3. 通过 SubhutiFrameworkInitializer 初始化框架
+        // 2. 通过 SubhutiFrameworkInitializer 初始化框架
         framework_initializer.init().await?;
 
-        // 3.5 创建 Rust 工具链适配器（供 RustExpert 等编译验证专家使用）
+        // 3.5 创建 Rust 工具链适配器
         let toolchain: Arc<dyn ToolchainPort> = Arc::new(
             crate::adapter::outbound::rust_toolchain_adapter::RustToolchainAdapter::new(
                 std::env::current_dir()
@@ -148,11 +175,23 @@ impl CompositionRoot {
             ),
         );
 
+        // 3.6 创建文件系统和命令执行适配器
+        let file_system: Arc<dyn FileSystemPort> =
+            Arc::new(crate::adapter::outbound::file_system_adapter::LocalFileSystemAdapter::new());
+        let command: Arc<dyn CommandPort> =
+            Arc::new(crate::adapter::outbound::command_adapter::LocalCommandAdapter::new());
+
         // 4. 通过 SubhutiFrameworkInitializer 注册领域专家
         let domain_experts = experts::create_all_experts();
         for expert in &domain_experts {
             framework_initializer
-                .register_expert(expert.clone(), repository.clone(), Some(toolchain.clone()))
+                .register_expert(
+                    expert.clone(),
+                    repository.clone(),
+                    Some(toolchain.clone()),
+                    Some(file_system.clone()),
+                    Some(command.clone()),
+                )
                 .await;
         }
 
@@ -227,6 +266,7 @@ impl CompositionRoot {
             skill_port: traced,
             trace_observer,
             session_observer,
+            pg_storage,
         })
     }
 }

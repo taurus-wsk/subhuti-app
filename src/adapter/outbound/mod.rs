@@ -41,7 +41,9 @@ pub mod subhuti_expert_repository;
 pub mod subhuti_orchestration_engine;
 pub mod subhuti_skill_executor;
 // 已删除：subhuti_plugin_repository（框架无真实实现，待插件生命周期管理实现后加回）
+pub mod command_adapter;
 pub mod event_bridge;
+pub mod file_system_adapter;
 pub mod graphs;
 pub mod observer_adapters;
 pub mod postgres_repository;
