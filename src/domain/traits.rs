@@ -53,6 +53,8 @@ pub struct DomainExecutionContext {
     pub ctx: DomainContext,
     /// LLM 客户端
     pub llm: Arc<dyn DomainLlm>,
+    /// 引擎侧 LLM（用于规划等框架能力，由适配器注入）
+    pub engine_llm: Option<Arc<dyn subhuti_core::LLM>>,
     /// 数据仓库
     pub repository: Arc<dyn DomainRepository>,
     /// 技能ID（可选，用于技能执行）
@@ -76,6 +78,7 @@ impl Clone for DomainExecutionContext {
         Self {
             ctx: self.ctx.clone(),
             llm: self.llm.clone(),
+            engine_llm: self.engine_llm.clone(),
             repository: self.repository.clone(),
             skill_id: self.skill_id.clone(),
             skill_params: self.skill_params.clone(),
@@ -166,15 +169,16 @@ pub trait DomainExpert: Send + Sync {
 
     /// 使用 LLM 自动规划并执行多技能组合
     ///
-    /// 通用默认实现：让 LLM 分析用户意图，生成技能执行计划，然后按顺序执行。
-    /// 所有专家都可以使用此方法，无需重复实现。
+    /// 通用默认实现：让引擎 planner 生成技能执行计划，再由引擎按顺序驱动执行。
+    /// 领域层只负责把"单步技能执行"供给引擎（通过 run_step 闭包），
+    /// 规划的生成与循环驱动机制全部收敛在引擎。
     ///
     /// # 参数
     /// - `exec_ctx`: 领域执行上下文
     ///
     /// # 返回
     /// - 所有技能执行结果的汇总
-    async fn plan_and_execute(&self, mut exec_ctx: DomainExecutionContext) -> DomainResult<String> {
+    async fn plan_and_execute(&self, exec_ctx: DomainExecutionContext) -> DomainResult<String> {
         let input = exec_ctx.ctx.input.clone();
         let skills = self.skills().to_vec();
         let expert_name = self.name().to_string();
@@ -187,15 +191,35 @@ pub trait DomainExpert: Send + Sync {
         );
 
         // 1. 发送进度通知：开始规划
-        let _ = send_progress(
+        send_progress(
             &exec_ctx.progress_tx,
             &format!("🔍 {} 正在分析需求，制定执行计划...", expert_name),
         );
 
-        // 2. 让 LLM 生成执行计划
-        let plan = generate_plan(&exec_ctx, &input, &skills, &expert_name).await?;
+        // 2. 让引擎 planner 用 LLM 生成执行计划
+        let skill_infos: Vec<subhuti_core::orchestrator::SkillInfo> = skills
+            .iter()
+            .map(|s| subhuti_core::orchestrator::SkillInfo {
+                id: s.id.clone(),
+                name: s.name.clone(),
+                description: s.description.clone(),
+                parameters: s.parameters.clone(),
+            })
+            .collect();
 
-        // 记录计划详情
+        let engine_llm = exec_ctx
+            .engine_llm
+            .clone()
+            .ok_or_else(|| DomainError::LlmError("缺少引擎 LLM，无法进行计划规划".to_string()))?;
+        let plan = subhuti_core::orchestrator::planner::generate_plan(
+            &engine_llm,
+            &input,
+            &skill_infos,
+            &expert_name,
+        )
+        .await
+        .map_err(|e| DomainError::LlmError(e.to_string()))?;
+
         tracing::info!(
             "[plan_and_execute] 生成计划: description={}, steps={:?}",
             plan.description,
@@ -205,174 +229,41 @@ pub trait DomainExpert: Send + Sync {
                 .collect::<Vec<_>>()
         );
 
-        // 3. 发送计划通知
-        let _ = send_progress(
-            &exec_ctx.progress_tx,
-            &format!(
-                "📋 执行计划：{}\n共 {} 个步骤",
-                plan.description,
-                plan.step_count()
-            ),
-        );
-
-        // 4. 按顺序执行每个步骤
-        let mut results = Vec::new();
-        let total_steps = plan.steps.len();
-
-        for (idx, step) in plan.steps.iter().enumerate() {
-            let step_num = idx + 1;
-
-            // 发送进度通知：开始执行步骤
-            let _ = send_progress(
-                &exec_ctx.progress_tx,
-                &format!(
-                    "⚡ 步骤 {}/{}: [{}] {} - 执行中...",
-                    step_num, total_steps, step.skill_id, step.description
-                ),
-            );
-
-            // 执行技能
-            let skill_result = self
-                .execute_skill(&step.skill_id, &step.params, exec_ctx.clone())
-                .await;
-
-            match &skill_result {
-                Ok(output) => {
-                    let _ = send_progress(
-                        &exec_ctx.progress_tx,
-                        &format!(
-                            "✅ 步骤 {}/{} 完成: {}",
-                            step_num, total_steps, step.description
-                        ),
-                    );
-                    results.push(format!(
-                        "## 步骤 {}: {}\n\n{}",
-                        step_num, step.description, output
-                    ));
+        // 3. 让引擎 execute_plan 驱动循环执行（含进度回传 + 结果注入 + 汇总）
+        let progress_tx = exec_ctx.progress_tx.clone();
+        let summary = subhuti_core::orchestrator::planner::execute_plan(
+            &expert_name,
+            &plan,
+            move |msg: &str| send_progress(&progress_tx, msg),
+            |skill_id, params, prev_input: &str| {
+                let skill_id_owned = skill_id.to_string();
+                let params_owned = params.to_string();
+                let skill_exec_ctx = DomainExecutionContext {
+                    ctx: DomainContext {
+                        input: prev_input.to_string(),
+                        system_prompt: exec_ctx.ctx.system_prompt.clone(),
+                        ..exec_ctx.ctx.clone()
+                    },
+                    skill_id: Some(skill_id_owned.clone()),
+                    skill_params: Some(params_owned.clone()),
+                    ..exec_ctx.clone()
+                };
+                let expert = self;
+                async move {
+                    expert
+                        .execute_skill(&skill_id_owned, &params_owned, skill_exec_ctx)
+                        .await
+                        .map_err(|e| subhuti_core::Error::Expert(e.to_string()))
                 }
-                Err(e) => {
-                    let _ = send_progress(
-                        &exec_ctx.progress_tx,
-                        &format!(
-                            "❌ 步骤 {}/{} 失败: {} - 错误: {}",
-                            step_num, total_steps, step.description, e
-                        ),
-                    );
-                    results.push(format!(
-                        "## 步骤 {}: {} [失败]\n\n错误: {}",
-                        step_num, step.description, e
-                    ));
-                }
-            }
+            },
+        )
+        .await
+        .map_err(|e| DomainError::LlmError(e.to_string()))?;
 
-            // 更新上下文，将前一步结果注入到下一步
-            exec_ctx.ctx.input = match &skill_result {
-                Ok(output) => output.clone(),
-                Err(e) => format!("上一步失败: {}", e),
-            };
-        }
-
-        // 5. 汇总结果
-        let summary = format!(
-            "# {} 执行结果\n\n{}\n\n---\n共执行 {} 个步骤",
-            expert_name,
-            results.join("\n\n---\n\n"),
-            total_steps
-        );
-
-        tracing::info!(
-            "[plan_and_execute] 专家={} 执行完成，共{}个步骤",
-            expert_name,
-            total_steps
-        );
+        tracing::info!("[plan_and_execute] 专家={} 执行完成", expert_name);
 
         Ok(summary)
     }
-}
-
-/// 解析 LLM 输出的执行计划（独立函数，避免 trait 对象大小问题）
-pub fn parse_plan(output: &str) -> DomainResult<SkillPlan> {
-    // 尝试提取 JSON（可能被 markdown 代码块包裹）
-    let json_str = if let Some(start) = output.find("```json") {
-        let start = start + 7;
-        if let Some(end) = output[start..].find("```") {
-            output[start..start + end].trim().to_string()
-        } else {
-            output.trim().to_string()
-        }
-    } else if let Some(start) = output.find("```") {
-        let start = start + 3;
-        if let Some(end) = output[start..].find("```") {
-            output[start..start + end].trim().to_string()
-        } else {
-            output.trim().to_string()
-        }
-    } else {
-        output.trim().to_string()
-    };
-
-    serde_json::from_str(&json_str).map_err(|e| {
-        DomainError::LlmError(format!("解析执行计划失败: {}, 原始输出: {}", e, output))
-    })
-}
-
-/// 使用 LLM 生成执行计划（独立函数）
-pub async fn generate_plan(
-    exec_ctx: &DomainExecutionContext,
-    input: &str,
-    skills: &[DomainSkill],
-    expert_name: &str,
-) -> DomainResult<SkillPlan> {
-    let skills_desc: String = skills
-        .iter()
-        .map(|s| {
-            format!(
-                "- **{}**: {} (参数: {})",
-                s.id,
-                s.description,
-                s.parameters.join(", ")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let system_prompt = format!(
-        r#"你是 {}，擅长规划任务执行。
-
-请分析用户需求，从可用技能中选择最合适的技能组合，制定执行计划。
-
-可用技能：
-{}
-
-规则：
-1. 根据用户需求选择 1-3 个技能组合执行
-2. 技能按顺序执行，前一步的输出作为后一步的输入
-3. 如果用户只是闲聊或询问信息，只需使用 chat 技能
-4. 如果需要编码，先 chat 确认需求，再 coding 执行
-5. 以 JSON 格式返回执行计划"#,
-        expert_name, skills_desc
-    );
-
-    let user_prompt = format!(
-        "用户需求：\n{}\n\n请制定执行计划，以以下 JSON 格式返回：\n```json\n{{\n  \"description\": \"计划描述\",\n  \"steps\": [\n    {{\n      \"order\": 1,\n      \"skill_id\": \"rust-chat\",\n      \"description\": \"步骤描述\",\n      \"params\": \"技能参数\"\n    }}\n  ]\n}}\n```",
-        input
-    );
-
-    let messages = vec![
-        DomainMessage {
-            role: DomainRole::System,
-            content: system_prompt,
-        },
-        DomainMessage {
-            role: DomainRole::User,
-            content: user_prompt,
-        },
-    ];
-
-    let llm_output = exec_ctx.llm.chat(messages).await?;
-
-    // 解析 JSON 计划
-    parse_plan(&llm_output)
 }
 
 /// 发送进度通知（辅助函数）
@@ -453,184 +344,3 @@ impl std::fmt::Display for DomainError {
 }
 
 impl std::error::Error for DomainError {}
-
-// ─── 规划器相关类型 ─────────────────────────────────────────────
-
-/// 执行计划步骤
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PlanStep {
-    /// 步骤序号（从1开始）
-    pub order: u32,
-    /// 使用的技能ID
-    pub skill_id: String,
-    /// 步骤描述
-    pub description: String,
-    /// 技能参数（可以是字符串或对象）
-    #[serde(deserialize_with = "deserialize_params")]
-    pub params: String,
-}
-
-/// 自定义反序列化：支持 params 为字符串或对象
-fn deserialize_params<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value: serde_json::Value = serde::Deserialize::deserialize(deserializer)?;
-    match value {
-        serde_json::Value::String(s) => Ok(s),
-        other => Ok(other.to_string()),
-    }
-}
-
-/// 执行计划
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SkillPlan {
-    /// 计划描述
-    pub description: String,
-    /// 步骤列表（按顺序执行）
-    pub steps: Vec<PlanStep>,
-}
-
-impl SkillPlan {
-    pub fn new(description: &str) -> Self {
-        Self {
-            description: description.to_string(),
-            steps: Vec::new(),
-        }
-    }
-
-    pub fn add_step(mut self, step: PlanStep) -> Self {
-        self.steps.push(step);
-        self
-    }
-
-    pub fn step_count(&self) -> usize {
-        self.steps.len()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_skill_plan_creation() {
-        let plan = SkillPlan::new("测试计划")
-            .add_step(PlanStep {
-                order: 1,
-                skill_id: "rust-chat".to_string(),
-                description: "闲聊".to_string(),
-                params: "你好".to_string(),
-            })
-            .add_step(PlanStep {
-                order: 2,
-                skill_id: "rust-coding".to_string(),
-                description: "编码".to_string(),
-                params: "创建项目".to_string(),
-            });
-
-        assert_eq!(plan.description, "测试计划");
-        assert_eq!(plan.step_count(), 2);
-        assert_eq!(plan.steps[0].skill_id, "rust-chat");
-        assert_eq!(plan.steps[1].skill_id, "rust-coding");
-    }
-
-    #[test]
-    fn test_parse_plan_from_json() {
-        let json = r#"{
-            "description": "简单计划",
-            "steps": [
-                {
-                    "order": 1,
-                    "skill_id": "rust-chat",
-                    "description": "回复问候",
-                    "params": "你好"
-                }
-            ]
-        }"#;
-
-        let plan = parse_plan(json).unwrap();
-        assert_eq!(plan.description, "简单计划");
-        assert_eq!(plan.step_count(), 1);
-        assert_eq!(plan.steps[0].skill_id, "rust-chat");
-    }
-
-    #[test]
-    fn test_parse_plan_from_markdown_code_block() {
-        let input = r#"以下是执行计划：
-
-```json
-{
-  "description": "编码计划",
-  "steps": [
-    {
-      "order": 1,
-      "skill_id": "rust-chat",
-      "description": "确认需求",
-      "params": "用户要求创建Rust项目"
-    },
-    {
-      "order": 2,
-      "skill_id": "rust-coding",
-      "description": "执行编码",
-      "params": "创建项目并编写代码"
-    }
-  ]
-}
-```"#;
-
-        let plan = parse_plan(input).unwrap();
-        assert_eq!(plan.description, "编码计划");
-        assert_eq!(plan.step_count(), 2);
-    }
-
-    #[test]
-    fn test_parse_plan_invalid_json() {
-        let input = "这不是有效的JSON";
-        let result = parse_plan(input);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_plan_step_serialization() {
-        let step = PlanStep {
-            order: 1,
-            skill_id: "rust-chat".to_string(),
-            description: "测试步骤".to_string(),
-            params: "参数".to_string(),
-        };
-
-        let json = serde_json::to_string(&step).unwrap();
-        let deserialized: PlanStep = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(deserialized.order, 1);
-        assert_eq!(deserialized.skill_id, "rust-chat");
-        assert_eq!(deserialized.description, "测试步骤");
-    }
-
-    #[test]
-    fn test_parse_plan_with_object_params() {
-        // 测试 params 为对象的情况（LLM 可能生成这种格式）
-        let json = r#"{
-            "description": "测试对象参数",
-            "steps": [
-                {
-                    "order": 1,
-                    "skill_id": "rust-chat",
-                    "description": "测试步骤",
-                    "params": {
-                        "question": "你好",
-                        "context": "测试"
-                    }
-                }
-            ]
-        }"#;
-
-        let plan = parse_plan(json).unwrap();
-        assert_eq!(plan.description, "测试对象参数");
-        assert_eq!(plan.step_count(), 1);
-        assert_eq!(plan.steps[0].skill_id, "rust-chat");
-        // params 应该被转换为字符串
-        assert!(plan.steps[0].params.contains("question"));
-    }
-}

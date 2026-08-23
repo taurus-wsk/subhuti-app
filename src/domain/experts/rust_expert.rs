@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 
 use crate::domain::traits::{
     DomainContext, DomainError, DomainExecutionContext, DomainExpert, DomainMessage, DomainResult,
-    DomainRole, DomainSkill, PlanStep, SkillPlan,
+    DomainRole, DomainSkill,
 };
 
 /// Rust 编程专家

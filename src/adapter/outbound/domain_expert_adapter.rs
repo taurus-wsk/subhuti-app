@@ -223,6 +223,7 @@ where
         let exec_ctx = DomainExecutionContext {
             ctx: domain_ctx,
             llm: domain_llm,
+            engine_llm: Some(llm.clone()),
             repository: self.repository.clone(),
             skill_id: if skill_id.is_empty() {
                 None

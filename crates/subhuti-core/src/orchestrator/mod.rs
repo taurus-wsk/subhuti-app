@@ -1,4 +1,5 @@
 pub mod actor;
+pub mod planner;
 pub mod rule_engine;
 pub mod strategies;
 
@@ -50,6 +51,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 pub use self::actor::{Actor, ActorRegistry, ExpertAgentActorAdapter};
+pub use self::planner::{execute_plan, generate_plan, parse_plan, PlanStep, SkillPlan};
 use self::strategies::{SemanticCandidate, SemanticRouter};
 use crate::event::{AgentEventData, EventBus};
 use crate::graph::{Graph, GraphOutput, GraphState};

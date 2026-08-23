@@ -46,12 +46,12 @@ pub use observe::{
     TraceObserverPort, TraceStatus,
 };
 pub use orchestrator::{
-    Actor, ActorRegistry, AgentContext, AgentRegistry, DefaultDispatchRule, DefaultExecutionRule,
-    DefaultTaskAnalysisRule, DispatchPlan, DispatchRule, DispatchStrategy, EventBusRef,
-    ExecutionResult, ExecutionRule, ExpertAgent, ExpertAgentActorAdapter, ExpertState,
-    FrameworkExpertInfo, FromState, GraphOrchestrator, Llm, MemoryRef, OrchestrationResult,
-    Orchestrator, ResultStrategy, RuleConfig, RuleEngine, Step, TaskAnalysisRule, TaskProfile,
-    TokenUsage,
+    execute_plan, generate_plan, parse_plan, Actor, ActorRegistry, AgentContext, AgentRegistry,
+    DefaultDispatchRule, DefaultExecutionRule, DefaultTaskAnalysisRule, DispatchPlan, DispatchRule,
+    DispatchStrategy, EventBusRef, ExecutionResult, ExecutionRule, ExpertAgent,
+    ExpertAgentActorAdapter, ExpertState, FrameworkExpertInfo, FromState, GraphOrchestrator, Llm,
+    MemoryRef, OrchestrationResult, Orchestrator, PlanStep, ResultStrategy, RuleConfig, RuleEngine,
+    SkillPlan, Step, TaskAnalysisRule, TaskProfile, TokenUsage,
 };
 pub use runtime::{
     LLMConfig, LLMProvider, LLMResponse, Message, Role, Session, Tool, ToolCall, ToolCallResult,
