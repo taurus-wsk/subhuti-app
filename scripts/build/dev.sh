@@ -41,24 +41,34 @@ build() {
     echo "✅ 编译完成: $BINARY"
 }
 
+# 关闭所有 subhuti serve 进程（含孤儿/多端口实例），再启动单一 8615 服务，
+# 避免多个实例并存导致日志重复、端口混淆。
+stop_all() {
+    echo "🛑 关闭所有 Subhuti serve 进程..."
+
+    # 释放端口占用（8615 及可能残留的 8080 等）
+    for port in 8615 8080; do
+        if lsof -ti:"$port" > /dev/null 2>&1; then
+            echo "  释放端口 $port ..."
+            lsof -ti:"$port" | xargs kill -9 2>/dev/null || true
+        fi
+    done
+
+    # 兜底：按项目目标二进制路径匹配，杀掉残余的 subhuti serve 进程
+    pgrep -f "$PROJECT_DIR/target/.*/subhuti serve" | xargs kill -9 2>/dev/null || true
+
+    rm -f "$PID_FILE"
+    sleep 1
+}
+
 start() {
-    if is_running; then
-        echo "⚠️  服务已在运行 (PID: $(cat "$PID_FILE"))，自动重启..."
-        stop
-        sleep 1
-    fi
+    # 先关闭所有已存在的 subhuti serve 进程，保证只留一个新起的 8615 服务
+    stop_all
 
     if [ "$BUILD_MODE" = "debug" ]; then
         echo "🔨 编译 debug 版本..."
         cd "$PROJECT_DIR"
         cargo build --bin subhuti
-    fi
-
-    # 确保 8615 端口可用
-    if lsof -ti:8615 > /dev/null 2>&1; then
-        echo "⚠️  端口 8615 被占用，正在释放..."
-        lsof -ti:8615 | xargs kill -9 2>/dev/null || true
-        sleep 1
     fi
 
     mkdir -p "$LOG_DIR"
@@ -134,9 +144,20 @@ status() {
     fi
 }
 
+# 清理遗留的 tail 进程：避免多个 tail 同时跟随同一日志文件，
+# 导致同一条新日志被重复打印（"日志重复"的根因）。
+kill_old_tails() {
+    pgrep -f "tail.*$LOG_DIR/subhuti\.log" | xargs kill -9 2>/dev/null || true
+    sleep 0.2
+}
+
 logs() {
+    # 先清理旧的 tail，保证只有一个 tail 在跟随日志文件
+    kill_old_tails
     if [ -f "$LOG_DIR/subhuti.log" ]; then
-        tail -f "$LOG_DIR/subhuti.log"
+        # -n 0：不回溯历史行，只显示本次启动后的新日志，避免把历次启动遗留的
+        # "Server listening" 等旧日志一起打印出来，造成"日志重复"的错觉。
+        tail -n 0 -f "$LOG_DIR/subhuti.log"
     else
         echo "ℹ️  暂无日志"
     fi
@@ -159,15 +180,18 @@ case "${1:-start}" in
     start)      start ;;
     start-log)  start_log ;;
     stop)       stop ;;
+    stop-all)   stop_all ;;
     restart)    restart ;;
     status)     status ;;
     logs)       logs ;;
     test)       test_health ;;
     *)
-        echo "用法: ./dev.sh [build|start|start-log|stop|restart|status|logs|test]"
+        echo "用法: ./dev.sh [build|start|start-log|stop|stop-all|restart|status|logs|test]"
         echo ""
-        echo "  start       后台启动服务（默认）"
-        echo "  start-log   启动后持续查看日志（Ctrl+C 退出，服务继续运行）"
+        echo "  start       启动前先关闭所有 subhuti serve，再后台启动单一 8615 服务（默认）"
+        echo "  start-log   同 start，随后持续查看日志（Ctrl+C 退出，服务继续运行）"
+        echo "  stop        停止服务"
+        echo "  stop-all    关闭所有 subhuti serve 进程（含孤儿/多端口实例）"
         echo "  logs        查看已有服务的日志"
         exit 1
         ;;

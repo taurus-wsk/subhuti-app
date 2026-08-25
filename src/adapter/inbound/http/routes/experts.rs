@@ -26,18 +26,6 @@ pub async fn experts_list_handler(State(state): State<AppState>) -> impl IntoRes
     )
 }
 
-pub async fn experts_active_handler(State(state): State<AppState>) -> impl IntoResponse {
-    // 通过 ExpertQueryPort 获取当前激活的专家（返回 None = 未激活）
-    let active = state.expert_query_port.active_expert().await;
-    (
-        axum::http::StatusCode::OK,
-        Json(serde_json::json!({
-            "success": true,
-            "data": active,
-        })),
-    )
-}
-
 pub async fn experts_match_handler(
     State(state): State<AppState>,
     Json(req): Json<MatchExpertRequest>,
@@ -59,15 +47,6 @@ inventory::submit! {
         method: "GET",
         trace_enabled: false,
         register: |r| r.route("/subhuti/api/v1/experts", get(experts_list_handler)),
-    }
-}
-
-inventory::submit! {
-    RouteEntry {
-        path: "/subhuti/api/v1/experts/active",
-        method: "GET",
-        trace_enabled: false,
-        register: |r| r.route("/subhuti/api/v1/experts/active", get(experts_active_handler)),
     }
 }
 

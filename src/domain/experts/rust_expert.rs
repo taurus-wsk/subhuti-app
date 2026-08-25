@@ -289,28 +289,6 @@ impl RustExpert {
         result
     }
 
-    /// 格式化技能列表用于系统提示词
-    fn format_skills_for_prompt(&self) -> String {
-        let mut result =
-            String::from("## 你拥有以下技能（必须严格按照此列表回答，不要编造列表外的技能）：\n\n");
-
-        for skill in &self.skills {
-            result.push_str(&format!(
-                "- **{}** (ID: {}): {}\n",
-                skill.name, skill.id, skill.description
-            ));
-        }
-
-        result.push_str("\n### 强制要求：\n");
-        result.push_str("1. 必须用中文回答\n");
-        result.push_str(
-            "2. 当用户问「你有什么技能」时，必须逐个列出以上6个技能，每个技能都要包含ID和名称\n",
-        );
-        result.push_str("3. 格式必须是列表形式，如：- **自由对话** (ID: rust-chat)：描述\n");
-        result.push_str("4. 不要添加列表中不存在的技能\n");
-        result
-    }
-
     /// 第一层：通用 Rust 基础知识
     fn layer1_rust_basics(&self) -> String {
         r#"## 第一层：Rust 基础知识与最佳实践
@@ -498,7 +476,7 @@ src/
     /// 流程：生成计划 → 展示待办 → 创建代码 → 写入文件 → cargo check → 修复
     async fn skill_coding(
         &self,
-        mut exec_ctx: DomainExecutionContext,
+        exec_ctx: DomainExecutionContext,
         task: &str,
     ) -> DomainResult<String> {
         // ── 智能路由：判断是否为编码查询 ──────────────────────
@@ -1405,126 +1383,6 @@ src/
 
 // ─── 输入分类 ────────────────────────────────────────────────
 
-/// 检测输入是否为编码/技术请求
-///
-/// 通过关键词匹配判断用户意图，返回 false 表示走闲聊模式。
-/// 避免将"你好"、"你是谁"等非编码请求送入代码生成流程。
-fn is_coding_request(input: &str) -> bool {
-    let input_lower = input.to_lowercase();
-    let char_count = input.chars().count();
-
-    // 明确排除的闲聊/问候/身份陈述模式
-    let chat_patterns = [
-        "你好",
-        "您好",
-        "hello",
-        "hi ",
-        "你是谁",
-        "你叫什么",
-        "你能做什么",
-        "在吗",
-        "在不在",
-        "谢谢",
-        "感谢",
-        "再见",
-        "拜拜",
-        "bye",
-        "goodbye",
-        "早上好",
-        "下午好",
-        "晚上好",
-        "help",
-        "帮助",
-        "你是什么",
-        "who are you",
-        "what can you do",
-        // 身份相关（第一人称陈述/询问）
-        "我是",
-        "我叫",
-        "我名字",
-        "我的名字",
-        "我是谁",
-        "我叫什么",
-        "我是谁",
-        "介绍",
-        "自我介绍",
-        "认识",
-        "很高兴",
-        "见到",
-    ];
-    for p in &chat_patterns {
-        if input_lower.contains(p) {
-            return false;
-        }
-    }
-
-    // 编码/技术关键词（匹配任意一个即视为编码请求）
-    let code_keywords = [
-        "生成",
-        "写一个",
-        "实现",
-        "开发",
-        "创建",
-        "代码",
-        "函数",
-        "struct",
-        "impl",
-        "trait",
-        "enum",
-        "fn ",
-        "cargo",
-        "编译",
-        "重构",
-        "审查",
-        "修改",
-        "修复",
-        "bug",
-        "错误",
-        "报错",
-        "error",
-        "怎么",
-        "如何",
-        "怎样",
-        "什么",
-        "区别",
-        "对比",
-        "原理",
-        "架构",
-        "设计模式",
-        "六边形",
-        "async",
-        "tokio",
-        "serde",
-        "anyhow",
-        "thiserror",
-        "cli",
-        "web",
-        "http",
-        "api",
-        "数据库",
-        "sql",
-        "测试",
-        "test",
-        "性能",
-        "优化",
-        "配置",
-        "部署",
-    ];
-    for kw in &code_keywords {
-        if input_lower.contains(kw) {
-            return true;
-        }
-    }
-
-    // 默认：如果输入太短（<8个字符）且没有匹配到任何技术关键词，视为闲聊
-    if char_count < 8 {
-        return false;
-    }
-
-    // 较长输入默认视为技术问题
-    true
-}
-
 /// 判断是否为知识库/专家能力查询
 ///
 /// 当用户询问知识库内容、专家能力、系统设定等时，返回 true
@@ -1566,28 +1424,6 @@ fn is_knowledge_query(input: &str) -> bool {
     ];
 
     knowledge_keywords.iter().any(|kw| input_lower.contains(kw))
-}
-
-/// 判断是否为技能查询
-///
-/// 当用户询问专家拥有的技能、能力列表等时，返回 true
-fn is_skill_query(input: &str) -> bool {
-    let input_lower = input.to_lowercase();
-
-    let skill_keywords = [
-        "技能",
-        "skill",
-        "skills",
-        "会什么",
-        "能做什么",
-        "有什么",
-        "功能",
-        "能力列表",
-        "怎么用",
-        "使用方法",
-    ];
-
-    skill_keywords.iter().any(|kw| input_lower.contains(kw))
 }
 
 // ─── DomainExpert 实现 ──────────────────────────────────────────
@@ -1723,30 +1559,6 @@ mod tests {
         assert!(catalog.contains("Rust 基础知识"));
         assert!(catalog.contains("设计模式"));
         assert!(catalog.contains("编码规范"));
-    }
-
-    #[test]
-    fn test_is_coding_request() {
-        // 闲聊/问候 → 非编码请求
-        assert!(!is_coding_request("你好"));
-        assert!(!is_coding_request("你是谁"));
-        assert!(!is_coding_request("hello"));
-        assert!(!is_coding_request("谢谢"));
-        assert!(!is_coding_request("hi"));
-        // 身份陈述 → 非编码请求
-        assert!(!is_coding_request("我是张三"));
-        assert!(!is_coding_request("我叫李四"));
-        assert!(!is_coding_request("我的名字叫王五"));
-        assert!(!is_coding_request("我是谁"));
-        // 太短的输入 → 非编码请求
-        assert!(!is_coding_request("啊"));
-        assert!(!is_coding_request("ok"));
-        // 编码/技术请求 → 编码请求
-        assert!(is_coding_request("生成一个Rust函数"));
-        assert!(is_coding_request("帮我写一个web服务器"));
-        assert!(is_coding_request("如何实现async trait"));
-        assert!(is_coding_request("这个代码报错怎么修复"));
-        assert!(is_coding_request("Rust的六边形架构怎么设计"));
     }
 
     #[test]

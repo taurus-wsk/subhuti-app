@@ -9,7 +9,6 @@
 //! - **应用层**: 业务实现，使用 core 接口和 infra 实现
 
 pub mod common;
-pub mod component;
 pub mod engine;
 pub mod event;
 pub mod graph;
@@ -22,11 +21,6 @@ pub mod sutra_library;
 pub mod vertical;
 
 pub use common::types::CtxId;
-pub use component::{
-    Component, ComponentContext, ComponentLifecycle, ComponentRegistry, ComponentSlot,
-    ComponentState, ExecutionContext, ExpertAgentAdapter, GraphNodeComponentAdapter,
-    GuardrailAdapter, Pipeline, PipelineBuilder, ValidatorAdapter,
-};
 pub use engine::Subhuti;
 pub use event::{
     bus::EventBus,
@@ -36,9 +30,9 @@ pub use event::{
 };
 pub use graph::{
     ActorAddr, ActorHandle, ActorHealth, ActorLifecycle, ActorStats, Checkpoint, CheckpointStore,
-    ConditionalEdge, Edge, EventDrivenActor, EventDrivenScheduler, Graph, GraphBuilder, GraphError,
-    GraphNode, GraphOutput, GraphState, GraphStructure, MemoryCheckpointStore, NodeActor, NodeFn,
-    NodeMessage, NodeResult, Route, StateReducer, SupervisionStrategy, Supervisor,
+    ConditionalEdge, Edge, EventDrivenScheduler, Graph, GraphBuilder, GraphError, GraphNode,
+    GraphOutput, GraphState, GraphStructure, MemoryCheckpointStore, NodeActor, NodeFn, NodeMessage,
+    NodeResult, Route, StateReducer, SupervisionStrategy, Supervisor,
 };
 pub use memory::Memory;
 pub use observe::{
@@ -46,12 +40,14 @@ pub use observe::{
     TraceObserverPort, TraceStatus,
 };
 pub use orchestrator::{
-    execute_plan, generate_plan, parse_plan, Actor, ActorRegistry, AgentContext, AgentRegistry,
+    execute_plan, execute_plan_adaptive, generate_plan, parse_plan, parse_plan_or_ask, Actor,
+    ActorRegistry, AdaptiveOptions, AgentContext, AgentRegistry, AskRequest, BoxFuture,
     DefaultDispatchRule, DefaultExecutionRule, DefaultTaskAnalysisRule, DispatchPlan, DispatchRule,
     DispatchStrategy, EventBusRef, ExecutionResult, ExecutionRule, ExpertAgent,
     ExpertAgentActorAdapter, ExpertState, FrameworkExpertInfo, FromState, GraphOrchestrator, Llm,
-    MemoryRef, OrchestrationResult, Orchestrator, PlanStep, ResultStrategy, RuleConfig, RuleEngine,
-    SkillPlan, Step, TaskAnalysisRule, TaskProfile, TokenUsage,
+    LlmToolFallback, MemoryRef, OrchestrationResult, Orchestrator, PlanOrAsk, PlanStep,
+    ResultStrategy, RuleConfig, RuleEngine, SkillPlan, Step, StepFallback, TaskAnalysisRule,
+    TaskProfile, TokenUsage, ToolExecutor,
 };
 pub use runtime::{
     LLMConfig, LLMProvider, LLMResponse, Message, Role, Session, Tool, ToolCall, ToolCallResult,

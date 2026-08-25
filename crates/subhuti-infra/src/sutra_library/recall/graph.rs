@@ -477,7 +477,7 @@ impl EntityGraph {
                     }
 
                     if let Some(eid) = edge_to_update {
-                        if let Some(mut ew) = graph.edge_weight_mut(eid) {
+                        if let Some(ew) = graph.edge_weight_mut(eid) {
                             ew.weight = new_weight;
                         }
                     } else if !found {
@@ -555,7 +555,7 @@ impl EntityGraph {
                     .collect();
 
                 for eid in &learned_edge_ids {
-                    if let Some(mut ew) = graph.edge_weight_mut(*eid) {
+                    if let Some(ew) = graph.edge_weight_mut(*eid) {
                         ew.weight *= decay_factor;
                         if ew.weight <= 0.05 {
                             edges_to_remove.push(*eid);
@@ -622,7 +622,7 @@ impl EntityGraph {
                 if let Some(&idx) = indices.get(entity) {
                     let edge_ids: Vec<EdgeIndex> = graph.edges(idx).map(|e| e.id()).collect();
                     for eid in edge_ids {
-                        if let Some(mut ew) = graph.edge_weight_mut(eid) {
+                        if let Some(ew) = graph.edge_weight_mut(eid) {
                             match ew.kind {
                                 EdgeKind::Learned => {
                                     ew.weight = (ew.weight + delta * 0.5).clamp(0.0, 1.0);

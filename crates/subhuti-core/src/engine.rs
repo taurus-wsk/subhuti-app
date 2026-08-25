@@ -145,13 +145,8 @@ impl Subhuti {
         let state = self.build_expert_state();
 
         tracing::info!("[dispatch_with_context] 开始获取 orchestrator 锁");
-        let mut orchestrator = self.orchestrator.lock().await;
+        let orchestrator = self.orchestrator.lock().await;
         tracing::info!("[dispatch_with_context] 已获取 orchestrator 锁，开始执行 dispatch");
-
-        // 克隆必要的数据，以便在释放锁后继续执行
-        let input = ctx.input.clone();
-        let session = ctx.session.clone();
-        let metadata = ctx.metadata.clone();
 
         // 在锁内执行 dispatch（因为需要访问 orchestrator 内部状态）
         let result = orchestrator.dispatch(&mut ctx, &state).await;
@@ -224,10 +219,6 @@ impl Subhuti {
 
     // ─── 任务分析 & 专家匹配 ─────────────────────────────────────
 
-    pub fn active_expert_info(&self) -> Option<FrameworkExpertInfo> {
-        None
-    }
-
     /// 任务分析
     pub async fn analyze_task(&self, message: &str) -> serde_json::Value {
         let orchestrator = self.orchestrator.lock().await;
@@ -288,11 +279,6 @@ impl Subhuti {
     /// 获取专家快照列表
     pub async fn list_orchestrator_experts(&self) -> Vec<FrameworkExpertInfo> {
         self.orchestrator.lock().await.list_expert_snapshots()
-    }
-
-    /// 获取真实 Agent 列表
-    pub async fn get_orchestrator_agents(&self) -> Vec<Arc<dyn ExpertAgent>> {
-        self.orchestrator.lock().await.list_experts()
     }
 
     /// 通过技能 ID 查找所属专家

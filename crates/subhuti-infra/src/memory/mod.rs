@@ -19,7 +19,6 @@ mod knowledge;
 pub mod knowledge_graph;
 pub mod layers;
 mod long_term;
-pub mod palace_graph;
 mod short_term;
 pub mod storage;
 
@@ -34,7 +33,6 @@ pub use knowledge::KnowledgeMemory;
 pub use knowledge_graph::{KnowledgeGraph, KnowledgeGraphStats, QueryDirection, Triple};
 pub use layers::{LayerOutput, MemoryLayerConfig, MemoryStack};
 pub use long_term::LongTermMemory;
-pub use palace_graph::{Hallway, PalaceGraph, PalaceGraphStats, Room, Tunnel, Wing};
 pub use short_term::ShortTermMemory;
 pub use storage::{
     Database, DbConfig, FeedbackRow, HistoryRow, MemoryRow, PersonaData, PersonaRow,
@@ -157,7 +155,6 @@ pub struct Memory {
     convo_miner: ConvoMiner,
     hybrid_searcher: HybridSearcher,
     deduplicator: Deduplicator,
-    palace_graph: Arc<RwLock<PalaceGraph>>,
     memory_stack: MemoryStack,
     knowledge_graph: RwLock<Option<Arc<KnowledgeGraph>>>,
 }
@@ -187,7 +184,6 @@ impl Clone for Memory {
             convo_miner: self.convo_miner.clone(),
             hybrid_searcher: self.hybrid_searcher.clone(),
             deduplicator: self.deduplicator.clone(),
-            palace_graph: Arc::clone(&self.palace_graph),
             memory_stack: self.memory_stack.clone(),
             knowledge_graph: RwLock::new(self.knowledge_graph()),
         }
@@ -214,7 +210,6 @@ impl Memory {
             convo_miner: ConvoMiner::new(),
             hybrid_searcher: HybridSearcher::default(),
             deduplicator: Deduplicator::new(DedupConfig::default()),
-            palace_graph: Arc::new(RwLock::new(PalaceGraph::new())),
             memory_stack: MemoryStack::new(MemoryLayerConfig::default()),
             knowledge_graph: RwLock::new(None),
         }
@@ -284,10 +279,6 @@ impl Memory {
 
     pub fn deduplicator(&self) -> &Deduplicator {
         &self.deduplicator
-    }
-
-    pub fn palace_graph(&self) -> &Arc<RwLock<PalaceGraph>> {
-        &self.palace_graph
     }
 
     pub fn memory_stack(&self) -> &MemoryStack {

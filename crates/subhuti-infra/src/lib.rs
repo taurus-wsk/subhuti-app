@@ -32,12 +32,11 @@ pub use memory::{
     BaseStats, ConnectionDynamics, ConvoExchange, ConvoMiner, Database, DatabaseStore, DbConfig,
     DedupConfig, DedupResult, Deduplicator, DefaultMemory, EmbeddingConfig, EmbeddingService,
     Entity, EntityExtractor, EntityRegistry, EntitySource, EntityType, FactChecker, FactIssue,
-    FeedbackRow, Hallway, HistoryRow, HybridSearchResult, HybridSearcher, IssueType, KeepStrategy,
+    FeedbackRow, HistoryRow, HybridSearchResult, HybridSearcher, IssueType, KeepStrategy,
     KnowledgeGraph, KnowledgeGraphStats, KnowledgeMemory, LayerOutput, LongTermMemory, Memory,
     MemoryConfig, MemoryItem, MemoryLayer, MemoryLayerConfig, MemoryRow, MemoryStack, MemoryStats,
-    MemoryStore, MinedMemory, PalaceGraph, PalaceGraphStats, PersonaData, PersonaRow,
-    QueryDirection, Room, SearchResult, SemanticSearchResult, ShortTermMemory, SqliteMemoryStore,
-    Triple, Tunnel, Wing,
+    MemoryStore, MinedMemory, PersonaData, PersonaRow, QueryDirection, SearchResult,
+    SemanticSearchResult, ShortTermMemory, SqliteMemoryStore, Triple,
 };
 pub use tool::{CalculatorTool, FileReadTool, FileWriteTool, WeatherTool, WebSearchTool};
 pub use vertical::{

@@ -136,7 +136,6 @@ pub struct SearchFilters {
 /// Tantivy 全文检索引擎
 pub struct TantivyIndex {
     index: Index,
-    schema: Schema,
     // 字段引用
     node_id: Field,
     title: Field,
@@ -157,7 +156,7 @@ impl TantivyIndex {
     pub fn new_in_ram() -> Self {
         let (schema, fields) = Self::build_schema();
         let index = Index::create_in_ram(schema.clone());
-        Self::init_index(index, schema, fields)
+        Self::init_index(index, fields)
     }
 
     /// 创建磁盘持久化索引
@@ -168,7 +167,7 @@ impl TantivyIndex {
     ) -> Result<Self, tantivy::TantivyError> {
         let (schema, fields) = Self::build_schema();
         let index = Index::create_in_dir(dir_path, schema.clone())?;
-        Ok(Self::init_index(index, schema, fields))
+        Ok(Self::init_index(index, fields))
     }
 
     /// 构建 Schema
@@ -294,7 +293,7 @@ impl TantivyIndex {
     }
 
     /// 初始化索引（注册分词器、创建写入器）
-    fn init_index(index: Index, schema: Schema, fields: TantivyFields) -> Self {
+    fn init_index(index: Index, fields: TantivyFields) -> Self {
         // 注册 jieba 中文分词器（用于 TEXT 字段）
         let tokenizer = TextAnalyzer::from(JiebaTokenizer::new());
         index.tokenizers().register("jieba", tokenizer);
@@ -309,7 +308,6 @@ impl TantivyIndex {
 
         Self {
             index,
-            schema,
             node_id: fields.node_id,
             title: fields.title,
             content: fields.content,
@@ -346,7 +344,7 @@ impl TantivyIndex {
             self.entity_ids => entity_ids_str.as_str(),
         );
 
-        let mut writer = self.writer.write().unwrap();
+        let writer = self.writer.write().unwrap();
         // 先删除旧文档（幂等更新），再添加新文档
         let term = tantivy::Term::from_field_text(self.node_id, &node.node_id);
         let _ = writer.delete_term(term);

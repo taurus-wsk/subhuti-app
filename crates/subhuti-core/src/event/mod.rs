@@ -37,7 +37,6 @@
 pub mod bus;
 pub mod handler;
 pub mod recorder;
-pub mod replay;
 pub mod types;
 
 pub use bus::{EventBus, EventBusConfig};
@@ -46,5 +45,4 @@ pub use recorder::{
     EventPlayer, EventRecorder, Recording, ReplayError, ReplayResult, ReplayStats, ReplayStrategy,
     TimelineEntry,
 };
-pub use replay::{replay_with_retry, replay_with_retry_async, ReplayConfig};
 pub use types::{AgentEventData, Event, EventId, EventMetadata, EventTimestamp};

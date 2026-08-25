@@ -37,11 +37,6 @@ pub trait ExpertRepositoryPort: Send + Sync + 'static {
         expert: Arc<dyn DomainExpert>,
         repository: Arc<dyn DomainRepository>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
-
-    /// 获取当前激活的专家（返回 None = 未激活）
-    fn active_expert(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<ExpertInfo>> + Send>>;
 }
 
 /// 编排引擎端口（出站端口）

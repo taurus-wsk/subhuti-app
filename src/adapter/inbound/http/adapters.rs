@@ -189,11 +189,24 @@ fn stream_to_sse(
                     }).to_string();
                     yield Ok(Event::default().data(json));
                 }
-                StreamEvent::Step { message, expert } => {
-                    let json = serde_json::json!({
+                StreamEvent::Step { message, expert, todo_state } => {
+                    let mut payload = serde_json::json!({
                         "type": "step",
                         "message": message,
                         "expert": expert,
+                    });
+                    if let Some(ts) = todo_state {
+                        payload.as_object_mut()
+                            .map(|o| o.insert("todo_state".into(), ts.into()));
+                    }
+                    yield Ok(Event::default().data(payload.to_string()));
+                }
+                StreamEvent::Ask { ask_id, question, options } => {
+                    let json = serde_json::json!({
+                        "type": "ask",
+                        "ask_id": ask_id,
+                        "question": question,
+                        "options": options,
                     }).to_string();
                     yield Ok(Event::default().data(json));
                 }
@@ -440,6 +453,42 @@ inventory::submit! {
         method: "GET",
         trace_enabled: false,
         register: |r| r.route("/subhuti/api/v1/orchestrate/experts", get(orchestrate_experts_handler)),
+    }
+}
+
+// ─── Ask Resolve 路由 ───────────────────────────────────────────
+
+/// POST /subhuti/api/v1/ask-resolve（主动提问的答复投递）
+///
+/// 前端在单选卡片上点击选项后调用，把 `ask_id` + `answer` 投递给正在
+/// 等待该提问答复的专家执行协程，唤醒后带着答复继续规划/执行。
+#[derive(Debug, serde::Deserialize)]
+pub struct AskResolveRequest {
+    /// 要答复的提问 ID（来自 Ask SSE 事件）
+    pub ask_id: String,
+    /// 用户选择的选项文本
+    pub answer: String,
+}
+
+async fn ask_resolve_handler(Json(req): Json<AskResolveRequest>) -> impl IntoResponse {
+    let resolved = crate::domain::pending_ask::resolve(&req.ask_id, req.answer.clone());
+    if resolved {
+        ApiSuccess::ok(serde_json::json!({
+            "status": "resolved",
+            "ask_id": req.ask_id,
+        }))
+        .into_response()
+    } else {
+        ApiError::not_found(format!("未找到挂起的提问: {}", req.ask_id)).into_response()
+    }
+}
+
+inventory::submit! {
+    RouteEntry {
+        path: "/subhuti/api/v1/ask-resolve",
+        method: "POST",
+        trace_enabled: false,
+        register: |r| r.route("/subhuti/api/v1/ask-resolve", post(ask_resolve_handler)),
     }
 }
 

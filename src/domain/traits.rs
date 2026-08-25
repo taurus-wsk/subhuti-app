@@ -196,7 +196,9 @@ pub trait DomainExpert: Send + Sync {
             &format!("🔍 {} 正在分析需求，制定执行计划...", expert_name),
         );
 
-        // 2. 让引擎 planner 用 LLM 生成执行计划
+        // 2. 让引擎 planner 用 LLM 生成执行计划。
+        //    规划器可能返回「执行计划」或「提问」，若是提问则通过主动提问机制阻塞等待用户答复，
+        //    把答复拼回输入后再次规划，直到得到明确的执行计划（信息收齐后再执行）。
         let skill_infos: Vec<subhuti_core::orchestrator::SkillInfo> = skills
             .iter()
             .map(|s| subhuti_core::orchestrator::SkillInfo {
@@ -211,14 +213,70 @@ pub trait DomainExpert: Send + Sync {
             .engine_llm
             .clone()
             .ok_or_else(|| DomainError::LlmError("缺少引擎 LLM，无法进行计划规划".to_string()))?;
-        let plan = subhuti_core::orchestrator::planner::generate_plan(
-            &engine_llm,
-            &input,
-            &skill_infos,
-            &expert_name,
-        )
-        .await
-        .map_err(|e| DomainError::LlmError(e.to_string()))?;
+
+        let progress_tx = exec_ctx.progress_tx.clone();
+        let mut planning_input = input.clone();
+        // 主动提问轮次上限：避免 LLM 反复要求提问（或前端未答复）导致无限循环。
+        // 一旦超过上限，追加指令强制不再提问、直接基于已有信息产出执行计划。
+        const MAX_ASK_ROUNDS: u32 = 2;
+        let mut ask_rounds: u32 = 0;
+        let plan = loop {
+            match subhuti_core::orchestrator::planner::generate_plan(
+                &engine_llm,
+                &planning_input,
+                &skill_infos,
+                &expert_name,
+            )
+            .await
+            .map_err(|e| DomainError::LlmError(e.to_string()))?
+            {
+                subhuti_core::orchestrator::PlanOrAsk::Plan(p) => break p,
+                subhuti_core::orchestrator::PlanOrAsk::Ask(ask) => {
+                    ask_rounds += 1;
+                    if ask_rounds > MAX_ASK_ROUNDS {
+                        tracing::warn!(
+                            "[plan_and_execute] 专家={} 提问次数超过上限({})，强制停止提问直接规划",
+                            expert_name,
+                            MAX_ASK_ROUNDS
+                        );
+                        planning_input =
+                            format!("{}（请直接给出执行计划，不要提问）", planning_input);
+                        continue;
+                    }
+                    tracing::info!(
+                        "[plan_and_execute] 专家={} 触发主动提问: {}",
+                        expert_name,
+                        ask.question
+                    );
+                    // 阻塞等待用户答复（前端单选卡片 → /ask-resolve 投递）
+                    let answer = crate::domain::pending_ask::ask_user(
+                        &progress_tx,
+                        &ask.question,
+                        ask.options.clone(),
+                    )
+                    .await;
+                    if answer.is_empty() {
+                        tracing::warn!(
+                            "[plan_and_execute] 专家={} 提问超时/无答复，跳过本次提问继续规划",
+                            expert_name
+                        );
+                        // 超时无答复：设置标记避免再次卡在同一提问，直接继续
+                        planning_input = format!(
+                            "{}（用户未答复上述提问，请基于已有信息直接规划）",
+                            planning_input
+                        );
+                    } else {
+                        // 把答复拼回输入，带着答复再次进入规划
+                        planning_input = format!(
+                            "{}\n\n用户选择: {}\n{}",
+                            planning_input,
+                            answer,
+                            ask.context.clone().unwrap_or_default()
+                        );
+                    }
+                }
+            }
+        };
 
         tracing::info!(
             "[plan_and_execute] 生成计划: description={}, steps={:?}",
@@ -229,36 +287,96 @@ pub trait DomainExpert: Send + Sync {
                 .collect::<Vec<_>>()
         );
 
-        // 3. 让引擎 execute_plan 驱动循环执行（含进度回传 + 结果注入 + 汇总）
-        let progress_tx = exec_ctx.progress_tx.clone();
-        let summary = subhuti_core::orchestrator::planner::execute_plan(
-            &expert_name,
-            &plan,
-            move |msg: &str| send_progress(&progress_tx, msg),
-            |skill_id, params, prev_input: &str| {
-                let skill_id_owned = skill_id.to_string();
-                let params_owned = params.to_string();
-                let skill_exec_ctx = DomainExecutionContext {
-                    ctx: DomainContext {
-                        input: prev_input.to_string(),
-                        system_prompt: exec_ctx.ctx.system_prompt.clone(),
-                        ..exec_ctx.ctx.clone()
-                    },
-                    skill_id: Some(skill_id_owned.clone()),
-                    skill_params: Some(params_owned.clone()),
-                    ..exec_ctx.clone()
-                };
-                let expert = self;
-                async move {
-                    expert
-                        .execute_skill(&skill_id_owned, &params_owned, skill_exec_ctx)
-                        .await
-                        .map_err(|e| subhuti_core::Error::Expert(e.to_string()))
-                }
-            },
-        )
-        .await
-        .map_err(|e| DomainError::LlmError(e.to_string()))?;
+        // 若 planner 判定无需执行任何技能（0 步骤，典型如问候语/普通对话），
+        // 不再空跑执行链（否则会输出「共执行 0 个步骤」），而是退化为 LLM 直接对话回答。
+        if plan.steps.is_empty() {
+            send_progress(
+                &exec_ctx.progress_tx,
+                &format!("💬 {} 正在回答...", expert_name),
+            );
+            tracing::info!(
+                "[plan_and_execute] 专家={} 计划为空(0 步骤)，退化为直接对话回答",
+                expert_name
+            );
+            let mut msgs = exec_ctx.ctx.history.clone();
+            msgs.push(DomainMessage {
+                role: DomainRole::System,
+                content: format!(
+                    "你是{}，请以该专家的身份直接、自然、简洁地回答用户。",
+                    expert_name
+                ),
+            });
+            msgs.push(DomainMessage {
+                role: DomainRole::User,
+                content: input.clone(),
+            });
+            let answer = exec_ctx.llm.chat(msgs).await?;
+            send_progress(
+                &exec_ctx.progress_tx,
+                &format!("✅ {} 回答完成", expert_name),
+            );
+            return Ok(answer);
+        }
+
+        // 3. 进入自适应执行链：L1 常态 → L2 反馈重试 → L3 领域层降级兜底。
+        //    L3 由领域层自实现 StepFallback（tool_fallback::DomainLlmFallback）提供：
+        //    它与普通技能共享同一套上下文，直接完成失败步骤并输出与普通技能一致的结果，
+        //    有 port 时附带文件/命令工具，否则纯文本兜底，且绝不触发递归。
+        let fallback = crate::domain::tool_fallback::assemble_fallback(&exec_ctx, &expert_name);
+
+        // 用引擎 LLM 编排出的步骤构造「待办清单」，先以未完成态推给前端，
+        // 让用户在执行前就能看到一步步待办，随后随执行逐个打勾推进（进度式显示）。
+        let total_steps = plan.steps.len();
+        let base_todo: Vec<String> = plan
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("- [ ] {}. [{}] {}", i + 1, s.skill_id, s.description))
+            .collect();
+        send_struct_progress(&progress_tx, "plan", &base_todo.join("\n"), 0, total_steps);
+
+        let mut run_step = |skill_id: &str, params: &str, prev_input: &str| {
+            let skill_id_owned = skill_id.to_string();
+            let params_owned = params.to_string();
+            let skill_exec_ctx = DomainExecutionContext {
+                ctx: DomainContext {
+                    input: prev_input.to_string(),
+                    system_prompt: exec_ctx.ctx.system_prompt.clone(),
+                    ..exec_ctx.ctx.clone()
+                },
+                skill_id: Some(skill_id_owned.clone()),
+                skill_params: Some(params_owned.clone()),
+                ..exec_ctx.clone()
+            };
+            let expert = self;
+            async move {
+                expert
+                    .execute_skill(&skill_id_owned, &params_owned, skill_exec_ctx)
+                    .await
+                    .map_err(|e| subhuti_core::Error::Expert(e.to_string()))
+            }
+        };
+
+        let summary = match fallback {
+            Some(fb) => subhuti_core::orchestrator::execute_plan_adaptive(
+                &expert_name,
+                &plan,
+                &subhuti_core::orchestrator::AdaptiveOptions::default(),
+                &*fb,
+                move |msg: &str| send_progress(&progress_tx, msg),
+                &mut run_step,
+            )
+            .await
+            .map_err(|e| DomainError::LlmError(e.to_string()))?,
+            None => subhuti_core::orchestrator::planner::execute_plan(
+                &expert_name,
+                &plan,
+                move |msg: &str| send_progress(&progress_tx, msg),
+                &mut run_step,
+            )
+            .await
+            .map_err(|e| DomainError::LlmError(e.to_string()))?,
+        };
 
         tracing::info!("[plan_and_execute] 专家={} 执行完成", expert_name);
 
@@ -271,6 +389,29 @@ fn send_progress(tx: &Option<mpsc::Sender<String>>, message: &str) {
     if let Some(sender) = tx {
         let _ = sender.try_send(message.to_string());
     }
+}
+
+/// 推送结构化进度事件（前端 SSE 渲染的关键载荷）
+///
+/// - `type = "plan"`：待办清单（消息体为 `- [ ]` markdown），前端据此渲染待办列表
+/// - `type = "step"`：步骤进度，`done_count`/`total_count` 被编排层拼成 `(done/total)`
+fn send_struct_progress(
+    tx: &Option<mpsc::Sender<String>>,
+    type_name: &str,
+    message: &str,
+    done: usize,
+    total: usize,
+) {
+    send_progress(
+        tx,
+        &serde_json::json!({
+            "type": type_name,
+            "message": message,
+            "done_count": done,
+            "total_count": total,
+        })
+        .to_string(),
+    );
 }
 
 /// 领域 LLM 接口（纯领域类型）

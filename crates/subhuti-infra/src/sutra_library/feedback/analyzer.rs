@@ -19,12 +19,12 @@
 //!  petgraph 更新 Learned 边权重 → PG 持久化
 
 use crate::sutra_library::feedback::data_models::{
-    ExecutionLog, FeedbackConfig, FeedbackMetrics, FeedbackResult, RecallChunkInfo,
+    ExecutionLog, FeedbackConfig, FeedbackMetrics, FeedbackResult,
     CREATE_EXECUTION_LOGS_INDEX_DOMAIN, CREATE_EXECUTION_LOGS_INDEX_TS,
     CREATE_EXECUTION_LOGS_TABLE, CREATE_FEEDBACK_METRICS_INDEX_GRAPH,
-    CREATE_FEEDBACK_METRICS_TABLE, EXECUTION_LOGS_TABLE, FEEDBACK_METRICS_TABLE,
+    CREATE_FEEDBACK_METRICS_TABLE,
 };
-use crate::sutra_library::recall::{EntityGraph, EntityUuid, RetrieveSource};
+use crate::sutra_library::recall::{EntityGraph, EntityUuid};
 use crate::sutra_library::storage::PgStorage;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
@@ -520,6 +520,7 @@ impl FeedbackAnalyzer {
         pg: &PgStorage,
         limit: usize,
     ) -> anyhow::Result<Vec<ExecutionLog>> {
+        use crate::sutra_library::feedback::data_models::RecallChunkInfo;
         let pool = &**pg.pool();
         let rows = sqlx::query_as::<_, PgExecutionLogRow>(
             r#"
@@ -688,6 +689,8 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sutra_library::feedback::data_models::RecallChunkInfo;
+    use crate::sutra_library::recall::RetrieveSource;
     use crate::sutra_library::EntityGraph;
 
     fn make_test_log(chunk_ids: Vec<String>, success: bool) -> ExecutionLog {

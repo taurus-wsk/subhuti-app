@@ -403,7 +403,11 @@ impl LLM for OpenAIClient {
         let response = ensure_http_success(response).await?;
 
         let result: OpenAICompletionResponse = response.json().await.map_err(map_reqwest_error)?;
-        Ok(result.choices[0].message.content.clone())
+        Ok(result.choices[0]
+            .message
+            .content
+            .clone()
+            .unwrap_or_default())
     }
 
     async fn chat_with_tools(
@@ -448,7 +452,7 @@ impl LLM for OpenAIClient {
         let message = &result.choices[0].message;
 
         Ok(LLMResponse {
-            content: message.content.clone(),
+            content: message.content.clone().unwrap_or_default(),
             tool_call: message.tool_calls.as_ref().and_then(|calls| {
                 calls.first().map(|c| ToolCall {
                     id: c.id.clone(),
@@ -569,7 +573,10 @@ struct OpenAICompletionChoice {
 #[allow(dead_code)]
 struct OpenAICompletionMessage {
     role: String,
-    content: String,
+    /// 可能为 null/缺失（模型只返回 tool_calls 时不带 content）
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
     tool_calls: Option<Vec<OpenAIToolCall>>,
 }
 
@@ -1141,7 +1148,11 @@ impl LLM for ZhipuClient {
             .map_err(map_reqwest_error)?;
 
         let result: ZhipuCompletionResponse = parse_zhipu_json(response).await?;
-        Ok(result.choices[0].message.content.clone())
+        Ok(result.choices[0]
+            .message
+            .content
+            .clone()
+            .unwrap_or_default())
     }
 
     async fn chat_with_tools(
@@ -1185,7 +1196,7 @@ impl LLM for ZhipuClient {
         let message = &result.choices[0].message;
 
         Ok(LLMResponse {
-            content: message.content.clone(),
+            content: message.content.clone().unwrap_or_default(),
             tool_call: message.tool_calls.as_ref().and_then(|calls| {
                 calls.first().map(|c| ToolCall {
                     id: c.id.clone(),
@@ -1328,7 +1339,10 @@ struct ZhipuCompletionChoice {
 #[allow(dead_code)]
 struct ZhipuCompletionMessage {
     role: String,
-    content: String,
+    /// 可能为 null/缺失（模型只返回 tool_calls 时不带 content）
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
     tool_calls: Option<Vec<ZhipuToolCall>>,
 }
 

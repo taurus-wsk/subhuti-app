@@ -74,14 +74,4 @@ impl ExpertRepositoryPort for SubhutiExpertRepository {
             subhuti.register_orchestrator_expert(framework_expert).await;
         })
     }
-
-    fn active_expert(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<ExpertInfo>> + Send>> {
-        let subhuti = self.subhuti.clone();
-        Box::pin(async move {
-            // active_expert_info 返回 Option<FrameworkExpertInfo>（None = 未激活专家，语义合法）
-            subhuti.active_expert_info().map(framework_to_app_expert)
-        })
-    }
 }

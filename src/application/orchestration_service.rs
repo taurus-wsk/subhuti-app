@@ -225,6 +225,7 @@ impl ChatPort for OrchestrationService {
                     } else {
                         None
                     },
+                    todo_state: None,
                 })
                 .await;
 
@@ -275,14 +276,34 @@ impl ChatPort for OrchestrationService {
                                             }).await;
                                         }
                                     }
+                                    Some("ask") => {
+                                        // 主动提问：透传给前端渲染单选卡片，ask_id 用于 /ask-resolve
+                                        let ask_id = progress_json.get("ask_id").and_then(|m| m.as_str()).unwrap_or_default().to_string();
+                                        let question = progress_json.get("question").and_then(|m| m.as_str()).unwrap_or_default().to_string();
+                                        let options = progress_json
+                                            .get("options")
+                                            .and_then(|m| m.as_array())
+                                            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                                            .unwrap_or_default();
+                                        let _ = tx.send(StreamEvent::Ask {
+                                            ask_id,
+                                            question,
+                                            options,
+                                        }).await;
+                                    }
                                     Some("step") => {
                                         let step_msg = progress_json.get("message").and_then(|m| m.as_str()).unwrap_or("执行中");
                                         let done_count = progress_json.get("done_count").and_then(|m| m.as_u64()).unwrap_or(0);
                                         let total_count = progress_json.get("total_count").and_then(|m| m.as_u64()).unwrap_or(0);
+                                        let todo_state = progress_json
+                                            .get("todo_state")
+                                            .and_then(|m| m.as_str())
+                                            .map(|s| s.to_string());
 
                                         let _ = tx.send(StreamEvent::Step {
                                             message: format!("{} ({}/{})", step_msg, done_count, total_count),
                                             expert: Some("rust-expert".to_string()),
+                                            todo_state,
                                         }).await;
                                     }
                                     _ => {}
@@ -299,7 +320,6 @@ impl ChatPort for OrchestrationService {
                             std::future::pending().await
                         }
                     } => {
-                        response_handle = None; // 标记已完成
                         match result {
                             Ok(response) => break response,
                             Err(e) => {
@@ -335,6 +355,7 @@ impl ChatPort for OrchestrationService {
                             .send(StreamEvent::Step {
                                 message: step_msg.to_string(),
                                 expert: Some("rust-expert".to_string()),
+                                todo_state: None,
                             })
                             .await;
                     }
@@ -357,6 +378,7 @@ impl ChatPort for OrchestrationService {
                                     .unwrap_or(&"".to_string())
                                     .clone(),
                             ),
+                            todo_state: None,
                         })
                         .await;
                 }
@@ -396,13 +418,6 @@ impl ExpertQueryPort for OrchestrationService {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<ExpertInfo>> + Send>> {
         let repo = self.expert_repository.clone();
         Box::pin(async move { repo.get_all().await })
-    }
-
-    fn active_expert(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<ExpertInfo>> + Send>> {
-        let repo = self.expert_repository.clone();
-        Box::pin(async move { repo.active_expert().await })
     }
 
     fn match_expert(

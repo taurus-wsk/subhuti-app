@@ -11,7 +11,6 @@
 use crate::sutra_library::feedback::data_models::RecallChunkInfo;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 // ─── LLM 自省打分结果 ───────────────────────────────────────
 
@@ -163,6 +162,7 @@ impl Default for LlmScorer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sutra_library::recall::RetrieveSource;
 
     #[test]
     fn test_should_sample() {
@@ -243,5 +243,3 @@ mod tests {
         assert_eq!(updated[0].llm_reason, Some("高度相关".to_string()));
     }
 }
-
-use crate::sutra_library::recall::RetrieveSource;

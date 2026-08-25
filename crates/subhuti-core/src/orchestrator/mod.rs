@@ -1,7 +1,7 @@
 pub mod actor;
+pub mod adaptive;
 pub mod planner;
 pub mod rule_engine;
-pub mod strategies;
 
 // ──────────────────────────────────────────────────────────────
 // 架构概念澄清
@@ -51,8 +51,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 pub use self::actor::{Actor, ActorRegistry, ExpertAgentActorAdapter};
-pub use self::planner::{execute_plan, generate_plan, parse_plan, PlanStep, SkillPlan};
-use self::strategies::{SemanticCandidate, SemanticRouter};
+pub use self::planner::{
+    execute_plan, generate_plan, parse_plan, parse_plan_or_ask, AskRequest, PlanOrAsk, PlanStep,
+    SkillPlan,
+};
 use crate::event::{AgentEventData, EventBus};
 use crate::graph::{Graph, GraphOutput, GraphState};
 use crate::memory::Memory;
@@ -60,6 +62,9 @@ use crate::runtime::llm::{Role, LLM};
 use crate::runtime::session::Session;
 use crate::sutra_library::SutraLibraryPort;
 use crate::vertical::{AssetLibrary, ProjectMemory, ToolRegistry, WorkflowStore};
+pub use adaptive::{
+    execute_plan_adaptive, AdaptiveOptions, BoxFuture, LlmToolFallback, StepFallback, ToolExecutor,
+};
 pub use rule_engine::{
     DefaultDispatchRule, DefaultExecutionRule, DefaultTaskAnalysisRule, DispatchPlan, DispatchRule,
     DispatchStrategy, ExecutionResult, ExecutionRule, ResultStrategy, RuleConfig, RuleEngine, Step,
@@ -359,7 +364,6 @@ pub struct Orchestrator {
     agent_registry: AgentRegistry,
     graph_registry: GraphRegistry,
     event_bus: Option<Arc<EventBus>>,
-    semantic_router: SemanticRouter,
     rule_engine: RuleEngine,
     /// 全局演员池（Actor 竞标制）
     actor_registry: ActorRegistry,
@@ -371,7 +375,6 @@ impl Orchestrator {
             agent_registry: AgentRegistry::new(),
             graph_registry: GraphRegistry::new(),
             event_bus: None,
-            semantic_router: SemanticRouter::new_disabled(),
             rule_engine: RuleEngine::with_defaults(),
             actor_registry: ActorRegistry::new(),
         }
@@ -379,11 +382,6 @@ impl Orchestrator {
 
     pub fn with_event_bus(mut self, bus: Arc<EventBus>) -> Self {
         self.event_bus = Some(bus);
-        self
-    }
-
-    pub fn with_semantic_router(mut self, router: SemanticRouter) -> Self {
-        self.semantic_router = router;
         self
     }
 
@@ -468,6 +466,24 @@ impl Orchestrator {
         )
         .await;
 
+        // 用户显式指定了专家：优先直接调度该专家（计划+技能执行），
+        // 避免被语义图路由截获后，图的每个节点又对「原始输入」整体重跑整个专家
+        //，导致 N 次递归重规划（plan_and_execute 叠加）与重复写文件。
+        if let Some(expert_id) = ctx.metadata.get("expert_id") {
+            if let Some(actor) = self.actor_registry.get_by_id(expert_id) {
+                tracing::debug!("用户指定专家: {} → 直接调度 Actor（跳过图路由）", expert_id);
+                let _ = self
+                    .emit_event(
+                        ctx,
+                        AgentEventData::UserMessage {
+                            message: input.clone(),
+                        },
+                    )
+                    .await;
+                return self.dispatch_via_actor(ctx, state, actor).await;
+            }
+        }
+
         // 优先使用指定图（从 ctx.metadata 中获取）
         let result = if let Some(graph_name) = ctx.metadata.get("graph_name") {
             if let Some(graph) = self.graph_registry.get(graph_name) {
@@ -539,12 +555,8 @@ impl Orchestrator {
     ) -> OrchestrationResult {
         let input = &ctx.input.clone();
 
-        // 图匹配：优先语义路由，其次关键词匹配
-        let matched_graph = self.try_semantic_graph_routing(input).await;
-        let matched_graph = match matched_graph {
-            Some(graph) => Some(graph),
-            None => self.graph_registry.find_matching_graph(input).await,
-        };
+        // 图匹配：关键词匹配（语义路由已废弃移除）
+        let matched_graph = self.graph_registry.find_matching_graph(input).await;
 
         match matched_graph {
             Some(graph) => {
@@ -755,31 +767,6 @@ impl Orchestrator {
             }
         }
     }
-
-    async fn try_semantic_graph_routing(&self, input: &str) -> Option<Arc<Graph>> {
-        if !self.semantic_router.enabled() {
-            return None;
-        }
-        let candidates = self.graph_registry.list_candidates();
-        if candidates.is_empty() {
-            return None;
-        }
-        if let Some(result) = self
-            .semantic_router
-            .match_candidate(input, candidates)
-            .await
-        {
-            tracing::debug!(
-                "语义路由匹配图: {} (置信度: {:.2}) - {}",
-                result.target_id,
-                result.confidence,
-                result.reasoning
-            );
-            self.graph_registry.get_by_id(&result.target_id)
-        } else {
-            None
-        }
-    }
 }
 
 pub struct AgentRegistry {
@@ -815,18 +802,6 @@ impl AgentRegistry {
 
         matched.sort_by_key(|b| std::cmp::Reverse(b.1));
         matched.into_iter().map(|(a, _)| a).collect()
-    }
-
-    pub fn list_candidates(&self) -> Vec<SemanticCandidate> {
-        self.agents
-            .values()
-            .map(|agent| SemanticCandidate {
-                id: agent.id().to_string(),
-                name: agent.name().to_string(),
-                description: format!("专家: {}", agent.name()),
-                tags: agent.tags().to_vec(),
-            })
-            .collect()
     }
 
     pub fn get_by_id(&self, id: &str) -> Option<Arc<dyn ExpertAgent>> {
@@ -1007,19 +982,6 @@ impl GraphRegistry {
 
         // 避免无关键词匹配时错误兜底到第一个图
         None
-    }
-
-    pub fn list_candidates(&self) -> Vec<SemanticCandidate> {
-        let graphs = self.graphs.read().unwrap();
-        graphs
-            .values()
-            .map(|graph| SemanticCandidate {
-                id: graph.name().to_string(),
-                name: graph.name().to_string(),
-                description: format!("工作流: {}", graph.name()),
-                tags: Vec::new(),
-            })
-            .collect()
     }
 
     pub fn get_by_id(&self, id: &str) -> Option<Arc<Graph>> {

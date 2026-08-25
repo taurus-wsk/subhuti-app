@@ -48,8 +48,8 @@ pub mod state;
 pub mod validator;
 
 pub use actor::{
-    ActorAddr, ActorHandle, ActorHealth, ActorLifecycle, ActorStats, EventDrivenActor,
-    EventDrivenScheduler, NodeActor, NodeMessage, SupervisionStrategy, Supervisor,
+    ActorAddr, ActorHandle, ActorHealth, ActorLifecycle, ActorStats, EventDrivenScheduler,
+    NodeActor, NodeMessage, SupervisionStrategy, Supervisor,
 };
 pub use checkpoint::{Checkpoint, CheckpointStore, MemoryCheckpointStore};
 pub use engine::{Graph, GraphBuilder, GraphError, GraphOutput, GraphStructure};

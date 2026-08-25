@@ -364,10 +364,6 @@ impl ExpertQueryPort for TraceAppService {
         self.inner.list_experts()
     }
 
-    fn active_expert(&self) -> Pin<Box<dyn Future<Output = Option<ExpertInfo>> + Send>> {
-        self.inner.active_expert()
-    }
-
     fn match_expert(&self, message: &str) -> Pin<Box<dyn Future<Output = Vec<ExpertInfo>> + Send>> {
         self.inner.match_expert(message)
     }

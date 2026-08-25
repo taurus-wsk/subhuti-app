@@ -25,13 +25,11 @@
 //!         ──Terminate──►          (停止)
 //! ```
 
-pub mod event_driven_actor;
 pub mod message;
 pub mod node_actor;
 pub mod scheduler;
 pub mod supervisor;
 
-pub use event_driven_actor::EventDrivenActor;
 pub use message::{ActorAddr, ActorHandle, ActorHealth, ActorLifecycle, ActorStats, NodeMessage};
 pub use node_actor::NodeActor;
 pub use scheduler::EventDrivenScheduler;

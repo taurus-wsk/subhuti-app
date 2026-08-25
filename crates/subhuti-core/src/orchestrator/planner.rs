@@ -75,7 +75,14 @@ impl SkillPlan {
 ///
 /// 兼容纯 JSON 与 markdown 代码块（```` ```json ... ``` ````）包裹两种形式。
 pub fn parse_plan(output: &str) -> Result<SkillPlan> {
-    let json_str = if let Some(start) = output.find("```json") {
+    let json_str = extract_json(output);
+    serde_json::from_str(&json_str)
+        .map_err(|e| crate::Error::Expert(format!("解析执行计划失败: {}, 原始输出: {}", e, output)))
+}
+
+/// 从 LLM 输出中抽取 JSON 文本（兼容纯 JSON 与 markdown 代码块包裹）
+fn extract_json(output: &str) -> String {
+    if let Some(start) = output.find("```json") {
         let start = start + 7;
         if let Some(end) = output[start..].find("```") {
             output[start..start + end].trim().to_string()
@@ -91,10 +98,50 @@ pub fn parse_plan(output: &str) -> Result<SkillPlan> {
         }
     } else {
         output.trim().to_string()
-    };
+    }
+}
 
-    serde_json::from_str(&json_str)
-        .map_err(|e| crate::Error::Expert(format!("解析执行计划失败: {}, 原始输出: {}", e, output)))
+/// 主动提问请求：规划阶段信息不足时，专家向用户发起单选提问
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AskRequest {
+    /// 问题描述
+    pub question: String,
+    /// 候选选项（前端渲染单选卡片）
+    pub options: Vec<String>,
+    /// 补充上下文（向用户说明为何提问，可选）
+    #[serde(default)]
+    pub context: Option<String>,
+}
+
+/// 规划器的产出：可能是执行计划，也可能是需要向用户提问
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PlanOrAsk {
+    /// 可执行的技能执行计划
+    Plan(SkillPlan),
+    /// 信息不足，需要先向用户提问
+    Ask(AskRequest),
+}
+
+/// 解析 LLM 输出的规划结果（计划 或 提问）
+///
+/// 当输出包含 `question`/`options` 字段时判定为提问，否则视为执行计划。
+pub fn parse_plan_or_ask(output: &str) -> Result<PlanOrAsk> {
+    let json_str = extract_json(output);
+    let value: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| {
+        crate::Error::Expert(format!("解析规划结果失败: {}, 原始输出: {}", e, output))
+    })?;
+
+    if value.get("question").is_some() && value.get("options").is_some() {
+        let ask: AskRequest = serde_json::from_value(value).map_err(|e| {
+            crate::Error::Expert(format!("解析提问请求失败: {}, 原始输出: {}", e, output))
+        })?;
+        Ok(PlanOrAsk::Ask(ask))
+    } else {
+        let plan: SkillPlan = serde_json::from_value(value).map_err(|e| {
+            crate::Error::Expert(format!("解析执行计划失败: {}, 原始输出: {}", e, output))
+        })?;
+        Ok(PlanOrAsk::Plan(plan))
+    }
 }
 
 /// 使用 LLM 生成执行计划
@@ -106,13 +153,13 @@ pub fn parse_plan(output: &str) -> Result<SkillPlan> {
 /// - `expert_name`: 专家名称（用于 system prompt 角色设定）
 ///
 /// # 返回
-/// - 解析后的 `SkillPlan`
+/// - 解析后的 `PlanOrAsk`：信息不足时为 `Ask`（需先向用户提问），否则为 `Plan`
 pub async fn generate_plan(
     llm: &Arc<dyn LLM>,
     input: &str,
     skills: &[SkillInfo],
     expert_name: &str,
-) -> Result<SkillPlan> {
+) -> Result<PlanOrAsk> {
     let skills_desc: String = skills
         .iter()
         .map(|s| {
@@ -135,16 +182,18 @@ pub async fn generate_plan(
 {}
 
 规则：
-1. 根据用户需求选择 1-3 个技能组合执行
-2. 技能按顺序执行，前一步的输出作为后一步的输入
-3. 如果用户只是闲聊或询问信息，只需使用 chat 技能
-4. 如果需要编码，先 chat 确认需求，再 coding 执行
-5. 以 JSON 格式返回执行计划"#,
+1. 根据用户需求选择 1-3 个技能组合执行，技能按顺序执行，前一步输出作为后一步输入
+2. 尽量直接、具体地展开执行计划，不要用「确认需求」这类占位步骤充当第一步
+3. 当用户需求已明确给出（如目标目录、语言、项目名、具体任务）时，直接规划并执行
+4. 如果用户只是闲聊或询问信息，只需使用 chat 技能
+5. 如果用户需求缺失完成它所必需的关键信息且无从推断（而不是含糊），
+   才允许返回一个提问（question + options）征询用户；通常不要提问
+6. 以 JSON 格式返回执行计划（除非规则 5 需要提问）"#,
         expert_name, skills_desc
     );
 
     let user_prompt = format!(
-        "用户需求：\n{}\n\n请制定执行计划，以以下 JSON 格式返回：\n```json\n{{\n  \"description\": \"计划描述\",\n  \"steps\": [\n    {{\n      \"order\": 1,\n      \"skill_id\": \"rust-chat\",\n      \"description\": \"步骤描述\",\n      \"params\": \"技能参数\"\n    }}\n  ]\n}}\n```",
+        "用户需求：\n{}\n\n请制定执行计划，以以下 JSON 格式返回：\n```json\n{{\n  \"description\": \"计划描述\",\n  \"steps\": [\n    {{\n      \"order\": 1,\n      \"skill_id\": \"rust-chat\",\n      \"description\": \"步骤描述\",\n      \"params\": \"技能参数\"\n    }}\n  ]\n}}\n```\n\n仅当确实缺失关键信息、且无法从上下文中推断时，才改为返回提问：\n```json\n{{\n  \"question\": \"问题\",\n  \"options\": [\"选项1\", \"选项2\"],\n  \"context\": \"为何询问的说明\"\n}}\n```",
         input
     );
 
@@ -163,7 +212,7 @@ pub async fn generate_plan(
 
     let llm_output = llm.chat(messages).await?;
 
-    parse_plan(&llm_output)
+    Ok(parse_plan_or_ask(&llm_output)?)
 }
 
 /// 按顺序执行计划（引擎侧的循环驱动机制）
@@ -326,6 +375,37 @@ mod tests {
     fn test_parse_plan_invalid_json() {
         let input = "这不是有效的JSON";
         assert!(parse_plan(input).is_err());
+    }
+
+    #[test]
+    fn test_parse_plan_or_ask_detects_ask() {
+        let ask_json = r#"{
+            "question": "请选择目标目录",
+            "options": ["/tmp/a", "/tmp/b"],
+            "context": "编码技能需要目标目录"
+        }"#;
+        match parse_plan_or_ask(ask_json).unwrap() {
+            PlanOrAsk::Ask(ask) => {
+                assert_eq!(ask.question, "请选择目标目录");
+                assert_eq!(ask.options.len(), 2);
+                assert!(ask.context.is_some());
+            }
+            PlanOrAsk::Plan(_) => panic!("应识别为提问"),
+        }
+    }
+
+    #[test]
+    fn test_parse_plan_or_ask_detects_plan() {
+        let plan_json = r#"{
+            "description": "编码计划",
+            "steps": [
+                { "order": 1, "skill_id": "rust-coding", "description": "编码", "params": "x" }
+            ]
+        }"#;
+        match parse_plan_or_ask(plan_json).unwrap() {
+            PlanOrAsk::Plan(plan) => assert_eq!(plan.step_count(), 1),
+            PlanOrAsk::Ask(_) => panic!("应识别为执行计划"),
+        }
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //!
 //! 入站适配层通过这些窄端口调用应用层：
 //! - `ChatPort`：聊天/编排调度（orchestrate + orchestrate_stream）
-//! - `ExpertQueryPort`：专家查询（list_experts + active_expert + match_expert + analyze_task）
+//! - `ExpertQueryPort`：专家查询（list_experts + match_expert + analyze_task）
 //! - `SkillPort`：技能操作（skill_list + execute_skill + execute_skill_stream）
 //!
 //! ## 设计原则
@@ -37,6 +37,15 @@ pub enum StreamEvent {
     Step {
         message: String,
         expert: Option<String>,
+        /// 完整打勾态的唯一待办清单快照（可选）。前端用它「原位替换」待办清单以动态打勾，
+        /// 而非每步追加新清单，避免聊天里清单重复堆叠。
+        todo_state: Option<String>,
+    },
+    /// 主动提问：专家在规划阶段信息不足时向用户发起单选提问（ask_id 用于 /ask-resolve 投递答复）
+    Ask {
+        ask_id: String,
+        question: String,
+        options: Vec<String>,
     },
     /// 数据块（应用层发完整内容，适配器决定分块策略）
     Chunk { content: String },
@@ -70,19 +79,14 @@ pub trait ChatPort: Sync + Send + 'static {
 
 /// 专家查询端口（入站窄端口 2）
 ///
-/// 负责专家列表、激活专家、专家匹配、任务分析。
+/// 负责专家列表、专家匹配、任务分析。
 /// orchestrate_experts_handler / orchestrate_analyze_handler / orchestrate_match_handler /
-/// experts_list_handler / experts_active_handler / experts_match_handler 依赖此端口。
+/// experts_list_handler / experts_match_handler 依赖此端口。
 pub trait ExpertQueryPort: Sync + Send + 'static {
     /// 获取专家列表（真实从框架 Orchestrator 注册中心快照）
     fn list_experts(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<ExpertInfo>> + Send>>;
-
-    /// 获取当前激活的专家（返回 None = 未激活）
-    fn active_expert(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<ExpertInfo>> + Send>>;
 
     /// 匹配专家（返回空 Vec = 未匹配到，语义合法）
     fn match_expert(
