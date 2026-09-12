@@ -11,6 +11,12 @@ use crate::domain::ports::FileSystemPort;
 /// 路径处理：相对路径相对于当前工作目录，绝对路径直接使用。
 pub struct LocalFileSystemAdapter;
 
+impl Default for LocalFileSystemAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LocalFileSystemAdapter {
     pub fn new() -> Self {
         Self

@@ -55,31 +55,6 @@ pub async fn run(subcommand: ApiCommands) -> anyhow::Result<()> {
             );
             println!("版本: {}", result["version"].as_str().unwrap_or("unknown"));
         }
-        ApiCommands::Skills => {
-            let resp = match client
-                .get(format!("{}/subhuti/api/v1/skills", base_url))
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    if handle_connection_error(&e) {
-                        return Ok(());
-                    }
-                    return Err(e.into());
-                }
-            };
-            let result: Value = resp.json().await?;
-            println!("{}", "📚 技能列表".yellow().bold());
-            println!("───────────────────────────────────────────────────────────────");
-            for skill in result["skills"].as_array().unwrap_or(&vec![]) {
-                println!(
-                    "  {} - {}",
-                    skill["id"].as_str().unwrap_or(""),
-                    skill["description"].as_str().unwrap_or("")
-                );
-            }
-        }
         ApiCommands::Experts => {
             let resp = match client
                 .get(format!("{}/subhuti/api/v1/experts", base_url))

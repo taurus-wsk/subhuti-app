@@ -56,6 +56,7 @@ impl TraceAppService {
 /// 1. complete_success/complete_failed（含 tracing 日志）
 /// 2. store_trace（持久化 trace）
 /// 3. record_request（记录会话）
+#[allow(clippy::too_many_arguments)]
 fn finalize_trace(
     mut trace: TraceHandle,
     trace_observer: &dyn TraceObserverPort,
@@ -284,71 +285,6 @@ impl SkillPort for TraceAppService {
             );
             resp
         })
-    }
-
-    fn execute_skill_stream(
-        &self,
-        skill_id: &str,
-        args: &str,
-        _trace_id: &str,
-        _session_id: &str,
-    ) -> mpsc::Receiver<StreamEvent> {
-        let user_id = "anonymous".to_string();
-        let session_id = gen_session_id();
-        let skill_id = skill_id.to_string();
-        let args = args.to_string();
-        let message = format!("skill={}, args={}", skill_id, args);
-
-        // 先预生成 trace 拿 trace_id，传给 inner
-        let trace = self
-            .trace_observer
-            .create_trace(&user_id, &session_id, &message);
-        let decorator_trace_id = trace.trace_id.clone();
-        let mut inner_rx =
-            self.inner
-                .execute_skill_stream(&skill_id, &args, &decorator_trace_id, &session_id);
-        let (tx, rx) = mpsc::channel(32);
-        let trace_observer = self.trace_observer.clone();
-        let session_observer = self.session_observer.clone();
-
-        tokio::spawn(async move {
-            let start = Instant::now();
-            let mut final_output = String::new();
-            let mut success = false;
-            let mut error_msg: Option<String> = None;
-
-            while let Some(event) = inner_rx.recv().await {
-                match &event {
-                    StreamEvent::Done { output, .. } => {
-                        final_output = output.clone();
-                        success = true;
-                    }
-                    StreamEvent::Error { error } => {
-                        error_msg = Some(error.clone());
-                    }
-                    _ => {}
-                }
-                let _ = tx.send(event).await;
-            }
-
-            let duration_ms = start.elapsed().as_millis() as u64;
-            finalize_trace(
-                trace,
-                &*trace_observer,
-                &*session_observer,
-                &user_id,
-                &session_id,
-                &message,
-                success,
-                &final_output,
-                error_msg.as_deref(),
-                duration_ms,
-                None,
-                None,
-            );
-        });
-
-        rx
     }
 
     fn skill_list(&self) -> Pin<Box<dyn Future<Output = Vec<SkillInfo>> + Send>> {

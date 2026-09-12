@@ -65,9 +65,9 @@ impl ChatPort for OrchestrationService {
         let engine = self.orchestration_engine.clone();
         let user_id = request.user_id.unwrap_or_else(|| "default".to_string());
         let message = request.message;
-        let chain = request.chain.unwrap_or_else(|| "".to_string());
-        let graph = request.graph.unwrap_or_else(|| "".to_string());
-        let expert_id = request.expert_id.unwrap_or_else(|| "".to_string());
+        let chain = request.chain.unwrap_or_default();
+        let graph = request.graph.unwrap_or_default();
+        let expert_id = request.expert_id.unwrap_or_default();
         // trace_id / session_id 由 TraceAppService 装饰器注入 request
         let trace_id = request.trace_id.unwrap_or_default();
         let session_id = request.session_id.unwrap_or_default();
@@ -261,6 +261,9 @@ impl ChatPort for OrchestrationService {
             // 使用 select 同时监听进度和最终结果
             // 将 response_handle 包装在 Option 中以支持循环内多次 select
             let mut response_handle = Some(response_handle);
+            // 是否已经通过 progress 通道流出过「真流式」分片：
+            // 已流出则最后不再重复下发整块 output（避免前端重复渲染）
+            let mut streamed_chunks = false;
             let final_response = loop {
                 tokio::select! {
                     // 监听进度事件
@@ -306,6 +309,15 @@ impl ChatPort for OrchestrationService {
                                             todo_state,
                                         }).await;
                                     }
+                                    // 真流式：模型增量文本，原样转成 Chunk 即时下发
+                                    Some("chunk") => {
+                                        if let Some(content) = progress_json.get("content").and_then(|m| m.as_str()) {
+                                            let _ = tx.send(StreamEvent::Chunk {
+                                                content: content.to_string(),
+                                            }).await;
+                                            streamed_chunks = true;
+                                        }
+                                    }
                                     _ => {}
                                 }
                             }
@@ -350,6 +362,19 @@ impl ChatPort for OrchestrationService {
             while let Ok(progress_str) = progress_rx.try_recv() {
                 if let Ok(progress_json) = serde_json::from_str::<serde_json::Value>(&progress_str)
                 {
+                    // 真流式分片：必须按 chunk 处理，否则会被误渲染成「步骤文本」
+                    if progress_json.get("type").and_then(|t| t.as_str()) == Some("chunk") {
+                        if let Some(content) = progress_json.get("content").and_then(|m| m.as_str())
+                        {
+                            let _ = tx
+                                .send(StreamEvent::Chunk {
+                                    content: content.to_string(),
+                                })
+                                .await;
+                            streamed_chunks = true;
+                        }
+                        continue;
+                    }
                     if let Some(step_msg) = progress_json.get("message").and_then(|m| m.as_str()) {
                         let _ = tx
                             .send(StreamEvent::Step {
@@ -383,11 +408,15 @@ impl ChatPort for OrchestrationService {
                         .await;
                 }
 
-                let _ = tx
-                    .send(StreamEvent::Chunk {
-                        content: final_response.output.clone(),
-                    })
-                    .await;
+                // 已经真流式下发过分片时，不再重复整块下发；
+                // `Done` 仍携带完整 output，作为前端权威结果（可据此覆盖/校正）。
+                if !streamed_chunks {
+                    let _ = tx
+                        .send(StreamEvent::Chunk {
+                            content: final_response.output.clone(),
+                        })
+                        .await;
+                }
                 let _ = tx
                     .send(StreamEvent::Done {
                         output: final_response.output,
@@ -466,51 +495,5 @@ impl SkillPort for OrchestrationService {
                 .execute_skill(&skill_id, &args, &trace_id, &session_id)
                 .await
         })
-    }
-
-    fn execute_skill_stream(
-        &self,
-        skill_id: &str,
-        args: &str,
-        trace_id: &str,
-        session_id: &str,
-    ) -> mpsc::Receiver<StreamEvent> {
-        let (tx, rx) = mpsc::channel(32);
-        let executor = self.skill_executor.clone();
-        let skill_id = skill_id.to_string();
-        let args = args.to_string();
-        let trace_id = trace_id.to_string();
-        let session_id = session_id.to_string();
-
-        tokio::spawn(async move {
-            let _ = tx.send(StreamEvent::Start).await;
-            let response = executor
-                .execute_skill(&skill_id, &args, &trace_id, &session_id)
-                .await;
-            if response.success {
-                let _ = tx
-                    .send(StreamEvent::Chunk {
-                        content: response.output.clone(),
-                    })
-                    .await;
-                let _ = tx
-                    .send(StreamEvent::Done {
-                        output: response.output,
-                        meta: serde_json::json!({
-                            "skill_id": skill_id,
-                            "expert_id": response.expert_id,
-                        }),
-                    })
-                    .await;
-            } else {
-                let _ = tx
-                    .send(StreamEvent::Error {
-                        error: response.error.unwrap_or_default(),
-                    })
-                    .await;
-            }
-        });
-
-        rx
     }
 }

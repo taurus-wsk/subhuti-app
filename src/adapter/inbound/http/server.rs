@@ -3,7 +3,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 
 use crate::adapter::inbound::http::adapters::HttpAdapterFactory;
-use crate::adapter::inbound::http::middleware::{self, RequestLogLayer, TraceIdLayer};
+use crate::adapter::inbound::http::middleware::{RequestLogLayer, TraceIdLayer};
 use crate::adapter::inbound::http::route_adapter::build_router;
 use crate::application::observer::{record_fn_log, LogLevel};
 use crate::application::CompositionRoot;
@@ -19,8 +19,6 @@ pub struct ServerOptions {
 }
 
 pub async fn start_server(options: ServerOptions) -> Result<()> {
-    let _log_guard = middleware::init_logging();
-
     record_fn_log(
         None,
         "",
@@ -83,7 +81,6 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
     let factory = HttpAdapterFactory::new(
         composition.chat_port,
         composition.expert_port,
-        composition.skill_port,
         composition.trace_observer.clone(),
         composition.session_observer.clone(),
         composition.pg_storage.clone(),
@@ -92,7 +89,7 @@ pub async fn start_server(options: ServerOptions) -> Result<()> {
     // 创建 AppState（依赖注入容器）
     let app_state = factory.create_app_state();
 
-    record_fn_log(None, "", LogLevel::Info, "✅ 六边形架构完成：3 窄端口（trace 装饰器自动记录）+ 2 观察者端口，路由采用 inventory 自动注册", None);
+    record_fn_log(None, "", LogLevel::Info, "✅ 六边形架构完成：2 窄端口（trace 装饰器自动记录）+ 2 观察者端口，路由采用 inventory 自动注册", None);
 
     // ── 方案 C：inventory 自动注册所有路由 ──
     // 所有路由通过 `inventory::submit!` 自注册，build_router 遍历收集后统一构建。

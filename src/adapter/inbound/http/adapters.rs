@@ -19,10 +19,10 @@ use std::sync::Arc;
 
 use async_stream::stream;
 use axum::{
-    extract::{Json, Path, State},
-    http::StatusCode,
+    extract::{Json, State},
+    http::{header, HeaderMap, StatusCode},
     response::{
-        sse::{Event, KeepAlive, Sse},
+        sse::{Event, Sse},
         IntoResponse, Response,
     },
     routing::{get, post},
@@ -34,7 +34,7 @@ use crate::adapter::inbound::http::route_adapter::RouteEntry;
 use crate::adapter::inbound::http::routes::AppState;
 use crate::application::observer::{record_fn_log, LogLevel};
 use crate::application::{
-    ChatPort, ExpertQueryPort, SessionObserverPort, SkillPort, StreamEvent, TraceObserverPort,
+    ChatPort, ExpertQueryPort, SessionObserverPort, StreamEvent, TraceObserverPort,
 };
 use crate::domain::dto::OrchestrateRequest as PortRequest;
 
@@ -130,14 +130,6 @@ impl ApiError {
 // ─── HTTP 请求 DTO ──────────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize)]
-pub struct SkillExecuteRequest {
-    pub message: String,
-    pub user_id: Option<String>,
-    pub session_id: Option<String>,
-    pub flow_template: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize)]
 pub struct OrchestrateRequest {
     pub message: String,
     pub user_id: Option<String>,
@@ -165,29 +157,45 @@ fn uuid_v4() -> String {
 ///
 /// 职责：分块大小、sleep 节奏、SSE 事件 JSON 格式 —— 全部在适配器层。
 /// 应用层只发语义事件（Start/Thought/Plan/Step/Chunk/Done/Error），不关心传输细节。
+///
+/// `session_id` 会回显进每个事件负载（跨模块串联标准）：前端不再靠请求体手动关联
+/// 会话与事件，而是直接从流内读取服务端采用并一路下传的 `session_id`，避免脱节。
 fn stream_to_sse(
     receiver: mpsc::Receiver<StreamEvent>,
+    session_id: String,
 ) -> impl futures::Stream<Item = Result<Event, axum::BoxError>> {
     stream! {
         let mut rx = receiver;
+        // 给每个 SSE 事件统一标注 session_id（协议中立的关联手段）
+        let decorate = |json: String| -> String {
+            match serde_json::from_str::<serde_json::Value>(&json) {
+                Ok(mut v) => {
+                    if let Some(o) = v.as_object_mut() {
+                        o.insert("session_id".into(), session_id.clone().into());
+                    }
+                    v.to_string()
+                }
+                Err(_) => json, // 非 JSON 载荷原样透传
+            }
+        };
         while let Some(event) = rx.recv().await {
             match event {
                 StreamEvent::Start => {
-                    yield Ok(Event::default().data(r#"{"type":"start"}"#));
+                    yield Ok(Event::default().data(decorate(r#"{"type":"start"}"#.into())));
                 }
                 StreamEvent::Thought { message } => {
                     let json = serde_json::json!({
                         "type": "thought",
                         "message": message,
                     }).to_string();
-                    yield Ok(Event::default().data(json));
+                    yield Ok(Event::default().data(decorate(json)));
                 }
                 StreamEvent::Plan { message } => {
                     let json = serde_json::json!({
                         "type": "plan",
                         "message": message,
                     }).to_string();
-                    yield Ok(Event::default().data(json));
+                    yield Ok(Event::default().data(decorate(json)));
                 }
                 StreamEvent::Step { message, expert, todo_state } => {
                     let mut payload = serde_json::json!({
@@ -199,7 +207,7 @@ fn stream_to_sse(
                         payload.as_object_mut()
                             .map(|o| o.insert("todo_state".into(), ts.into()));
                     }
-                    yield Ok(Event::default().data(payload.to_string()));
+                    yield Ok(Event::default().data(decorate(payload.to_string())));
                 }
                 StreamEvent::Ask { ask_id, question, options } => {
                     let json = serde_json::json!({
@@ -208,24 +216,18 @@ fn stream_to_sse(
                         "question": question,
                         "options": options,
                     }).to_string();
-                    yield Ok(Event::default().data(json));
+                    yield Ok(Event::default().data(decorate(json)));
                 }
                 StreamEvent::Chunk { content } => {
-                    // 分块策略 + 节奏（适配器职责，可按需调整）
-                    // 按字符切分而非字节，避免 UTF-8 多字节字符被截断导致 panic
-                    let chunk_size = 64;
-                    let chars: Vec<char> = content.chars().collect();
-                    for i in (0..chars.len()).step_by(chunk_size) {
-                        let end = std::cmp::min(i + chunk_size, chars.len());
-                        let chunk: String = chars[i..end].iter().collect();
-                        let json = serde_json::json!({
-                            "type": "data",
-                            "content": chunk,
-                            "done": false,
-                        }).to_string();
-                        yield Ok(Event::default().data(json));
-                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                    }
+                    // 真流式：content 已是模型产出的**真实增量**（域层逐 delta 下发），
+                    // 这里原样透传，不再做「64 字符切块 + 50ms 人为延时」的假打字机。
+                    // 非流式兜底路径下 content 为整块 output，会一次性到达（属预期）。
+                    let json = serde_json::json!({
+                        "type": "data",
+                        "content": content,
+                        "done": false,
+                    }).to_string();
+                    yield Ok(Event::default().data(decorate(json)));
                 }
                 StreamEvent::Done { output, meta } => {
                     let mut payload = serde_json::Map::new();
@@ -236,72 +238,32 @@ fn stream_to_sse(
                             payload.insert(k, v);
                         }
                     }
-                    yield Ok(Event::default().data(serde_json::Value::Object(payload).to_string()));
+                    yield Ok(Event::default().data(decorate(
+                        serde_json::Value::Object(payload).to_string(),
+                    )));
                 }
                 StreamEvent::Error { error } => {
                     let json = serde_json::json!({"type": "error", "error": error}).to_string();
-                    yield Ok(Event::default().data(json));
+                    yield Ok(Event::default().data(decorate(json)));
                 }
             }
         }
     }
 }
 
-// ─── Chat Stream 路由 ───────────────────────────────────────────
+// ─── 编排统一入口（按 Accept 内容协商响应模式）───────────────────
 
-/// POST /subhuti/api/v1/chat/stream（SSE 流式响应）
-async fn chat_stream_handler(
-    State(state): State<AppState>,
-    Json(req): Json<OrchestrateRequest>,
-) -> impl IntoResponse {
-    let user_id = req
-        .user_id
-        .clone()
-        .unwrap_or_else(|| "anonymous".to_string());
-    let session_id = req.session_id.clone().unwrap_or_else(uuid_v4);
-
-    record_fn_log(
-        None,
-        "",
-        LogLevel::Info,
-        format!(
-            "Chat stream 请求 (user={}, session={}, message={}, chain={:?})",
-            user_id, session_id, req.message, req.chain
-        ),
-        None,
-    );
-
-    let receiver = state.chat_port.orchestrate_stream(PortRequest {
-        message: req.message.clone(),
-        user_id: Some(user_id.clone()),
-        session_id: Some(session_id.clone()),
-        chain: req.chain.clone(),
-        graph: req.graph.clone(),
-        expert_id: req.expert_id.clone(),
-        trace_id: None,
-        workspace_folder: req.workspace_folder.clone(),
-        system_prompt: req.system_prompt.clone(),
-    });
-
-    Sse::new(stream_to_sse(receiver))
+/// 是否要求 SSE 流式响应（`Accept` 内容协商）
+fn wants_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_ascii_lowercase().contains("text/event-stream"))
+        .unwrap_or(false)
 }
 
-inventory::submit! {
-    RouteEntry {
-        path: "/subhuti/api/v1/chat/stream",
-        method: "POST",
-        trace_enabled: false,  // 辅助路由（流式，trace 由装饰器自动覆盖）
-        register: |r| r.route("/subhuti/api/v1/chat/stream", post(chat_stream_handler)),
-    }
-}
-
-// ─── Orchestrate 路由 ───────────────────────────────────────────
-
-/// POST /subhuti/api/v1/orchestrate
-async fn orchestrate_handler(
-    State(state): State<AppState>,
-    Json(req): Json<OrchestrateRequest>,
-) -> impl IntoResponse {
+/// 一次性 JSON 编排：等待整条编排链路结束后返回结构化结果
+async fn orchestrate_json(state: AppState, req: OrchestrateRequest) -> Response {
     let user_id = req
         .user_id
         .clone()
@@ -375,6 +337,60 @@ async fn orchestrate_handler(
                 "trace_id": response.trace_id,
             }))
             .into_response()
+    }
+}
+
+/// 流式编排：把协议中立的 StreamEvent 流转为 SSE 事件流
+fn orchestrate_sse(state: AppState, req: OrchestrateRequest) -> Response {
+    let user_id = req
+        .user_id
+        .clone()
+        .unwrap_or_else(|| "anonymous".to_string());
+    let session_id = req.session_id.clone().unwrap_or_else(uuid_v4);
+
+    record_fn_log(
+        None,
+        "",
+        LogLevel::Info,
+        format!(
+            "编排流式请求 (user={}, session={}, message={}, chain={:?})",
+            user_id, session_id, req.message, req.chain
+        ),
+        None,
+    );
+
+    let receiver = state.chat_port.orchestrate_stream(PortRequest {
+        message: req.message.clone(),
+        user_id: Some(user_id.clone()),
+        session_id: Some(session_id.clone()),
+        chain: req.chain.clone(),
+        graph: req.graph.clone(),
+        expert_id: req.expert_id.clone(),
+        trace_id: None,
+        workspace_folder: req.workspace_folder.clone(),
+        system_prompt: req.system_prompt.clone(),
+    });
+
+    Sse::new(stream_to_sse(receiver, session_id)).into_response()
+}
+
+/// POST /subhuti/api/v1/orchestrate（编排统一入口）
+///
+/// 同一个业务动作（编排一条消息），由客户端用 `Accept` 头选择响应模式：
+/// - `Accept: text/event-stream` → SSE 流式（进度事件 + 逐 delta 的回答）
+/// - 其他 / 未带 `Accept`        → 一次性 JSON（等整条链路结束后返回）
+///
+/// 之所以保留两种模式而非只留流式：MCP 的 `tools/call` 与脚本/CI 需要的都是
+/// **一次完整的结构化结果**，SSE 不适用；且 MCP 本身不经 HTTP，直调 `chat_port`。
+async fn orchestrate_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<OrchestrateRequest>,
+) -> Response {
+    if wants_event_stream(&headers) {
+        orchestrate_sse(state, req)
+    } else {
+        orchestrate_json(state, req).await
     }
 }
 
@@ -492,155 +508,6 @@ inventory::submit! {
     }
 }
 
-// ─── Skill Execute 路由 ─────────────────────────────────────────
-
-/// POST /subhuti/api/v1/skills/:name
-async fn skill_execute_handler(
-    State(state): State<AppState>,
-    Path(skill_name): Path<String>,
-    Json(req): Json<SkillExecuteRequest>,
-) -> impl IntoResponse {
-    let user_id = req
-        .user_id
-        .clone()
-        .unwrap_or_else(|| "anonymous".to_string());
-    let session_id = req.session_id.clone().unwrap_or_else(uuid_v4);
-
-    record_fn_log(
-        None,
-        "",
-        LogLevel::Info,
-        format!(
-            "Skill execute 请求 (user={}, skill={}, session={}, message={})",
-            user_id, skill_name, session_id, req.message
-        ),
-        None,
-    );
-
-    let response = state
-        .skill_port
-        .execute_skill(&skill_name, &req.message, "", "")
-        .await;
-
-    if response.success {
-        record_fn_log(
-            None,
-            "",
-            LogLevel::Info,
-            format!(
-                "Skill execute 完成 (skill={}, expert={})",
-                skill_name, response.expert_id
-            ),
-            None,
-        );
-        ApiSuccess::ok(serde_json::json!({
-            "output": response.output,
-            "session_id": session_id,
-            "skill_used": skill_name,
-            "chain": vec![response.expert_id],
-        }))
-        .into_response()
-    } else {
-        let error_msg = response.error.clone().unwrap_or_default();
-        record_fn_log(
-            None,
-            "",
-            LogLevel::Error,
-            format!(
-                "Skill execute 错误 (skill={}, error={})",
-                skill_name, error_msg
-            ),
-            None,
-        );
-        ApiError::internal(error_msg)
-            .with_detail(serde_json::json!({ "session_id": session_id }))
-            .into_response()
-    }
-}
-
-inventory::submit! {
-    RouteEntry {
-        path: "/subhuti/api/v1/skills/:name",
-        method: "POST",
-        trace_enabled: true,  // 核心业务路由标记（debug 分类用）
-        register: |r| r.route("/subhuti/api/v1/skills/:name", post(skill_execute_handler)),
-    }
-}
-
-// ─── Skill List 路由 ────────────────────────────────────────────
-
-/// GET/POST /subhuti/api/v1/skills
-async fn skill_list_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let skills = state.skill_port.skill_list().await;
-
-    let skill_infos: Vec<serde_json::Value> = skills
-        .into_iter()
-        .map(|s| {
-            serde_json::json!({
-                "name": s.name,
-                "description": s.description,
-                "flow_template": serde_json::Value::Null,
-                "flow_templates": Vec::<String>::new(),
-                "priority": 0,
-            })
-        })
-        .collect();
-
-    ApiSuccess::ok(serde_json::json!({
-        "skills": skill_infos,
-    }))
-}
-
-inventory::submit! {
-    RouteEntry {
-        path: "/subhuti/api/v1/skills",
-        method: "GET+POST",  // 同一路径注册两个方法
-        trace_enabled: false,
-        register: |r| r.route("/subhuti/api/v1/skills", get(skill_list_handler).post(skill_list_handler)),
-    }
-}
-
-// ─── Skill Stream 路由 ──────────────────────────────────────────
-
-/// POST /subhuti/api/v1/skills/:name/stream
-async fn skill_stream_handler(
-    State(state): State<AppState>,
-    Path(skill_name): Path<String>,
-    Json(req): Json<SkillExecuteRequest>,
-) -> impl IntoResponse {
-    let _user_id = req
-        .user_id
-        .clone()
-        .unwrap_or_else(|| "anonymous".to_string());
-    let session_id = req.session_id.clone().unwrap_or_else(uuid_v4);
-
-    record_fn_log(
-        None,
-        "",
-        LogLevel::Info,
-        format!(
-            "Skill execute stream request: skill={}, session={}, message={}",
-            skill_name, session_id, req.message
-        ),
-        None,
-    );
-
-    let receiver = state
-        .skill_port
-        .execute_skill_stream(&skill_name, &req.message, "", "");
-
-    Sse::new(stream_to_sse(receiver)).keep_alive(KeepAlive::default())
-}
-
-inventory::submit! {
-    RouteEntry {
-        path: "/subhuti/api/v1/skills/:name/stream",
-        method: "POST",
-        trace_enabled: false,
-        register: |r| r.route("/subhuti/api/v1/skills/:name/stream", post(skill_stream_handler)),
-    }
-}
-
 // ─── 适配器工厂 ──────────────────────────────────────────────────
 
 /// HTTP 依赖注入工厂
@@ -651,18 +518,15 @@ inventory::submit! {
 pub struct HttpAdapterFactory {
     chat_port: Arc<dyn ChatPort>,
     expert_query_port: Arc<dyn ExpertQueryPort>,
-    skill_port: Arc<dyn SkillPort>,
     trace_observer: Arc<dyn TraceObserverPort>,
     session_observer: Arc<dyn SessionObserverPort>,
     pg_storage: Option<Arc<subhuti_infra::sutra_library::storage::PgStorage>>,
 }
 
 impl HttpAdapterFactory {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         chat_port: Arc<dyn ChatPort>,
         expert_query_port: Arc<dyn ExpertQueryPort>,
-        skill_port: Arc<dyn SkillPort>,
         trace_observer: Arc<dyn TraceObserverPort>,
         session_observer: Arc<dyn SessionObserverPort>,
         pg_storage: Option<Arc<subhuti_infra::sutra_library::storage::PgStorage>>,
@@ -670,7 +534,6 @@ impl HttpAdapterFactory {
         Self {
             chat_port,
             expert_query_port,
-            skill_port,
             trace_observer,
             session_observer,
             pg_storage,
@@ -682,7 +545,6 @@ impl HttpAdapterFactory {
         AppState {
             chat_port: self.chat_port.clone(),
             expert_query_port: self.expert_query_port.clone(),
-            skill_port: self.skill_port.clone(),
             trace_observer: self.trace_observer.clone(),
             session_observer: self.session_observer.clone(),
             pg_storage: self.pg_storage.clone(),

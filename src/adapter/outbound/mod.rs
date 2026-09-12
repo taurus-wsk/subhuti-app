@@ -44,7 +44,6 @@ pub mod subhuti_skill_executor;
 pub mod command_adapter;
 pub mod event_bridge;
 pub mod file_system_adapter;
-pub mod graphs;
 pub mod observer_adapters;
 pub mod postgres_repository;
 pub mod rules;

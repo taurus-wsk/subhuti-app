@@ -28,7 +28,6 @@ use subhuti_infra::{
     ZhipuClient, ZhipuConfig,
 };
 
-use crate::adapter::outbound::graphs;
 use crate::adapter::outbound::rules;
 use crate::adapter::outbound::subhuti_expert_repository::SubhutiExpertRepository;
 use crate::adapter::outbound::subhuti_orchestration_engine::SubhutiOrchestrationEngine;
@@ -99,8 +98,8 @@ impl SubhutiFrameworkInitializer {
             workflow_store,
         );
 
-        // 初始化事件总线内置处理器
-        let _ = subhuti.event_bus().init_builtin_handlers();
+        // 事件总线内置处理器（日志 / Trace 事件）在 init() 的异步上下文中 await 注册；
+        // 此处为同步构造函数，不能 await，故不在此调用（否则 future 被立即丢弃，处理器永不注册）。
         record_fn_log(
             None,
             "",
@@ -281,6 +280,10 @@ impl SubhutiFrameworkInitializer {
     /// 初始化框架（创建框架实例、配置 LLM、数据库等）
     pub async fn init(&self) -> anyhow::Result<()> {
         let subhuti = self.subhuti.clone();
+
+        // 初始化事件总线内置处理器（日志 / Trace 事件）
+        subhuti.event_bus().init_builtin_handlers().await;
+
         let is_test_mode = self.app_config.test_mode.enabled;
 
         // ── LLM 健康检查（真实 provider 才会打网络） ──
@@ -304,8 +307,7 @@ impl SubhutiFrameworkInitializer {
             }
         }
 
-        // ── 同步插件专家到 Orchestrator ──
-        subhuti.sync_experts_to_orchestrator().await;
+        // ── 专家已通过 register_expert 注册到 Orchestrator（框架不再持有任何 Graph）──
         Ok(())
     }
 
@@ -357,39 +359,6 @@ impl SubhutiFrameworkInitializer {
             format!("注册领域专家: {}", expert_name),
             None,
         );
-    }
-
-    /// 注册所有图编排流程
-    pub async fn register_all_graphs(&self) {
-        let subhuti = self.subhuti.clone();
-
-        let llm = match subhuti.current_llm() {
-            Some(l) => l,
-            None => {
-                record_fn_log(
-                    None,
-                    "",
-                    LogLevel::Warn,
-                    "LLM 未注入，无法创建图节点（LLM 调用节点将失败）",
-                    None,
-                );
-                return;
-            }
-        };
-        let bus = subhuti.event_bus().clone();
-
-        let graphs = graphs::create_all_graphs(llm, bus);
-        for graph in graphs {
-            let name = graph.name().to_string();
-            subhuti.register_graph(graph).await;
-            record_fn_log(
-                None,
-                "",
-                LogLevel::Info,
-                format!("注册图编排: {}", name),
-                None,
-            );
-        }
     }
 
     /// 设置任务分析规则

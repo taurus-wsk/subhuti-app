@@ -61,11 +61,7 @@ pub fn run(
     thread::spawn(move || {
         let mut file = File::open(&file_path).unwrap();
         let file_len = file.seek(SeekFrom::End(0)).unwrap();
-        let start_pos = if file_len > tail_clone as u64 * 1024 {
-            file_len - tail_clone as u64 * 1024
-        } else {
-            0
-        };
+        let start_pos = file_len.saturating_sub(tail_clone as u64 * 1024);
         file.seek(SeekFrom::Start(start_pos)).unwrap();
 
         let mut reader = BufReader::new(file);
@@ -125,11 +121,8 @@ pub fn run(
         }
     });
 
-    loop {
-        match rx.recv() {
-            Ok(line) => print_log_line(&line),
-            Err(_) => break,
-        }
+    while let Ok(line) = rx.recv() {
+        print_log_line(&line);
     }
 
     Ok(())

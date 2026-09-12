@@ -47,9 +47,9 @@ pub struct DomainRules {
     pub execution_rule: Arc<dyn ExecutionRule>,
 }
 
-impl DomainRules {
+impl Default for DomainRules {
     /// 使用默认规则创建
-    pub fn default() -> Self {
+    fn default() -> Self {
         Self {
             analysis_rule: Arc::new(DefaultTaskAnalysisRule::new()),
             dispatch_rule: Arc::new(DefaultDispatchRule::new()),

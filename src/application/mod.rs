@@ -21,7 +21,7 @@
 //!
 //! - 领域 DTO 在 `domain::dto`（ExpertInfo, SkillInfo, OrchestrateRequest/Response, SkillResponse）
 //! - 领域出站端口在 `domain::ports`（ExpertRepositoryPort, OrchestrationEnginePort, SkillExecutionPort）
-//! - 图编排：在出站适配层（`adapter/outbound/graphs/`）配置
+//! - 编排：框架层由 Planner 驱动（无 Graph）；专家内部 Workflow 由专家自持
 
 pub mod composition_root;
 pub mod observer;

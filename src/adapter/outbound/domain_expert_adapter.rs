@@ -163,8 +163,16 @@ where
         // 1. 从框架状态中提取 LLM
         let Llm(llm) = Llm::from_state(state)?;
 
-        // 2. 创建领域 LLM 适配器
-        let domain_llm = Arc::new(SubhutiLlmAdapter { llm: llm.clone() });
+        // 2. 创建领域 LLM 适配器（携带 trace_id / session_id，使专家内 LLM 调用可与全链路关联）
+        let domain_llm = Arc::new(SubhutiLlmAdapter {
+            llm: llm.clone(),
+            trace_id: ctx
+                .metadata
+                .get("trace_id")
+                .cloned()
+                .filter(|s| !s.is_empty()),
+            session_id: Some(ctx.session.id().to_string()),
+        });
 
         // 3. 构建领域上下文
         // 从框架 Session 提取历史消息并转换为 DomainMessage
@@ -189,6 +197,12 @@ where
         let domain_ctx = DomainContext {
             input: ctx.input.clone(),
             session_id: Some(ctx.session.id().to_string()),
+            // trace_id 由框架经 ctx.metadata 透传（引擎在 graph_state 中写入），这里注入领域上下文
+            trace_id: ctx
+                .metadata
+                .get("trace_id")
+                .cloned()
+                .filter(|s| !s.is_empty()),
             user_id: None,
             workspace_folder: ctx
                 .metadata
@@ -271,38 +285,91 @@ where
 /// Subhuti LLM 适配器
 ///
 /// 将 Subhuti 框架的 LLM 转换为领域层的 DomainLlm 接口。
+///
+/// 携带 trace_id / session_id（跨模块串联标准），在 `chat()` 内建立隔离 tracing span，
+/// 使专家内的每次 LLM 调用日志都能与 `trace_id`、`session_id` 关联。
 struct SubhutiLlmAdapter {
     llm: Arc<dyn subhuti_core::LLM>,
+    trace_id: Option<String>,
+    session_id: Option<String>,
+}
+
+/// 领域消息 → 框架消息（`chat` / `chat_stream` 共用，避免两处重复转换）
+fn domain_to_framework_messages(messages: Vec<DomainMessage>) -> Vec<subhuti_core::Message> {
+    messages
+        .into_iter()
+        .map(|m| {
+            let role = match m.role {
+                DomainRole::System => subhuti_core::Role::System,
+                DomainRole::User => subhuti_core::Role::User,
+                DomainRole::Assistant => subhuti_core::Role::Assistant,
+            };
+            subhuti_core::Message {
+                role,
+                content: m.content,
+                tool_call_id: None,
+            }
+        })
+        .collect()
 }
 
 #[async_trait]
 impl DomainLlm for SubhutiLlmAdapter {
     async fn chat(&self, messages: Vec<DomainMessage>) -> DomainResult<String> {
-        // 将领域消息转换为框架消息
-        let framework_messages: Vec<subhuti_core::Message> = messages
-            .into_iter()
-            .map(|m| {
-                let role = match m.role {
-                    DomainRole::System => subhuti_core::Role::System,
-                    DomainRole::User => subhuti_core::Role::User,
-                    DomainRole::Assistant => subhuti_core::Role::Assistant,
-                };
-                subhuti_core::Message {
-                    role,
-                    content: m.content,
-                    tool_call_id: None,
-                }
-            })
-            .collect();
+        // 建立带 trace/session 上下文的 span，贯穿本次 LLM 调用的全部日志
+        let span = tracing::info_span!(
+            "domain_llm_chat",
+            trace_id = %self.trace_id.as_deref().unwrap_or("-"),
+            session_id = %self.session_id.as_deref().unwrap_or("-"),
+        );
+        let _enter = span.enter();
 
         // 调用框架 LLM
-        let response = self.llm.chat(framework_messages).await;
+        let response = self.llm.chat(domain_to_framework_messages(messages)).await;
 
         // 转换结果
         match response {
             Ok(output) => Ok(output),
             Err(e) => Err(DomainError::LlmError(e.to_string())),
         }
+    }
+
+    /// 真流式：透传框架 `chat_streaming` 的逐 delta 回调
+    ///
+    /// - 每个 delta 既转发给 `on_delta`（供领域层增量下发给前端，实现首字即出）
+    /// - 又累积进 `Arc<Mutex<String>>`，流结束后作为**完整文本**返回
+    async fn chat_stream(
+        &self,
+        messages: Vec<DomainMessage>,
+        on_delta: Box<dyn Fn(String) + Send>,
+    ) -> DomainResult<String> {
+        let span = tracing::info_span!(
+            "domain_llm_chat_stream",
+            trace_id = %self.trace_id.as_deref().unwrap_or("-"),
+            session_id = %self.session_id.as_deref().unwrap_or("-"),
+        );
+        let _enter = span.enter();
+
+        // callback 是 `Fn`（不可变），用 Arc<Mutex> 共享累积缓冲
+        let acc = Arc::new(Mutex::new(String::new()));
+        let acc_cb = acc.clone();
+        let cb: Box<dyn Fn(String) + Send> = Box::new(move |delta: String| {
+            if let Ok(mut s) = acc_cb.lock() {
+                s.push_str(&delta);
+            }
+            on_delta(delta);
+        });
+
+        self.llm
+            .chat_streaming(domain_to_framework_messages(messages), cb)
+            .await
+            .map_err(|e| DomainError::LlmError(e.to_string()))?;
+
+        let full = acc
+            .lock()
+            .map(|s| s.clone())
+            .map_err(|_| DomainError::LlmError("流式文本累积锁被污染".to_string()))?;
+        Ok(full)
     }
 
     fn model_name(&self) -> &str {

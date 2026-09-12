@@ -183,7 +183,7 @@ where
 ///
 /// 返回的 guard 必须在整个程序生命周期内保持，
 /// 否则日志写入可能会丢失
-pub fn init_logging() -> impl Drop {
+pub fn init_logging(default_level: Option<&str>) -> impl Drop {
     use tracing_subscriber::fmt::format::FmtSpan;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -245,8 +245,13 @@ pub fn init_logging() -> impl Drop {
         .with_writer(file_writer);
 
     // 日志级别过滤：支持 RUST_LOG 环境变量
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,tower_http=off,hyper=off,reqwest=off"));
+    // 默认：subhuti 框架 crate 的 debug 日志可见，第三方库（tower_http/hyper/reqwest）静默
+    let default_directive = default_level
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "info,subhuti=debug,tower_http=off,hyper=off,reqwest=off".to_string());
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&default_directive));
 
     Registry::default()
         .with(env_filter)

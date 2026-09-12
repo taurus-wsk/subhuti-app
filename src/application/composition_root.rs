@@ -6,7 +6,7 @@
 //! 它负责：
 //! 1. 创建领域数据仓库（PostgreSQL / 内存降级）
 //! 2. 创建框架初始化器（SubhutiFrameworkInitializer）
-//! 3. 通过 SubhutiFrameworkInitializer 初始化框架、注册专家、设置规则、注册图
+//! 3. 通过 SubhutiFrameworkInitializer 初始化框架、注册专家、设置规则
 //! 4. 调用 build_adapters() 获取出站端口适配器
 //! 5. 构造 OrchestrationService + 横切观察者，打包为 Composition 返回
 //!
@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use crate::adapter::outbound::observer_adapters::{
-    SubhutiSessionObserverAdapter, SubhutiTraceObserverAdapter,
+    InMemoryTraceObserverAdapter, SqliteTraceObserverAdapter, SubhutiSessionObserverAdapter,
 };
 use crate::adapter::outbound::postgres_repository::{InMemoryRepository, PostgresRepository};
 use crate::adapter::outbound::subhuti_framework_initializer::SubhutiFrameworkInitializer;
@@ -32,6 +32,7 @@ use crate::domain::ports::FileSystemPort;
 use crate::domain::ports::ToolchainPort;
 use crate::domain::traits::DomainRepository;
 use crate::infra::config::AppConfig;
+use subhuti_infra::trace_store::{resolve_trace_db_path, SqliteTraceStore};
 
 /// 组合根产物：应用服务 + 横切观察者
 ///
@@ -60,13 +61,35 @@ impl CompositionRoot {
     /// 3. 通过 SubhutiFrameworkInitializer 初始化框架
     /// 4. 注册领域专家
     /// 5. 设置规则（analysis / dispatch / execution）
-    /// 6. 注册图编排
     /// 7. 调用 build_adapters() 获取出站端口适配器
     /// 8. 构造 OrchestrationService + 观察者，打包为 Composition
     pub async fn build(app_config: &AppConfig) -> anyhow::Result<Composition> {
         // 0. 先创建框架初始化器（用于后续藏经阁引擎初始化）
         let app_config_arc = Arc::new(app_config.clone());
         let framework_initializer = Arc::new(SubhutiFrameworkInitializer::new(app_config_arc));
+
+        // 0.1 统一数据目录：所有运行时落盘数据都在它下面，启动时打印绝对路径
+        //     （可用 SUBHUTI_DATA_DIR 覆盖，默认 ~/.subhuti/data）
+        match subhuti_infra::data_dir::ensure_data_dir() {
+            Ok(dir) => record_fn_log(
+                None,
+                "",
+                LogLevel::Info,
+                format!("数据目录: {}（SUBHUTI_DATA_DIR 可覆盖）", dir.display()),
+                None,
+            ),
+            Err(e) => record_fn_log(
+                None,
+                "",
+                LogLevel::Warn,
+                format!(
+                    "数据目录创建失败: {}（{}）",
+                    e,
+                    subhuti_infra::data_dir::data_dir().display()
+                ),
+                None,
+            ),
+        }
 
         // 1. 创建领域数据仓库：
         //    - test_mode=true 用内存仓库
@@ -156,7 +179,7 @@ impl CompositionRoot {
                     None,
                     "",
                     LogLevel::Info,
-                    "藏经阁引擎使用内存模式（无 PG 持久化）",
+                    "未检测到 PostgreSQL，藏经阁引擎将降级使用 SQLite 持久化（SUBHUTI_SUTRA_SQLITE 可自定义路径）",
                     None,
                 );
                 None
@@ -207,12 +230,36 @@ impl CompositionRoot {
             None,
         );
 
-        // 6. 通过 SubhutiFrameworkInitializer 注册所有图编排
-        framework_initializer.register_all_graphs().await;
+        // 6. 框架不再注册任何 Graph 编排（Workflow 已下沉为专家内部，由专家自选执行路径）
 
         // 7. 创建观察者适配器（必须先于 build_adapters，用于函数调用链路追踪注入引擎）
+        //    优先使用共享 SQLite：HTTP 与 MCP 两进程写入同一文件，trace 自然汇聚，
+        //    可在任一进程的 /traces 查到全部链路。SQLite 不可用（如只读文件系统）
+        //    则降级为进程内内存存储（仅本进程可见）。
+        let trace_db_path = resolve_trace_db_path();
         let trace_observer: Arc<dyn TraceObserverPort> =
-            Arc::new(SubhutiTraceObserverAdapter::new());
+            match SqliteTraceStore::open(&trace_db_path) {
+                Ok(store) => {
+                    record_fn_log(
+                        None,
+                        "",
+                        LogLevel::Info,
+                        format!("Trace 持久化已启用 (共享 SQLite): {}", trace_db_path),
+                        None,
+                    );
+                    Arc::new(SqliteTraceObserverAdapter::new(Arc::new(store)))
+                }
+                Err(e) => {
+                    record_fn_log(
+                        None,
+                        "",
+                        LogLevel::Warn,
+                        format!("Trace SQLite 打开失败，降级为内存存储: {}", e),
+                        None,
+                    );
+                    Arc::new(InMemoryTraceObserverAdapter::new())
+                }
+            };
         let session_observer: Arc<dyn SessionObserverPort> =
             Arc::new(SubhutiSessionObserverAdapter::new());
 

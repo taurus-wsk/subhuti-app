@@ -2,7 +2,7 @@
 //!
 //! 实现框架 `EventHandler` trait，订阅框架 EventBus，
 //! 将带 trace_id 的事件转换为应用层 `SpanData`，并通过 `TraceObserverPort.record_span`
-//! 写入 SubhutiTraceObserverAdapter.spans HashMap，供 get_span_tree 查询组装树。
+//! 写入观察者（InMemory / 共享 SQLite 两种后端），供 get_span_tree 查询组装树。
 //!
 //! 六边形架构：
 //! - 属于 outbound adapter（适配框架 EventHandler → 应用层 TraceObserverPort）

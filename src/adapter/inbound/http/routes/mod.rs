@@ -17,16 +17,14 @@ pub mod traces;
 
 use std::sync::Arc;
 
-use crate::application::{
-    ChatPort, ExpertQueryPort, SessionObserverPort, SkillPort, TraceObserverPort,
-};
+use crate::application::{ChatPort, ExpertQueryPort, SessionObserverPort, TraceObserverPort};
 
 /// Axum State 分发的依赖注入容器
 ///
 /// 六边形架构：入站适配层通过 Port 接口调用应用层，不直接依赖框架实例。
 /// 所有依赖以 `Arc<dyn Port>` 形式持有，实现 Clone 以支持 axum State 分发。
 ///
-/// 接口隔离：原 OrchestratePort（9 方法）拆分为 3 个窄端口，
+/// 接口隔离：原 OrchestratePort（9 方法）拆分为 2 个窄端口，
 /// handler 只依赖需要的端口。
 #[derive(Clone)]
 pub struct AppState {
@@ -34,8 +32,6 @@ pub struct AppState {
     pub chat_port: Arc<dyn ChatPort>,
     /// 入站窄端口 2：专家查询
     pub expert_query_port: Arc<dyn ExpertQueryPort>,
-    /// 入站窄端口 3：技能操作
-    pub skill_port: Arc<dyn SkillPort>,
     /// 出站端口：追踪观察者（记录执行链路）
     pub trace_observer: Arc<dyn TraceObserverPort>,
     /// 出站端口：会话观察者（记录会话信息）

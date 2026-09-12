@@ -3,7 +3,7 @@
 //! 入站适配层通过这些窄端口调用应用层：
 //! - `ChatPort`：聊天/编排调度（orchestrate + orchestrate_stream）
 //! - `ExpertQueryPort`：专家查询（list_experts + match_expert + analyze_task）
-//! - `SkillPort`：技能操作（skill_list + execute_skill + execute_skill_stream）
+//! - `SkillPort`：技能操作（skill_list + execute_skill）
 //!
 //! ## 设计原则
 //!
@@ -63,7 +63,9 @@ pub enum StreamEvent {
 /// 聊天/编排调度端口（入站窄端口 1）
 ///
 /// 负责执行调度和流式调度。
-/// chat_handler / orchestrate_handler / chat_stream_handler 依赖此端口。
+/// `orchestrate_handler`（编排统一入口，按 `Accept` 分流到 JSON / SSE）与
+/// `chat_stream_handler`（强制流式的兼容别名）依赖此端口；MCP 的 `subhuti_chat`
+/// 不经 HTTP，直接调用本端口。
 pub trait ChatPort: Sync + Send + 'static {
     /// 执行调度（核心）
     fn orchestrate(
@@ -101,10 +103,11 @@ pub trait ExpertQueryPort: Sync + Send + 'static {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = serde_json::Value> + Send>>;
 }
 
-/// 技能操作端口（入站窄端口 3）
+/// 技能操作端口
 ///
-/// 负责技能列表、执行技能、流式执行技能。
-/// skill_list_handler / skill_execute_handler / skill_stream_handler 依赖此端口。
+/// 负责技能列表、执行技能。**唯一的入站消费方是 MCP**
+/// （`subhuti_skill_list` / `subhuti_skill_run`）；
+/// HTTP 面已不再暴露技能路由，故不属于 HTTP 的 AppState 依赖。
 pub trait SkillPort: Sync + Send + 'static {
     /// 获取所有技能（从专家聚合）
     fn skill_list(
@@ -122,16 +125,4 @@ pub trait SkillPort: Sync + Send + 'static {
         trace_id: &str,
         session_id: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SkillResponse> + Send>>;
-
-    /// 流式执行技能（协议中立流事件）
-    ///
-    /// - `trace_id`: 追踪 ID（由 TraceAppService 装饰器生成并传入）
-    /// - `session_id`: 会话 ID（同上）
-    fn execute_skill_stream(
-        &self,
-        skill_id: &str,
-        args: &str,
-        trace_id: &str,
-        session_id: &str,
-    ) -> mpsc::Receiver<StreamEvent>;
 }

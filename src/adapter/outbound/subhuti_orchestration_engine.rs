@@ -111,9 +111,13 @@ impl OrchestrationEnginePort for SubhutiOrchestrationEngine {
             }
 
             // 如果指定了图名称，设置图信息（dispatch 时优先使用指定图）
-            // "default" 是前端未选择知识库时的默认值，此时不设置 graph_name，
-            // 让 Orchestrator 走关键词匹配逻辑找到正确的图。
-            if !graph.is_empty() && graph != "default" {
+            //
+            // 过去这里写的是 `graph != "default"`，把 "default" 当作「前端未选择」
+            // 静默忽略，副作用是调用方无法明确表达「别猜图」，只能听任关键词
+            // 路由误判（实测把 Blender 问题判进了 rust_edit，跑了 4 分钟）。
+            // 现在显式指定的图一律生效；"default" 由 Orchestrator 解释为
+            // 「跳过关键词匹配，直接交给最相关的专家」。
+            if !graph.is_empty() {
                 ctx.set_metadata("graph_name", &graph);
             }
 
@@ -169,7 +173,7 @@ impl OrchestrationEnginePort for SubhutiOrchestrationEngine {
                 chain: vec![result.strategy],
                 expert_chain: result.expert_chain,
                 expert_outputs: result.expert_outputs,
-                duration_ms: 0,
+                duration_ms,
                 error: if result.success {
                     None
                 } else {

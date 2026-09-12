@@ -8,6 +8,7 @@
 //! - `doctor` - 环境诊断
 //! - `api` - HTTP API 客户端（调用 agent）
 //! - `log-stream` - 实时日志监控
+//! - `mcp` - 启动 MCP server（stdio），供 WorkBuddy / MCP client 调用
 
 pub mod api;
 pub mod doctor;
@@ -62,12 +63,21 @@ pub enum Commands {
         #[command(subcommand)]
         subcommand: ApiCommands,
     },
+    /// 启动 MCP server（stdio），供 WorkBuddy / 其他 MCP client 调用
+    Mcp {
+        #[arg(long)]
+        debug: bool,
+        #[arg(long)]
+        log_level: Option<String>,
+        /// 并发工具调用上限（限流，防止本地 LLM 被同时打爆），默认 2
+        #[arg(long)]
+        concurrency: Option<usize>,
+    },
 }
 
 #[derive(Subcommand)]
 pub enum ApiCommands {
     Health,
-    Skills,
     Experts,
     Trace {
         #[arg(long)]

@@ -489,10 +489,10 @@ fn render_fn_call_node(html: &mut String, node: &serde_json::Value, depth: usize
 
     // 格式化内存显示
     let mem_entry_str = memory_entry
-        .map(|b| format_mem_bytes(b))
+        .map(format_mem_bytes)
         .unwrap_or_else(|| "-".into());
     let mem_exit_str = memory_exit
-        .map(|b| format_mem_bytes(b))
+        .map(format_mem_bytes)
         .unwrap_or_else(|| "-".into());
     let mem_diff_str = if memory_diff > 0 {
         format!(" (+{} bytes)", memory_diff)
@@ -545,7 +545,7 @@ fn render_fn_call_node(html: &mut String, node: &serde_json::Value, depth: usize
           {}
         </div>",
         indent,
-        if has_children { "" } else { "" },
+        "",
         icon_class, icon,
         fn_name,
         duration_ms,

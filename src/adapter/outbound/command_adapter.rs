@@ -10,6 +10,12 @@ use crate::domain::ports::{CommandOutput, CommandPort};
 /// 在指定工作目录中执行 shell 命令，返回 stdout、stderr 和退出码。
 pub struct LocalCommandAdapter;
 
+impl Default for LocalCommandAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LocalCommandAdapter {
     pub fn new() -> Self {
         Self
