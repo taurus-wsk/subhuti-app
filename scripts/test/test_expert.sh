@@ -68,12 +68,12 @@ fi
 # 7. 获取 Skill 列表（验证是否注入了专家技能）
 echo ""
 echo "【步骤7】获取 Skill 列表（验证是否注入了专家技能）..."
-SKILLS=$(curl -s "$BASE_URL/skills")
-echo "$SKILLS" | jq '.skills[].name'
+SKILLS=$(curl -s "$BASE_URL/experts")
+echo "$SKILLS" | jq '.data[].skills[].name'
 
 # 验证是否包含专家技能
-MOOD_CHECK=$(echo "$SKILLS" | jq -r '.skills[] | select(.name == "mood_check") | .name' | head -1)
-STRESS_RELIEF=$(echo "$SKILLS" | jq -r '.skills[] | select(.name == "stress_relief") | .name' | head -1)
+MOOD_CHECK=$(echo "$SKILLS" | jq -r '.data[].skills[] | select(.name == "mood_check") | .name' | head -1)
+STRESS_RELIEF=$(echo "$SKILLS" | jq -r '.data[].skills[] | select(.name == "stress_relief") | .name' | head -1)
 
 if [ -n "$MOOD_CHECK" ]; then
     echo "✅ 专家技能 mood_check 已注入"

@@ -161,10 +161,10 @@ fn test_register_duplicate_expert() {
 
 | 步骤 | API 调用 | 预期结果 | 状态 |
 |------|---------|---------|------|
-| 1 | `GET /skills` | 包含 "mood_check" | ⬜ |
-| 2 | `GET /skills` | 包含 "stress_relief" | ⬜ |
+| 1 | `GET /experts` | 包含 "mood_check" | ⬜ |
+| 2 | `GET /experts` | 包含 "stress_relief" | ⬜ |
 | 3 | 停用专家 | - | ⬜ |
-| 4 | `GET /skills` | 不包含专家技能 | ⬜ |
+| 4 | `GET /experts` | 不包含专家技能 | ⬜ |
 
 ---
 

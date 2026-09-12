@@ -36,6 +36,8 @@ Thumbs.db
 .project
 .settings/
 .classpath
+.trae
+.codebuddy
 
 # 环境变量（包含敏感信息）
 .env
@@ -100,3 +102,8 @@ venv/
 # 备份文件
 *.backup
 *.orig
+
+# 运行时数据（SQLite 数据库及 WAL 副产物）
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

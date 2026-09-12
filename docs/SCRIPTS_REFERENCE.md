@@ -233,18 +233,17 @@ make release-test
 | 3. 单元测试 | cargo test --workspace | 所有单元测试 |
 | 4. Docker 构建 | docker.sh build | 镜像构建 |
 | 5. 容器启动 | docker.sh start | 健康检查 |
-| 6. API 测试 | 7 个接口 | 健康、技能、专家、人格、Trace、聊天 |
+| 6. API 测试 | 6 个接口 | 健康、专家、人格、Trace、聊天 |
 | 7. 清理 | 停止容器 | 清理环境 |
 
 ### API 测试覆盖
 
 - ✅ 健康检查：`/subhuti/api/v1/health`
 - ✅ 详细状态：`/subhuti/api/v1/health/detailed`
-- ✅ 技能列表：`/subhuti/api/v1/skills`
 - ✅ 专家列表：`/subhuti/api/v1/experts`
 - ✅ 人格信息：`/subhuti/api/v1/persona`
 - ✅ Trace 追踪：`/subhuti/api/v1/traces`
-- ✅ 聊天功能：`POST /subhuti/api/v1/chat`
+- ✅ 聊天功能：`POST /subhuti/api/v1/orchestrate`
 
 ### 输出产物
 

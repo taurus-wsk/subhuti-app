@@ -227,8 +227,8 @@ fi
 
 # 技能列表
 echo "🛠️  技能列表..."
-SKILLS=$(curl -sf http://localhost:8080/subhuti/api/v1/skills 2>&1)
-SKILL_COUNT=$(echo "$SKILLS" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('skills',[])))" 2>/dev/null)
+SKILLS=$(curl -sf http://localhost:8080/subhuti/api/v1/experts 2>&1)
+SKILL_COUNT=$(echo "$SKILLS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(sum(len(e.get('skills',[])) for e in (d.get('data') or [])))" 2>/dev/null)
 if [ "$SKILL_COUNT" -gt 0 ] 2>/dev/null; then
     record_test "技能列表" "PASS" "$SKILL_COUNT 个技能"
 else

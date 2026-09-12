@@ -24,7 +24,7 @@
 #### 请求
 
 ```http
-POST /subhuti/api/v1/chat
+POST /subhuti/api/v1/orchestrate
 Content-Type: application/json
 ```
 
@@ -73,7 +73,7 @@ Content-Type: application/json
 #### curl 示例
 
 ```bash
-curl -X POST http://localhost:8080/subhuti/api/v1/chat \
+curl -X POST http://localhost:8080/subhuti/api/v1/orchestrate \
   -H "Content-Type: application/json" \
   -d '{
     "message": "你好，今天天气怎么样？",
@@ -84,7 +84,7 @@ curl -X POST http://localhost:8080/subhuti/api/v1/chat \
 #### JavaScript 示例
 
 ```javascript
-const response = await fetch('http://localhost:8080/subhuti/api/v1/chat', {
+const response = await fetch('http://localhost:8080/subhuti/api/v1/orchestrate', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
@@ -94,7 +94,7 @@ const response = await fetch('http://localhost:8080/subhuti/api/v1/chat', {
 });
 
 const data = await response.json();
-console.log(data.data.response);
+console.log(data.data.output);
 ```
 
 ---
@@ -106,7 +106,7 @@ console.log(data.data.response);
 #### 请求
 
 ```http
-POST /subhuti/api/v1/chat/stream
+POST /subhuti/api/v1/orchestrate
 Content-Type: application/json
 Accept: text/event-stream
 ```
@@ -116,50 +116,64 @@ Accept: text/event-stream
 ```json
 {
   "message": "写一个关于秋天的故事",
-  "user_id": "user_001",
-  "stream": true
+  "user_id": "user_001"
 }
 ```
 
 #### 响应流
 
 ```
-data: {"type": "token", "content": "秋", "index": 0}
+data: {"type": "start", "session_id": "..."}
 
-data: {"type": "token", "content": "天", "index": 1}
+data: {"type": "thought", "message": "指定专家: rust-expert", "session_id": "..."}
 
-data: {"type": "token", "content": "来", "index": 2}
+data: {"type": "data", "content": "秋", "session_id": "..."}
+
+data: {"type": "data", "content": "天", "session_id": "..."}
 
 ...
 
-data: {"type": "done", "content": "", "trace_id": "trace_abc"}
+data: {"type": "done", "content": "<完整答案>", "trace_id": "trace_abc", "session_id": "..."}
 ```
 
 #### JavaScript 示例
 
-```javascript
-const eventSource = new EventSource('/subhuti/api/v1/chat/stream');
+`/orchestrate` 是 POST + SSE。浏览器原生 `EventSource` 只支持 GET，所以需用 `fetch` 读取响应流：
 
+```javascript
+const res = await fetch('/subhuti/api/v1/orchestrate', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'Accept': 'text/event-stream',
+  },
+  body: JSON.stringify({ message: '写一个关于秋天的故事', user_id: 'user_001' }),
+});
+
+const reader = res.body.getReader();
+const decoder = new TextDecoder();
+let buffer = '';
 let fullText = '';
 
-eventSource.onmessage = (event) => {
-  const data = JSON.parse(event.data);
-  
-  if (data.type === 'token') {
-    fullText += data.content;
-    console.log('收到 token:', data.content);
-  } else if (data.type === 'done') {
-    console.log('完成！trace_id:', data.trace_id);
-    eventSource.close();
+while (true) {
+  const { value, done } = await reader.read();
+  if (done) break;
+  buffer += decoder.decode(value, { stream: true });
+
+  const lines = buffer.split('\n');
+  buffer = lines.pop() ?? '';
+  for (const line of lines) {
+    if (!line.startsWith('data:')) continue;
+    const data = JSON.parse(line.slice(5).trim());
+    if (data.type === 'data') {
+      fullText += data.content;
+    } else if (data.type === 'done') {
+      fullText = data.content;
+      console.log('完成！trace_id:', data.trace_id);
+    }
   }
-};
-
-eventSource.onerror = (error) => {
-  console.error('流错误:', error);
-  eventSource.close();
-};
+}
 ```
-
 ---
 
 ## 心灵宫殿 API
@@ -781,7 +795,7 @@ async function chatExample() {
   console.log('系统健康:', healthData.healthy);
   
   // 2. 发送第一条消息
-  const chat1 = await fetch(`${baseUrl}/subhuti/api/v1/chat`, {
+  const chat1 = await fetch(`${baseUrl}/subhuti/api/v1/orchestrate`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -790,7 +804,7 @@ async function chatExample() {
     })
   });
   const data1 = await chat1.json();
-  console.log('AI 回复:', data1.data.response);
+  console.log('AI 回复:', data1.data.output);
   console.log('Trace ID:', data1.data.trace_id);
   
   // 3. 查看心灵宫殿状态
@@ -799,7 +813,7 @@ async function chatExample() {
   console.log('记忆总数:', statsData.data.total_count);
   
   // 4. 发送第二条消息（测试记忆）
-  const chat2 = await fetch(`${baseUrl}/subhuti/api/v1/chat`, {
+  const chat2 = await fetch(`${baseUrl}/subhuti/api/v1/orchestrate`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -808,7 +822,7 @@ async function chatExample() {
     })
   });
   const data2 = await chat2.json();
-  console.log('AI 回复:', data2.data.response);
+  console.log('AI 回复:', data2.data.output);
   console.log('使用了', data2.data.used_memories, '条记忆');
 }
 
@@ -838,7 +852,7 @@ async function expertExample() {
   console.log('激活专家:', activateData.data.expert_name);
   
   // 3. 与专家对话
-  const chat = await fetch(`${baseUrl}/subhuti/api/v1/chat`, {
+  const chat = await fetch(`${baseUrl}/subhuti/api/v1/orchestrate`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -847,7 +861,7 @@ async function expertExample() {
     })
   });
   const chatData = await chat.json();
-  console.log('专家回复:', chatData.data.response);
+  console.log('专家回复:', chatData.data.output);
   
   // 4. 停用专家
   const deactivate = await fetch(`${baseUrl}/subhuti/api/v1/experts/deactivate`, {
@@ -924,7 +938,7 @@ BASE_URL = "http://localhost:8080"
 def chat(message, user_id="user_001"):
     """发送聊天消息"""
     response = requests.post(
-        f"{BASE_URL}/subhuti/api/v1/chat",
+        f"{BASE_URL}/subhuti/api/v1/orchestrate",
         json={
             "message": message,
             "user_id": user_id
@@ -1225,7 +1239,7 @@ curl http://localhost:8080/subhuti/api/v1/trace/{trace_id}
 
 ### Q: 如何启用流式输出？
 
-**A**: 在请求中设置 `stream: true`，或使用 `/chat/stream` 端点。
+**A**: 调用 `/orchestrate` 时带上请求头 `Accept: text/event-stream`（响应为 SSE 流，逐 delta 下发）。
 
 ### Q: 心灵宫殿和记忆系统有什么区别？
 

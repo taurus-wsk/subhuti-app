@@ -4,7 +4,7 @@
 # 用法: make [target]
 # ============================================================
 
-.PHONY: help build test test-watch serve serve-debug serve-debug-log serve-mock serve-status serve-logs serve-stop serve-restart docker docker-build docker-stop fmt clippy check clean install release-test trace orch-experts orch-analyze orch-match orch-run orch-all cache-clean cache-stats routes _py_init
+.PHONY: help build test test-watch serve serve-debug serve-debug-log serve-mock serve-status serve-logs serve-stop serve-restart mcp docker docker-build docker-stop fmt clippy check clean install release-test trace orch-experts orch-analyze orch-match orch-run orch-all cache-clean cache-stats routes _py_init
 
 # 默认目标
 .DEFAULT_GOAL := help
@@ -66,6 +66,7 @@ help:
 	@echo "  subhuti db              数据库操作"
 	@echo "  subhuti api             API 测试客户端"
 	@echo "  subhuti flame           性能火焰图"
+	@echo "  subhuti mcp             启动 MCP server (stdio)"
 	@echo ""
 	@echo "$(GREEN)日志查询:$(NC)"
 	@echo "  log-trace ID=<trace_id>    按 trace_id 查日志"
@@ -87,6 +88,7 @@ help:
 	@echo "  serve-debug LOG=1                          同上，环境变量方式"
 	@echo "  serve                                      生产模式 (release build)"
 	@echo "  serve-mock                                 Mock 模式 (不打真实 API, 调 HTTP/编排逻辑用)"
+	@echo "  mcp                                        启动 MCP server (stdio，供 WorkBuddy 调用)"
 	@echo ""
 	@echo "$(GREEN)🎯 Orchestrate 调度调试 (HTTP, 需先启动服务 make serve-debug):$(NC)"
 	@echo "  orch-experts                               列出所有已注册专家快照"
@@ -167,6 +169,12 @@ serve-stop:
 serve-restart:
 	@echo "$(GREEN)🔄 重启服务 ($(BUILD_MODE))...$(NC)"
 	./scripts/build/dev.sh restart $(BUILD_MODE)
+
+# 🔌 MCP server（stdio），供 WorkBuddy / 其他 MCP client 调用
+mcp:
+	@echo "$(GREEN)🔌 启动 MCP server (stdio)...$(NC)"
+	@echo "   WorkBuddy 接入: command=$$(pwd)/target/release/subhuti  args=[mcp]"
+	@cargo run --bin subhuti -- mcp $(if $(DEBUG),--debug,) $(if $(LOG_LEVEL),--log-level $(LOG_LEVEL),) $(if $(CONCURRENCY),--concurrency $(CONCURRENCY),)
 
 fmt:
 	@echo "$(GREEN)📝 格式化代码...$(NC)"

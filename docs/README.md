@@ -104,11 +104,11 @@ subhuti-app/
 
 ### 聊天接口
 ```bash
-# 发送消息
-POST /subhuti/api/v1/chat
+# 发送消息（默认返回一次性 JSON）
+POST /subhuti/api/v1/orchestrate
 
-# 流式输出
-POST /subhuti/api/v1/chat/stream
+# 流式输出（加请求头 Accept: text/event-stream）
+POST /subhuti/api/v1/orchestrate
 ```
 
 ### 心灵宫殿

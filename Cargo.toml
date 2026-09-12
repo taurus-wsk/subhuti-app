@@ -17,10 +17,6 @@ default-run = "subhuti"
 name = "subhuti"
 path = "src/bin/main.rs"
 
-[[bin]]
-name = "subhuti-app"
-path = "src/bin/subhuti_app.rs"
-
 [dependencies]
 subhuti-core = { path = "crates/subhuti-core" }
 subhuti-infra = { path = "crates/subhuti-infra" }

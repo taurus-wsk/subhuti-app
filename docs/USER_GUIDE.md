@@ -465,12 +465,12 @@ pub trait Skill: Send + Sync {
 curl http://localhost:8080/subhuti/api/v1/health
 
 # 聊天（AI 自动匹配 Skill）
-curl -X POST http://localhost:8080/subhuti/api/v1/chat \
+curl -X POST http://localhost:8080/subhuti/api/v1/orchestrate \
   -H "Content-Type: application/json" \
   -d '{"message": "你好", "user_id": "test"}'
 
 # 指定 Skill
-curl -X POST http://localhost:8080/subhuti/api/v1/chat \
+curl -X POST http://localhost:8080/subhuti/api/v1/orchestrate \
   -H "Content-Type: application/json" \
   -d '{"message": "123 + 456 = ?", "skill": "calculator"}'
 ```
@@ -711,11 +711,7 @@ subhuti-app/
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/subhuti/api/v1/health` | 健康检查 |
-| GET | `/subhuti/api/v1/skills` | 技能列表 |
-| POST | `/subhuti/api/v1/chat` | 聊天（AI 匹配）|
-| POST | `/subhuti/api/v1/chat/stream` | 流式聊天 |
-| POST | `/subhuti/api/v1/skills/{name}` | 执行指定技能 |
-| POST | `/subhuti/api/v1/skills/{name}/stream` | 流式执行技能 |
+| POST | `/subhuti/api/v1/orchestrate` | 编排统一入口（`Accept: text/event-stream` 时 SSE 流式）|
 | GET | `/subhuti/api/v1/traces` | Trace 列表 |
 | GET | `/subhuti/api/v1/traces/{id}` | Trace 详情 |
 | GET | `/subhuti/api/v1/experts` | 专家列表 |
@@ -731,6 +727,8 @@ subhuti-app/
 | POST | `/subhuti/api/v1/persona/evolve` | 触发演化 |
 | GET | `/subhuti/api/v1/logs` | 日志查询 |
 | GET | `/` | 测试页面 |
+
+> 技能列表与技能执行**不在 HTTP 面暴露**，改用 MCP 工具 `subhuti_skill_list` / `subhuti_skill_run`。
 
 ---
 

@@ -83,7 +83,7 @@ subhuti <COMMAND>
 Commands:
   serve         启动 HTTP 服务（--mock 启用 Mock LLM，--debug 调试模式，--addr 指定端口）
   doctor        环境诊断
-  api           调用 API（health/skills/experts/trace/sessions/orchestrate）
+  api           调用 API（health/experts/trace/sessions/orchestrate）
   log-stream    实时日志流（--trace-id / --level / --keyword 过滤）
 ```
 
@@ -102,9 +102,8 @@ subhuti doctor
 # 健康检查
 subhuti api health
 
-# 专家/技能列表
+# 专家列表
 subhuti api experts
-subhuti api skills
 
 # 编排调用（健康检查 → LLM 规划执行）
 subhuti api orchestrate --message "你好"
@@ -180,12 +179,11 @@ subhuti-app/
 ├── src/
 │   ├── adapter/
 │   │   ├── inbound/            # 入口：CLI + HTTP(Axum) 路由
-│   │   └── outbound/           # 出站：专家适配器、文件系统、命令、LLM 注入、graph/rules
+│   │   └── outbound/           # 出站：专家适配器、文件系统、命令、LLM 注入、rules
 │   ├── application/            # 应用层：编排服务、组合根、trace 装饰
 │   ├── domain/                 # 领域层：DomainExpert、专家实现（rust_expert 等）、ports
 │   ├── infra/                  # 应用配置
-│   ├── report/                 # 报告渲染（火焰图等）
-│   └── bin/                    # 二进制入口：main.rs(subhuti)、subhuti_app.rs
+│   └── bin/                    # 二进制入口：main.rs（subhuti）
 │
 ├── sql/
 │   └── schema.sql              # 数据库表结构（唯一权威来源）
@@ -227,14 +225,14 @@ make routes        # 列出已注册 HTTP 路由
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/health` | 健康检查 |
-| POST | `/chat/stream` | 流式聊天（SSE，实时进度） |
-| GET | `/skills` | 技能列表 |
+| POST | `/orchestrate` | 编排统一入口（`Accept: text/event-stream` 时返回 SSE 流式） |
 | GET | `/experts` | 专家列表 |
-| POST | `/orchestrate` | 编排调用 |
 | GET | `/traces` | Trace 列表 |
 | GET | `/traces/:id` | Trace 详情 |
 | GET | `/sessions` | 会话列表 |
 | GET/POST | `/knowledge` | 知识库相关 |
+
+> 技能列表与技能执行**不在 HTTP 面暴露**，改用 MCP 工具 `subhuti_skill_list` / `subhuti_skill_run`。
 
 ---
 

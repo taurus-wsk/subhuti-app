@@ -80,7 +80,7 @@ http://localhost:8080/
 或者使用 curl 发送消息：
 
 ```bash
-curl -X POST http://localhost:8080/subhuti/api/v1/chat \
+curl -X POST http://localhost:8080/subhuti/api/v1/orchestrate \
   -H "Content-Type: application/json" \
   -d '{"message": "你好，我是小明，今天天气真好！", "user_id": "test_user_001"}'
 ```

@@ -84,9 +84,9 @@ fi
 # 6. 验证技能注入
 echo ""
 echo "【步骤6】验证专家技能已注入..."
-SKILLS=$(curl -s "$BASE_URL/skills")
-MOOD_CHECK=$(echo "$SKILLS" | jq -r '.skills[] | select(.name == "mood_check") | .name')
-STRESS_RELIEF=$(echo "$SKILLS" | jq -r '.skills[] | select(.name == "stress_relief") | .name')
+SKILLS=$(curl -s "$BASE_URL/experts")
+MOOD_CHECK=$(echo "$SKILLS" | jq -r '.data[].skills[] | select(.name == "mood_check") | .name')
+STRESS_RELIEF=$(echo "$SKILLS" | jq -r '.data[].skills[] | select(.name == "stress_relief") | .name')
 if [ -n "$MOOD_CHECK" ]; then
     echo "✅ mood_check 技能已注入"
 fi

@@ -109,9 +109,9 @@ for t in traces:
     
     skills)
         check_service
-        echo -e "${GREEN}🎯 Skill 列表${NC}"
+        echo -e "${GREEN}🎯 技能列表（经 /experts 聚合）${NC}"
         echo ""
-        curl -s "$API_BASE/skills" | python3 -m json.tool
+        curl -s "$API_BASE/experts" | python3 -m json.tool
         ;;
     
     *)
