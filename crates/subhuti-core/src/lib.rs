@@ -6,13 +6,11 @@
 //!
 //! - **core**: 只定义规则和运行时机制，不含任何业务细节
 //! - **infra**: 具体实现，对接第三方服务（LLM API、数据库、工具等）
-//! - **应用层**: 业务实现，使用 core 接口和 infra 实现
+//! - **应用层**: 业务实现，使用 core 接口和 infra 实现（注：框架已无 Graph 编排，Workflow 下沉至专家内部）
 
 pub mod common;
 pub mod engine;
 pub mod event;
-pub mod graph;
-pub mod guardrails;
 pub mod memory;
 pub mod observe;
 pub mod orchestrator;
@@ -28,12 +26,6 @@ pub use event::{
     recorder::EventRecorder,
     types::{AgentEventData, ArcEvent, Event, EventMetadata},
 };
-pub use graph::{
-    ActorAddr, ActorHandle, ActorHealth, ActorLifecycle, ActorStats, Checkpoint, CheckpointStore,
-    ConditionalEdge, Edge, EventDrivenScheduler, Graph, GraphBuilder, GraphError, GraphNode,
-    GraphOutput, GraphState, GraphStructure, MemoryCheckpointStore, NodeActor, NodeFn, NodeMessage,
-    NodeResult, Route, StateReducer, SupervisionStrategy, Supervisor,
-};
 pub use memory::Memory;
 pub use observe::{
     record_fn_log, FnCallData, FnTracer, LogEntry, LogLevel, SpanData, TraceHandle,
@@ -44,10 +36,10 @@ pub use orchestrator::{
     ActorRegistry, AdaptiveOptions, AgentContext, AgentRegistry, AskRequest, BoxFuture,
     DefaultDispatchRule, DefaultExecutionRule, DefaultTaskAnalysisRule, DispatchPlan, DispatchRule,
     DispatchStrategy, EventBusRef, ExecutionResult, ExecutionRule, ExpertAgent,
-    ExpertAgentActorAdapter, ExpertState, FrameworkExpertInfo, FromState, GraphOrchestrator, Llm,
-    LlmToolFallback, MemoryRef, OrchestrationResult, Orchestrator, PlanOrAsk, PlanStep,
-    ResultStrategy, RuleConfig, RuleEngine, SkillPlan, Step, StepFallback, TaskAnalysisRule,
-    TaskProfile, TokenUsage, ToolExecutor,
+    ExpertAgentActorAdapter, ExpertState, FrameworkExpertInfo, FromState, Llm, LlmToolFallback,
+    MemoryRef, OrchestrationResult, Orchestrator, PlanOrAsk, PlanStep, ResultStrategy, RuleConfig,
+    RuleEngine, SkillPlan, Step, StepFallback, TaskAnalysisRule, TaskProfile, TokenUsage,
+    ToolExecutor,
 };
 pub use runtime::{
     LLMConfig, LLMProvider, LLMResponse, Message, Role, Session, Tool, ToolCall, ToolCallResult,
@@ -65,8 +57,6 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     #[error("Orchestrator: {0}")]
     Orchestrator(String),
-    #[error("Graph: {0}")]
-    Graph(String),
     #[error("Event: {0}")]
     Event(String),
     #[error("Memory: {0}")]
@@ -113,7 +103,6 @@ impl ClassifiableError for Error {
             Error::FixFailed(_) => ErrorKind::Fixable,
             Error::CompensationFailed(_) => ErrorKind::Fixable,
             Error::FallbackFailed(_) => ErrorKind::Fixable,
-            Error::Graph(_) => ErrorKind::Fixable,
             Error::Expert(_) => ErrorKind::Fatal,
             Error::Orchestrator(_) => ErrorKind::Fatal,
             Error::Event(_) => ErrorKind::Retryable,

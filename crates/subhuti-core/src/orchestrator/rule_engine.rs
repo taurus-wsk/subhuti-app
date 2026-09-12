@@ -48,7 +48,7 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use super::ExpertAgent;
@@ -67,9 +67,10 @@ pub enum DispatchStrategy {
 }
 
 /// 结果聚合策略
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ResultStrategy {
     /// 取最后一个专家的输出
+    #[default]
     TakeLast,
     /// 取第一个专家的输出
     TakeFirst,
@@ -77,14 +78,8 @@ pub enum ResultStrategy {
     MergeAll,
 }
 
-impl Default for ResultStrategy {
-    fn default() -> Self {
-        Self::TakeLast
-    }
-}
-
 /// 任务画像（Layer 1 输出）
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TaskProfile {
     /// 领域标签（关键词提取）
     pub domain_tags: Vec<String>,
@@ -96,18 +91,6 @@ pub struct TaskProfile {
     pub predicate: Option<String>,
     /// 宾语
     pub object: Option<String>,
-}
-
-impl Default for TaskProfile {
-    fn default() -> Self {
-        Self {
-            domain_tags: Vec::new(),
-            task_type: String::new(),
-            subject: None,
-            predicate: None,
-            object: None,
-        }
-    }
 }
 
 /// 调度计划（Layer 2 输出）
@@ -410,7 +393,7 @@ impl DefaultDispatchRule {
             }
         }
 
-        matched.sort_by(|a, b| b.1.cmp(&a.1));
+        matched.sort_by_key(|m| std::cmp::Reverse(m.1));
         matched
     }
 
@@ -582,9 +565,12 @@ impl ExecutionRule for DefaultExecutionRule {
 /// 规则引擎 - 协调三层规则
 pub struct RuleEngine {
     config: RuleConfig,
-    analysis_rule: Arc<dyn TaskAnalysisRule>,
-    dispatch_rule: Arc<dyn DispatchRule>,
-    execution_rule: Arc<dyn ExecutionRule>,
+    /// 三条规则均为 `RwLock<Arc<dyn ..>>`：
+    /// 支持运行时热替换（`&self`），同时让 Orchestrator 可被并发共享，
+    /// 不必为「改规则」而在编排主链路上加排他锁。
+    analysis_rule: RwLock<Arc<dyn TaskAnalysisRule>>,
+    dispatch_rule: RwLock<Arc<dyn DispatchRule>>,
+    execution_rule: RwLock<Arc<dyn ExecutionRule>>,
 }
 
 impl RuleEngine {
@@ -592,9 +578,9 @@ impl RuleEngine {
     pub fn new(config: RuleConfig) -> Self {
         Self {
             config,
-            analysis_rule: Arc::new(DefaultTaskAnalysisRule::new()),
-            dispatch_rule: Arc::new(DefaultDispatchRule::new()),
-            execution_rule: Arc::new(DefaultExecutionRule::new()),
+            analysis_rule: RwLock::new(Arc::new(DefaultTaskAnalysisRule::new())),
+            dispatch_rule: RwLock::new(Arc::new(DefaultDispatchRule::new())),
+            execution_rule: RwLock::new(Arc::new(DefaultExecutionRule::new())),
         }
     }
 
@@ -605,37 +591,87 @@ impl RuleEngine {
 
     /// 替换任务分析规则
     pub fn with_analysis_rule(mut self, rule: Arc<dyn TaskAnalysisRule>) -> Self {
-        self.analysis_rule = rule;
+        self.analysis_rule = RwLock::new(rule);
         self
     }
 
     /// 替换调度规则
     pub fn with_dispatch_rule(mut self, rule: Arc<dyn DispatchRule>) -> Self {
-        self.dispatch_rule = rule;
+        self.dispatch_rule = RwLock::new(rule);
         self
     }
 
     /// 替换执行规则
     pub fn with_execution_rule(mut self, rule: Arc<dyn ExecutionRule>) -> Self {
-        self.execution_rule = rule;
+        self.execution_rule = RwLock::new(rule);
         self
+    }
+
+    // ── 规则读取（读锁快照，锁中毒时回退默认规则）──
+
+    fn current_analysis_rule(&self) -> Arc<dyn TaskAnalysisRule> {
+        match self.analysis_rule.read() {
+            Ok(guard) => guard.clone(),
+            Err(e) => {
+                tracing::error!("RuleEngine.analysis_rule 读锁中毒，回退默认规则: {}", e);
+                Arc::new(DefaultTaskAnalysisRule::new())
+            }
+        }
+    }
+
+    fn current_dispatch_rule(&self) -> Arc<dyn DispatchRule> {
+        match self.dispatch_rule.read() {
+            Ok(guard) => guard.clone(),
+            Err(e) => {
+                tracing::error!("RuleEngine.dispatch_rule 读锁中毒，回退默认规则: {}", e);
+                Arc::new(DefaultDispatchRule::new())
+            }
+        }
+    }
+
+    fn current_execution_rule(&self) -> Arc<dyn ExecutionRule> {
+        match self.execution_rule.read() {
+            Ok(guard) => guard.clone(),
+            Err(e) => {
+                tracing::error!("RuleEngine.execution_rule 读锁中毒，回退默认规则: {}", e);
+                Arc::new(DefaultExecutionRule::new())
+            }
+        }
+    }
+
+    fn replace_analysis_rule(&self, rule: Arc<dyn TaskAnalysisRule>) {
+        if let Ok(mut guard) = self.analysis_rule.write() {
+            *guard = rule;
+        }
+    }
+
+    fn replace_dispatch_rule(&self, rule: Arc<dyn DispatchRule>) {
+        if let Ok(mut guard) = self.dispatch_rule.write() {
+            *guard = rule;
+        }
+    }
+
+    fn replace_execution_rule(&self, rule: Arc<dyn ExecutionRule>) {
+        if let Ok(mut guard) = self.execution_rule.write() {
+            *guard = rule;
+        }
     }
 
     // ── 运行时替换（不消费 self，供应用层在启动后替换）──
 
     /// 运行时替换任务分析规则（Layer 1）
-    pub fn set_analysis_rule(&mut self, rule: Arc<dyn TaskAnalysisRule>) {
-        self.analysis_rule = rule;
+    pub fn set_analysis_rule(&self, rule: Arc<dyn TaskAnalysisRule>) {
+        self.replace_analysis_rule(rule);
     }
 
     /// 运行时替换调度决策规则（Layer 2）
-    pub fn set_dispatch_rule(&mut self, rule: Arc<dyn DispatchRule>) {
-        self.dispatch_rule = rule;
+    pub fn set_dispatch_rule(&self, rule: Arc<dyn DispatchRule>) {
+        self.replace_dispatch_rule(rule);
     }
 
     /// 运行时替换执行监控规则（Layer 3）
-    pub fn set_execution_rule(&mut self, rule: Arc<dyn ExecutionRule>) {
-        self.execution_rule = rule;
+    pub fn set_execution_rule(&self, rule: Arc<dyn ExecutionRule>) {
+        self.replace_execution_rule(rule);
     }
 
     /// 获取配置引用
@@ -644,15 +680,16 @@ impl RuleEngine {
     }
 
     /// 获取执行规则引用
-    pub fn execution_rule(&self) -> &Arc<dyn ExecutionRule> {
-        &self.execution_rule
+    /// 获取当前执行规则（返回 Arc 克隆，不再暴露内部引用）
+    pub fn execution_rule(&self) -> Arc<dyn ExecutionRule> {
+        self.current_execution_rule()
     }
 
     // ── Layer 1: 任务分析 ──
 
     pub fn analyze_task(&self, input: &str) -> crate::Result<TaskProfile> {
         tracing::info!("[任务理解·Layer1] 开始分析任务");
-        let profile = self.analysis_rule.analyze(input, &self.config)?;
+        let profile = self.current_analysis_rule().analyze(input, &self.config)?;
         tracing::info!(
             "[任务理解·Layer1] 分析完成: domain_tags={:?}, task_type={}",
             profile.domain_tags,
@@ -668,7 +705,9 @@ impl RuleEngine {
         profile: &TaskProfile,
         agents: &[Arc<dyn ExpertAgent>],
     ) -> crate::Result<DispatchPlan> {
-        let plan = self.dispatch_rule.decide(profile, agents, &self.config)?;
+        let plan = self
+            .current_dispatch_rule()
+            .decide(profile, agents, &self.config)?;
         tracing::info!(
             "[调度策略·Layer2] 策略: {:?}, 步骤数: {}",
             plan.strategy,
@@ -680,24 +719,26 @@ impl RuleEngine {
     // ── Layer 3: 执行监控（由 Orchestrator 在执行循环中调用）──
 
     pub fn check_max_steps(&self, current_step: usize) -> crate::Result<()> {
-        self.execution_rule
+        self.current_execution_rule()
             .check_max_steps(current_step, &self.config)
     }
 
     pub fn check_timeout(&self, elapsed: Duration) -> crate::Result<()> {
-        self.execution_rule.check_timeout(elapsed, &self.config)
+        self.current_execution_rule()
+            .check_timeout(elapsed, &self.config)
     }
 
     pub fn per_step_timeout(&self) -> Duration {
-        self.execution_rule.per_step_timeout(&self.config)
+        self.current_execution_rule().per_step_timeout(&self.config)
     }
 
     pub fn should_continue(&self) -> bool {
-        self.execution_rule.should_continue(&self.config)
+        self.current_execution_rule().should_continue(&self.config)
     }
 
     pub fn merge_results(&self, results: &[String]) -> String {
-        self.execution_rule.merge_results(results, &self.config)
+        self.current_execution_rule()
+            .merge_results(results, &self.config)
     }
 }
 

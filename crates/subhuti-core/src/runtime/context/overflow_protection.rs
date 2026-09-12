@@ -83,10 +83,10 @@ impl OverflowProtection {
         let mut sorted_entries: Vec<super::manager::ContextEntry> = snapshot
             .normal_entries
             .into_iter()
-            .chain(snapshot.low_entries.into_iter())
+            .chain(snapshot.low_entries)
             .collect();
 
-        sorted_entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        sorted_entries.sort_by_key(|a| a.timestamp);
 
         for entry in sorted_entries {
             let current_tokens = manager.get_token_count().await;
@@ -103,7 +103,7 @@ impl OverflowProtection {
         let mut low_priority_entries: Vec<super::manager::ContextEntry> = snapshot
             .normal_entries
             .into_iter()
-            .chain(snapshot.low_entries.into_iter())
+            .chain(snapshot.low_entries)
             .collect();
 
         low_priority_entries.sort_by(|a, b| b.priority.cmp(&a.priority));
@@ -148,7 +148,7 @@ impl OverflowProtection {
 
 #[cfg(test)]
 mod tests {
-    use super::super::manager::{ContextConfig, ContextManager, ContextPriority};
+    use super::super::manager::{ContextConfig, ContextManager};
     use super::*;
 
     #[tokio::test]

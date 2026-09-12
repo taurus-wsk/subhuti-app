@@ -13,7 +13,7 @@ impl CtxId {
         Self(Uuid::new_v4().to_string())
     }
 
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_string(s: &str) -> Self {
         Self(s.to_string())
     }
 

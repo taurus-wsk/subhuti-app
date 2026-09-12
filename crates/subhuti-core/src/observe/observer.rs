@@ -375,12 +375,23 @@ pub fn record_fn_log(
     let msg = message.into();
     let fn_tag = fn_name.unwrap_or("system");
     // 始终输出到 tracing（终端 stdout + 日志文件）
+    // 关键：把 trace_id 作为字段附带，使 JSON 日志与 log_stream --trace-id 能按链路过滤
     match level {
-        LogLevel::Trace => tracing::trace!(target: "subhuti", "[{}] {}", fn_tag, msg),
-        LogLevel::Debug => tracing::debug!(target: "subhuti", "[{}] {}", fn_tag, msg),
-        LogLevel::Info => tracing::info!(target: "subhuti", "[{}] {}", fn_tag, msg),
-        LogLevel::Warn => tracing::warn!(target: "subhuti", "[{}] {}", fn_tag, msg),
-        LogLevel::Error => tracing::error!(target: "subhuti", "[{}] {}", fn_tag, msg),
+        LogLevel::Trace => {
+            tracing::trace!(target: "subhuti", trace_id = %trace_id, "[{}] {}", fn_tag, msg)
+        }
+        LogLevel::Debug => {
+            tracing::debug!(target: "subhuti", trace_id = %trace_id, "[{}] {}", fn_tag, msg)
+        }
+        LogLevel::Info => {
+            tracing::info!(target: "subhuti", trace_id = %trace_id, "[{}] {}", fn_tag, msg)
+        }
+        LogLevel::Warn => {
+            tracing::warn!(target: "subhuti", trace_id = %trace_id, "[{}] {}", fn_tag, msg)
+        }
+        LogLevel::Error => {
+            tracing::error!(target: "subhuti", trace_id = %trace_id, "[{}] {}", fn_tag, msg)
+        }
     }
     // 如果 observer 可用，同时写入跟踪报告
     if let Some(obs) = observer {

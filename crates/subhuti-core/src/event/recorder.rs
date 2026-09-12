@@ -287,22 +287,17 @@ impl From<String> for ReplayError {
 }
 
 /// 回放策略
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum ReplayStrategy {
     /// 遇到错误立即停止
     StopOnError,
     /// 跳过失败事件，继续回放
+    #[default]
     SkipOnError,
     /// 重试指定次数后跳过
     RetryThenSkip { max_retries: usize, delay_ms: u64 },
     /// 重试指定次数后停止
     RetryThenStop { max_retries: usize, delay_ms: u64 },
-}
-
-impl Default for ReplayStrategy {
-    fn default() -> Self {
-        Self::SkipOnError
-    }
 }
 
 /// 回放统计
@@ -328,6 +323,9 @@ impl ReplayStats {
     }
 }
 
+/// 回放回调类型（事件 → 回放结果）
+type ReplayCallback = Box<dyn Fn(&Event) -> ReplayResult<()> + Send + Sync>;
+
 /// 事件回放器
 ///
 /// 从 Recording 回放事件，用于调试和分析。
@@ -337,7 +335,7 @@ pub struct EventPlayer {
     /// 回放速度倍率（1.0 = 实时，0 = 瞬间完成）
     speed: f64,
     /// 回放回调（返回 Result）
-    callback: Option<Box<dyn Fn(&Event) -> ReplayResult<()> + Send + Sync>>,
+    callback: Option<ReplayCallback>,
     /// 错误处理策略
     strategy: ReplayStrategy,
 }
@@ -519,7 +517,7 @@ impl EventPlayer {
     /// 带重试的执行单个事件回调
     fn execute_with_retry(
         &self,
-        cb: &Box<dyn Fn(&Event) -> ReplayResult<()> + Send + Sync>,
+        cb: &ReplayCallback,
         event: &Event,
         index: usize,
         stats: &mut ReplayStats,
@@ -668,12 +666,6 @@ impl AgentEventData {
             } => format!("tool={}, ok={}, {}ms", tool_name, success, duration_ms),
             Self::MemoryWritten { key, category } => format!("{}={}", category, key),
             Self::MemoryRetrieved { results_count, .. } => format!("{} results", results_count),
-            Self::SpanStarted { span_name, .. } => format!("span={}", span_name),
-            Self::SpanEnded {
-                span_name,
-                duration_ms,
-                ..
-            } => format!("span={}, {}ms", span_name, duration_ms),
             Self::GraphStarted {
                 graph_name,
                 entry_node,

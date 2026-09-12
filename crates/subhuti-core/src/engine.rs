@@ -6,7 +6,6 @@
 use std::sync::Arc;
 
 use crate::event::EventBus;
-use crate::graph::{Graph, GraphBuilder, NodeResult};
 use crate::memory::Memory;
 use crate::orchestrator::{
     Actor, AgentContext, DispatchRule, ExecutionRule, ExpertAgent, ExpertState,
@@ -23,7 +22,15 @@ use crate::vertical::{AssetLibrary, ProjectMemory, ToolRegistry, WorkflowStore};
 pub struct Subhuti {
     memory: Arc<dyn Memory>,
     event_bus: Arc<EventBus>,
-    orchestrator: tokio::sync::Mutex<Orchestrator>,
+    /// 编排器（**无锁**）
+    ///
+    /// 历史问题：这里曾是 `tokio::sync::Mutex<Orchestrator>`，且 `dispatch()` 全程持锁，
+    /// 导致所有 HTTP 请求被完全串行化——第二个请求必须等第一个（可能几十秒）跑完。
+    ///
+    /// 现在 `Orchestrator` 内部状态（专家表 / 演员池 / 图注册表 / 规则引擎）全部改为
+    /// 细粒度 `RwLock`，读多写少，注册与配置走写锁、编排执行走读锁，
+    /// 因此这里不再需要任何外层锁，多个请求可真正并发执行。
+    orchestrator: Orchestrator,
     asset_library: Arc<dyn AssetLibrary>,
     project_memory: Arc<dyn ProjectMemory>,
     tool_registry: Arc<dyn ToolRegistry>,
@@ -54,7 +61,7 @@ impl Subhuti {
         Self {
             memory,
             event_bus,
-            orchestrator: tokio::sync::Mutex::new(orchestrator),
+            orchestrator,
             asset_library,
             project_memory,
             tool_registry,
@@ -109,55 +116,38 @@ impl Subhuti {
         &self.event_bus
     }
 
-    pub fn actor_registry(&self) -> &tokio::sync::Mutex<Orchestrator> {
+    /// 获取编排器引用（无锁共享，可并发读）
+    pub fn actor_registry(&self) -> &Orchestrator {
         &self.orchestrator
     }
 
     /// 注册 ExpertAgent（通过 Orchestrator）
     pub async fn register_orchestrator_expert(&self, agent: Arc<dyn ExpertAgent>) {
-        self.orchestrator.lock().await.register_agent(agent);
+        self.orchestrator.register_agent(agent);
     }
 
     /// 注册 Actor 到全局演员池
     pub async fn register_actor(&self, actor: Arc<dyn Actor>) {
-        self.orchestrator.lock().await.register_actor(actor);
-    }
-
-    /// 注册图编排
-    pub async fn register_graph(&self, mut graph: Graph) {
-        graph.set_event_bus(self.event_bus.clone());
-        self.orchestrator.lock().await.register_graph(graph);
+        self.orchestrator.register_actor(actor);
     }
 
     /// 使用默认上下文执行编排
     pub async fn dispatch(&self, input: &str) -> OrchestrationResult {
         let mut ctx = AgentContext::new(input, "default");
         let state = self.build_expert_state();
-        self.orchestrator
-            .lock()
-            .await
-            .dispatch(&mut ctx, &state)
-            .await
+        self.orchestrator.dispatch(&mut ctx, &state).await
     }
 
     /// 使用自定义上下文执行编排
     pub async fn dispatch_with_context(&self, mut ctx: AgentContext) -> OrchestrationResult {
         let state = self.build_expert_state();
 
-        tracing::info!("[dispatch_with_context] 开始获取 orchestrator 锁");
-        let orchestrator = self.orchestrator.lock().await;
-        tracing::info!("[dispatch_with_context] 已获取 orchestrator 锁，开始执行 dispatch");
+        // 无锁：Orchestrator 内部为细粒度 RwLock，多个请求可并发 dispatch
+        let result = self.orchestrator.dispatch(&mut ctx, &state).await;
 
-        // 在锁内执行 dispatch（因为需要访问 orchestrator 内部状态）
-        let result = orchestrator.dispatch(&mut ctx, &state).await;
-
-        tracing::info!("[dispatch_with_context] dispatch 执行完成，准备释放锁");
-        drop(orchestrator); // 显式释放锁
-
-        // 保存 Session（会话历史持久化）- 锁外执行
+        // 保存 Session（会话历史持久化）
         self.save_session(ctx.session.clone()).await;
 
-        tracing::info!("[dispatch_with_context] 完成");
         result
     }
 
@@ -181,48 +171,22 @@ impl Subhuti {
     // ─── 规则设置 ─────────────────────────────────────────────────
 
     pub async fn set_analysis_rule(&self, rule: Arc<dyn TaskAnalysisRule>) {
-        self.orchestrator.lock().await.set_analysis_rule(rule);
+        self.orchestrator.set_analysis_rule(rule);
     }
 
     pub async fn set_dispatch_rule(&self, rule: Arc<dyn DispatchRule>) {
-        self.orchestrator.lock().await.set_dispatch_rule(rule);
+        self.orchestrator.set_dispatch_rule(rule);
     }
 
     pub async fn set_execution_rule(&self, rule: Arc<dyn ExecutionRule>) {
-        self.orchestrator.lock().await.set_execution_rule(rule);
-    }
-
-    // ─── 默认图 ──────────────────────────────────────────────────
-
-    /// 同步插件专家并注册默认图
-    pub async fn sync_experts_to_orchestrator(&self) {
-        self.register_default_graph().await;
-    }
-
-    /// 注册默认图（单节点，无标签，兜底用）
-    async fn register_default_graph(&self) {
-        let bus = self.event_bus.clone();
-        let mut graph = GraphBuilder::new()
-            .name("default")
-            .node("default_node", |state| async move {
-                let input = state.get("input").unwrap_or_default();
-                NodeResult::ok(input)
-            })
-            .entry("default_node")
-            .build()
-            .expect("默认图构建失败");
-        graph.set_event_bus(bus);
-        self.orchestrator.lock().await.register_graph(graph);
-        self.orchestrator.lock().await.set_default_graph("default");
-        tracing::debug!("已注册默认图");
+        self.orchestrator.set_execution_rule(rule);
     }
 
     // ─── 任务分析 & 专家匹配 ─────────────────────────────────────
 
     /// 任务分析
     pub async fn analyze_task(&self, message: &str) -> serde_json::Value {
-        let orchestrator = self.orchestrator.lock().await;
-        match orchestrator.rule_engine().analyze_task(message) {
+        match self.orchestrator.rule_engine().analyze_task(message) {
             Ok(profile) => {
                 tracing::info!(
                     "[Subhuti·analyze_task] domain_tags={:?}, task_type={}",
@@ -241,7 +205,7 @@ impl Subhuti {
 
     /// 专家匹配
     pub async fn match_expert(&self, input: &str) -> Vec<FrameworkExpertInfo> {
-        let orchestrator = self.orchestrator.lock().await;
+        let orchestrator = &self.orchestrator;
         let profile = match orchestrator.rule_engine().analyze_task(input) {
             Ok(p) => p,
             Err(e) => {
@@ -278,7 +242,7 @@ impl Subhuti {
 
     /// 获取专家快照列表
     pub async fn list_orchestrator_experts(&self) -> Vec<FrameworkExpertInfo> {
-        self.orchestrator.lock().await.list_expert_snapshots()
+        self.orchestrator.list_expert_snapshots()
     }
 
     /// 通过技能 ID 查找所属专家
@@ -286,7 +250,7 @@ impl Subhuti {
         &self,
         skill_id: &str,
     ) -> Option<(String, Arc<dyn ExpertAgent>)> {
-        let orchestrator = self.orchestrator.lock().await;
+        let orchestrator = &self.orchestrator;
         for agent in orchestrator.list_experts() {
             if agent.skills().iter().any(|s| s.id == skill_id) {
                 return Some((agent.id().to_string(), agent));
@@ -295,3 +259,18 @@ impl Subhuti {
         None
     }
 }
+
+// ─── 编译期并发契约断言 ─────────────────────────────────────────
+//
+// `Subhuti` 被 HTTP 服务以 `Arc` 共享给所有请求任务，因此必须 `Send + Sync`。
+//
+// 背景：`orchestrator` 字段原本是 `tokio::sync::Mutex<Orchestrator>`，
+// 且 `dispatch()` 全程持锁 —— 两个 HTTP 请求会严格排队（第二个要等第一个跑完，
+// Agent 场景下常常是几十秒）。现在改为无锁 + 内部细粒度 RwLock。
+//
+// 此断言用于防回归：一旦将来有人引入非 Sync 字段、或重新把编排器套进
+// 需要 `&mut` 的容器，这里会直接编译失败，而不是悄悄退化成串行。
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Subhuti>();
+};

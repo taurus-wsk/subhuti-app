@@ -52,11 +52,10 @@ use std::sync::{Arc, RwLock};
 
 pub use self::actor::{Actor, ActorRegistry, ExpertAgentActorAdapter};
 pub use self::planner::{
-    execute_plan, generate_plan, parse_plan, parse_plan_or_ask, AskRequest, PlanOrAsk, PlanStep,
-    SkillPlan,
+    execute_plan, generate_expert_plan, generate_plan, parse_plan, parse_plan_or_ask, AskRequest,
+    PlanOrAsk, PlanStep, SkillPlan,
 };
 use crate::event::{AgentEventData, EventBus};
-use crate::graph::{Graph, GraphOutput, GraphState};
 use crate::memory::Memory;
 use crate::runtime::llm::{Role, LLM};
 use crate::runtime::session::Session;
@@ -355,25 +354,29 @@ impl<'a> FromState<'a> for EventBusRef<'a> {
     fn from_state(state: &'a ExpertState) -> crate::Result<Self> {
         state
             .event_bus()
-            .map(|b| EventBusRef(&**b))
+            .map(|b| EventBusRef(b))
             .ok_or_else(|| crate::Error::Runtime("EventBus 未配置".to_string()))
     }
 }
 
 pub struct Orchestrator {
     agent_registry: AgentRegistry,
-    graph_registry: GraphRegistry,
     event_bus: Option<Arc<EventBus>>,
     rule_engine: RuleEngine,
     /// 全局演员池（Actor 竞标制）
     actor_registry: ActorRegistry,
 }
 
+impl Default for Orchestrator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Orchestrator {
     pub fn new() -> Self {
         Self {
             agent_registry: AgentRegistry::new(),
-            graph_registry: GraphRegistry::new(),
             event_bus: None,
             rule_engine: RuleEngine::with_defaults(),
             actor_registry: ActorRegistry::new(),
@@ -396,26 +399,29 @@ impl Orchestrator {
     }
 
     /// 运行时替换任务分析规则（Layer 1）
-    pub fn set_analysis_rule(&mut self, rule: Arc<dyn TaskAnalysisRule>) {
+    ///
+    /// 内部走写锁，无需 `&mut self`：编排主链路不会被注册/配置动作阻塞。
+    pub fn set_analysis_rule(&self, rule: Arc<dyn TaskAnalysisRule>) {
         self.rule_engine.set_analysis_rule(rule);
     }
 
     /// 运行时替换调度决策规则（Layer 2）
-    pub fn set_dispatch_rule(&mut self, rule: Arc<dyn DispatchRule>) {
+    pub fn set_dispatch_rule(&self, rule: Arc<dyn DispatchRule>) {
         self.rule_engine.set_dispatch_rule(rule);
     }
 
     /// 运行时替换执行监控规则（Layer 3）
-    pub fn set_execution_rule(&mut self, rule: Arc<dyn ExecutionRule>) {
+    pub fn set_execution_rule(&self, rule: Arc<dyn ExecutionRule>) {
         self.rule_engine.set_execution_rule(rule);
     }
 
-    pub fn register_agent(&mut self, agent: Arc<dyn ExpertAgent>) {
+    /// 注册专家（内部写锁，无需 `&mut self`）
+    pub fn register_agent(&self, agent: Arc<dyn ExpertAgent>) {
         self.agent_registry.register(agent);
     }
 
-    /// 注册 Actor（演员）到全局演员池
-    pub fn register_actor(&mut self, actor: Arc<dyn actor::Actor>) {
+    /// 注册 Actor（演员）到全局演员池（内部写锁，无需 `&mut self`）
+    pub fn register_actor(&self, actor: Arc<dyn actor::Actor>) {
         self.actor_registry.register(actor);
     }
 
@@ -436,14 +442,6 @@ impl Orchestrator {
     /// 获取专家快照列表（强类型 DTO，用于适配器/上层查询）
     pub fn list_expert_snapshots(&self) -> Vec<FrameworkExpertInfo> {
         self.agent_registry.list_agent_snapshots()
-    }
-
-    pub fn register_graph(&mut self, graph: Graph) {
-        self.graph_registry.register(graph);
-    }
-
-    pub fn set_default_graph(&self, name: &str) {
-        self.graph_registry.set_default(name);
     }
 
     pub async fn dispatch(
@@ -484,58 +482,26 @@ impl Orchestrator {
             }
         }
 
-        // 优先使用指定图（从 ctx.metadata 中获取）
+        // graph_name 元数据：框架已无图路由（Workflow 下沉为专家内部），
+        // 这里仅把它当作「按专家 ID / 标签精确指定」的别名，等价于 expert_id。
+        // 找不到对应专家则回退到主管编排（单域快速路径 / 多域规划路径）。
         let result = if let Some(graph_name) = ctx.metadata.get("graph_name") {
-            if let Some(graph) = self.graph_registry.get(graph_name) {
-                tracing::debug!("指定图: {}", graph_name);
-                self.dispatch_via_graph(ctx, state, &graph).await
+            if let Some(actor) = self.actor_registry.get_by_id(graph_name) {
+                tracing::debug!("graph_name 命中专家 ID: {} → {}", graph_name, actor.name());
+                self.dispatch_via_actor(ctx, state, actor).await
+            } else if let Some(actor) = self
+                .actor_registry
+                .list()
+                .iter()
+                .find(|a| a.tags().iter().any(|t| t.eq_ignore_ascii_case(graph_name)))
+            {
+                tracing::debug!("graph_name 命中专家标签: {} → {}", graph_name, actor.name());
+                self.dispatch_via_actor(ctx, state, actor.clone()).await
             } else {
-                tracing::warn!("指定的图不存在: {}，尝试按专家 ID/标签匹配", graph_name);
-
-                // 图名不存在 → 尝试按专家 ID/标签匹配（graph_name 可以是专家 ID 或标签）
-                // 1. 尝试按专家 ID 精确匹配
-                if let Some(actor) = self.actor_registry.get_by_id(graph_name) {
-                    tracing::debug!("按专家 ID 匹配: {} → {}", graph_name, actor.name());
-                    self.dispatch_via_actor(ctx, state, actor).await
-                }
-                // 2. 尝试按专家标签匹配（标签包含 graph_name 的专家）
-                else {
-                    let actors = self.actor_registry.list();
-                    let mut matched_actor = None;
-                    for actor in actors.iter() {
-                        if actor
-                            .tags()
-                            .iter()
-                            .any(|t| t.eq_ignore_ascii_case(graph_name))
-                        {
-                            tracing::debug!("按专家标签匹配: {} → {}", graph_name, actor.name());
-                            matched_actor = Some(actor.clone());
-                            break;
-                        }
-                    }
-                    // 3. 如果有 expert_id metadata，直接按 expert_id 匹配
-                    if matched_actor.is_none() {
-                        if let Some(expert_id) = ctx.metadata.get("expert_id") {
-                            if let Some(actor) = self.actor_registry.get_by_id(expert_id) {
-                                tracing::debug!(
-                                    "按 expert_id 匹配: {} → {}",
-                                    expert_id,
-                                    actor.name()
-                                );
-                                matched_actor = Some(actor);
-                            }
-                        }
-                    }
-                    if let Some(actor) = matched_actor {
-                        self.dispatch_via_actor(ctx, state, actor).await
-                    } else {
-                        // 都找不到则继续走图匹配流程
-                        self.dispatch_without_graph(ctx, state).await
-                    }
-                }
+                tracing::warn!("graph_name 未命中任何专家，回退主管编排: {}", graph_name);
+                self.dispatch_without_graph(ctx, state).await
             }
         } else {
-            // 未指定图名，走关键词匹配
             self.dispatch_without_graph(ctx, state).await
         };
 
@@ -547,7 +513,104 @@ impl Orchestrator {
         result
     }
 
-    /// 无指定图时的 dispatch 流程：先尝试语义路由，再尝试关键词匹配
+    /// 按标签相关性从演员池挑选最匹配的专家
+    ///
+    /// 评分方式：专家的每个 tag 出现在输入中记 1 分，取总分最高者。
+    /// 这里不能硬编码「优先 code / rust」——那会让 Blender、写作这类
+    /// 非代码问题也被固定塞给编程专家。
+    fn select_actor_by_relevance(&self, input: &str) -> Option<Arc<dyn Actor>> {
+        let input_lower = input.to_lowercase();
+        let actors = self.actor_registry.list();
+
+        let mut best: Option<(usize, Arc<dyn Actor>)> = None;
+        for actor in actors.iter() {
+            let score = actor
+                .tags()
+                .iter()
+                .filter(|t| !t.is_empty() && input_lower.contains(&t.to_lowercase()))
+                .count();
+            if score > 0 && best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
+                best = Some((score, actor.clone()));
+            }
+        }
+
+        if let Some((score, actor)) = &best {
+            tracing::debug!(
+                "按标签相关性匹配到专家: {} (命中 {} 个标签)",
+                actor.name(),
+                score
+            );
+            return Some(actor.clone());
+        }
+
+        // 没有任何标签命中时，回退到第一个可用专家（保持原有兜底行为）
+        actors.first().cloned()
+    }
+
+    /// 跳过图匹配，直接交给最相关的专家处理
+    ///
+    /// 用于调用方已显式表达「不要猜图」的场景（例如显式指定默认图）。
+    pub async fn dispatch_direct(
+        &self,
+        ctx: &mut AgentContext,
+        state: &ExpertState,
+    ) -> OrchestrationResult {
+        let input = ctx.input.clone();
+        match self.select_actor_by_relevance(&input) {
+            Some(actor) => {
+                tracing::debug!("直接调度（跳过图匹配）: {}", actor.name());
+                self.dispatch_via_actor(ctx, state, actor).await
+            }
+            None => {
+                tracing::warn!("未匹配到任何可用专家");
+                OrchestrationResult {
+                    strategy: "fallback".to_string(),
+                    expert_chain: Vec::new(),
+                    output: "未匹配到合适的专家，请检查专家注册或输入内容".to_string(),
+                    tokens: TokenUsage::default(),
+                    expert_outputs: Vec::new(),
+                    success: false,
+                }
+            }
+        }
+    }
+
+    /// 按标签命中数从演员池挑选相关专家（降序）。
+    ///
+    /// 仅收录「输入中命中了至少一个标签」的专家；无任何命中返回空。
+    /// 命中数用于区分「单领域（快速路径）」与「多领域（主管规划路径）」。
+    fn relevant_actors(&self, input: &str) -> Vec<Arc<dyn Actor>> {
+        let input_lower = input.to_lowercase();
+        let actors = self.actor_registry.list();
+        let mut scored: Vec<(usize, Arc<dyn Actor>)> = actors
+            .iter()
+            .filter_map(|a| {
+                let hits = a
+                    .tags()
+                    .iter()
+                    .filter(|t| !t.is_empty() && input_lower.contains(&t.to_lowercase()))
+                    .count();
+                if hits > 0 {
+                    Some((hits, a.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        scored.sort_by_key(|(h, _)| std::cmp::Reverse(*h));
+        scored.into_iter().map(|(_, a)| a).collect()
+    }
+
+    /// 无指定图时的 dispatch 流程：主管编排（Planner/ReAct 主管）。
+    ///
+    /// 不再做自动图路由（框架已无 Graph，Workflow 下沉为专家内部，由主管 Planner 选专家）。
+    /// 两级决策：
+    ///   1. 单领域命中 → 直接黑盒调该专家（不额外消耗一次 LLM 规划，保留 M1a 速度）
+    ///   2. 多领域命中 → 主管用框架 Planner 把请求拆给多个专家串行执行
+    ///   3. 零命中   → 兜底到第一个可用专家（保持原行为）
+    ///
+    /// 专家内部自带 Planner/ReAct（DomainExpert::plan_and_execute），框架只负责
+    /// 「选哪些专家、按什么顺序」，专家如何内部执行对框架是黑盒。
     async fn dispatch_without_graph(
         &self,
         ctx: &mut AgentContext,
@@ -555,45 +618,28 @@ impl Orchestrator {
     ) -> OrchestrationResult {
         let input = &ctx.input.clone();
 
-        // 图匹配：关键词匹配（语义路由已废弃移除）
-        let matched_graph = self.graph_registry.find_matching_graph(input).await;
+        tracing::debug!("未指定图，走主管编排（无图路由）: input={}", input);
 
-        match matched_graph {
-            Some(graph) => {
-                tracing::debug!("图匹配成功: {}", graph.name());
-                self.dispatch_via_graph(ctx, state, &graph).await
+        let relevant = self.relevant_actors(input);
+        match relevant.len() {
+            // 清晰单领域：快速路径，直接黑盒调该专家
+            1 => {
+                let actor = relevant.into_iter().next().unwrap();
+                tracing::debug!("单领域命中，快速路径: {}", actor.name());
+                self.dispatch_via_actor(ctx, state, actor).await
             }
-            None => {
-                // 无匹配图时，尝试按标签匹配专家（Actor）
-                tracing::debug!("无匹配图，尝试按专家标签匹配: input={}", input);
-                let actors = self.actor_registry.list();
-
-                // 尝试找到第一个能处理该输入的专家
-                // 优先匹配标签包含 "code" 或 "rust" 的专家
-                let mut matched_actor = None;
-                for actor in actors.iter() {
-                    let tags = actor.tags();
-                    if tags.iter().any(|t| {
-                        let tl = t.to_lowercase();
-                        tl.contains("code") || tl.contains("rust") || tl.contains("programming")
-                    }) {
-                        tracing::debug!("按标签匹配到专家: {}", actor.name());
-                        matched_actor = Some(actor.clone());
-                        break;
-                    }
-                }
-
-                // 如果没有匹配到特定专家，尝试使用第一个可用专家
-                if matched_actor.is_none() {
-                    matched_actor = actors.first().cloned();
-                }
-
-                if let Some(actor) = matched_actor {
-                    tracing::debug!("使用专家: {}", actor.name());
+            // 多领域：主管规划，框架 Planner 拆给多个专家串行
+            n if n >= 2 => {
+                tracing::debug!("多领域命中 {} 个专家，走主管规划路径", n);
+                self.dispatch_with_plan(ctx, state, relevant).await
+            }
+            // 零命中：兜底
+            _ => {
+                tracing::debug!("无关键词命中，兜底选择");
+                if let Some(actor) = self.select_actor_by_relevance(input) {
                     self.dispatch_via_actor(ctx, state, actor).await
                 } else {
-                    // 没有可用专家
-                    tracing::warn!("未匹配到任何图或专家");
+                    tracing::warn!("未匹配到任何专家");
                     OrchestrationResult {
                         strategy: "fallback".to_string(),
                         expert_chain: Vec::new(),
@@ -607,74 +653,102 @@ impl Orchestrator {
         }
     }
 
-    async fn dispatch_via_graph(
+    /// 主管规划路径（M1b）：框架 Planner 把多领域请求拆给多个专家串行执行。
+    ///
+    /// 每个计划步骤 = 调一个专家（黑盒）；框架把上一步专家的输出作为下一步专家的输入，
+    /// 通过克隆 AgentContext、改写其 `input` 实现专家间的上下文传递。
+    /// 主管不感知专家内部如何执行（内部 Planner/ReAct/重试对框架不可见）。
+    async fn dispatch_with_plan(
         &self,
         ctx: &mut AgentContext,
-        _state: &ExpertState,
-        graph: &Graph,
+        state: &ExpertState,
+        roster: Vec<Arc<dyn Actor>>,
     ) -> OrchestrationResult {
-        self.emit_event(
-            ctx,
-            AgentEventData::ChainSelected {
-                chain_name: graph.name().to_string(),
-                strategy: "graph".to_string(),
-            },
-        )
-        .await;
-
-        let mut graph_state = GraphState::new();
-        graph_state.set("input", &*ctx.input);
-        if let Some(tid) = ctx.metadata.get("trace_id") {
-            graph_state.set("trace_id", tid.clone());
-        }
-        if let Some(sid) = ctx.metadata.get("session_id") {
-            graph_state.set("session_id", sid.clone());
-        }
-        if let Some(ws) = ctx.metadata.get("workspace_folder") {
-            graph_state.set("workspace_folder", ws.clone());
-        }
-
-        match self
-            .execute_graph(graph, graph_state, &self.actor_registry, _state)
-            .await
-        {
-            Ok(output) => {
-                tracing::debug!(
-                    "📊 dispatch_via_graph 完成: graph={}, success={}, output_len={}, error={:?}",
-                    graph.name(),
-                    output.success,
-                    output.output.len(),
-                    output.error,
-                );
-                let final_output = if output.success || output.error.is_none() {
-                    output.output
-                } else {
-                    output.error.clone().unwrap_or(output.output)
-                };
-                OrchestrationResult {
-                    strategy: format!("graph:{}", graph.name()),
-                    expert_chain: output.execution_path,
-                    output: final_output,
-                    tokens: TokenUsage::default(),
-                    expert_outputs: Vec::new(),
-                    success: output.success,
-                }
+        // LLM 来自 ExpertState（无需给 Orchestrator 增加字段）
+        let llm = match state.llm_cloned() {
+            Some(l) => l,
+            None => {
+                tracing::warn!("主管规划需要 LLM 但未配置，回退到首个相关专家");
+                return self.dispatch_via_actor(ctx, state, roster[0].clone()).await;
             }
-            Err(e) => {
-                tracing::warn!(
-                    "📊 dispatch_via_graph 失败: graph={}, error={}",
-                    graph.name(),
-                    e
-                );
-                OrchestrationResult {
-                    strategy: format!("graph:{}", graph.name()),
-                    expert_chain: Vec::new(),
-                    output: e.to_string(),
-                    tokens: TokenUsage::default(),
-                    expert_outputs: Vec::new(),
-                    success: false,
+        };
+
+        // 把候选专家渲染成 Planner 的「技能清单」，skill_id 即专家 id
+        let experts: Vec<SkillInfo> = roster
+            .iter()
+            .map(|a| SkillInfo {
+                id: a.id().to_string(),
+                name: a.name().to_string(),
+                description: format!("领域标签：{}", a.tags().join("/")),
+                parameters: vec!["input".to_string()],
+            })
+            .collect();
+
+        let plan =
+            match generate_expert_plan(&llm, &ctx.input, &experts, "Subhuti 主管（多专家编排）")
+                .await
+            {
+                Ok(PlanOrAsk::Plan(p)) => p,
+                // 规划返回提问 → 回退到首个相关专家，避免卡住用户
+                Ok(PlanOrAsk::Ask(_)) => {
+                    tracing::warn!("主管规划返回提问，回退单专家");
+                    return self.dispatch_via_actor(ctx, state, roster[0].clone()).await;
                 }
+                // 规划失败 → 回退到首个相关专家
+                Err(e) => {
+                    tracing::warn!("主管规划失败，回退单专家: {:?}", e.to_string());
+                    return self.dispatch_via_actor(ctx, state, roster[0].clone()).await;
+                }
+            };
+
+        if plan.steps.is_empty() {
+            return self.dispatch_via_actor(ctx, state, roster[0].clone()).await;
+        }
+
+        // 串行执行每个专家（黑盒），上一步输出喂下一步
+        let mut expert_chain: Vec<String> = Vec::new();
+        let mut prev_output: Option<String> = None;
+        let mut last_output = String::new();
+        let mut all_ok = true;
+
+        for (idx, step) in plan.steps.iter().enumerate() {
+            let actor = match self.actor_registry.get_by_id(&step.skill_id) {
+                Some(a) => a,
+                None => {
+                    tracing::warn!("计划引用了未知专家 id={}，跳过该步", step.skill_id);
+                    continue;
+                }
+            };
+
+            // 克隆一份子上下文：第一步用原始输入，后续步注入上一位专家的输出
+            let mut sub = ctx.clone();
+            sub.input = if idx == 0 {
+                ctx.input.clone()
+            } else {
+                format!(
+                    "{}\n\n## 上一位专家的输出（上下文）\n{}\n",
+                    ctx.input,
+                    prev_output.clone().unwrap_or_default()
+                )
+            };
+
+            let res = self.dispatch_via_actor(&mut sub, state, actor).await;
+            expert_chain.extend(res.expert_chain);
+            if res.success {
+                prev_output = Some(res.output.clone());
+            } else {
+                all_ok = false;
             }
+            last_output = res.output;
+        }
+
+        OrchestrationResult {
+            strategy: "plan:multi-expert".to_string(),
+            expert_chain,
+            output: last_output,
+            tokens: TokenUsage::default(),
+            expert_outputs: Vec::new(),
+            success: all_ok,
         }
     }
 
@@ -770,25 +844,38 @@ impl Orchestrator {
 }
 
 pub struct AgentRegistry {
-    agents: HashMap<String, Arc<dyn ExpertAgent>>,
+    agents: Arc<RwLock<HashMap<String, Arc<dyn ExpertAgent>>>>,
+}
+
+impl Default for AgentRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AgentRegistry {
     pub fn new() -> Self {
         Self {
-            agents: HashMap::new(),
+            agents: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    pub fn register(&mut self, agent: Arc<dyn ExpertAgent>) {
-        self.agents.insert(agent.id().to_string(), agent);
+    /// 注册专家（内部写锁，无需 `&mut self`）
+    pub fn register(&self, agent: Arc<dyn ExpertAgent>) {
+        match self.agents.write() {
+            Ok(mut agents) => {
+                agents.insert(agent.id().to_string(), agent);
+            }
+            Err(e) => tracing::error!("AgentRegistry 写锁中毒，专家注册失败: {}", e),
+        }
     }
 
     pub fn find_matching_experts(&self, input: &str) -> Vec<Arc<dyn ExpertAgent>> {
         let input_lower = input.to_lowercase();
         let mut matched: Vec<(Arc<dyn ExpertAgent>, u32)> = Vec::new();
 
-        for agent in self.agents.values() {
+        let agents = self.agents.read().map(|a| a.clone()).unwrap_or_default();
+        for agent in agents.values() {
             let mut score = 0;
             for tag in agent.tags() {
                 if input_lower.contains(&tag.to_lowercase()) {
@@ -805,243 +892,175 @@ impl AgentRegistry {
     }
 
     pub fn get_by_id(&self, id: &str) -> Option<Arc<dyn ExpertAgent>> {
-        self.agents.get(id).cloned()
+        self.agents
+            .read()
+            .ok()
+            .and_then(|agents| agents.get(id).cloned())
     }
 
     /// 列出所有已注册专家（用于 RuleEngine 调度，返回真实 Agent）
     pub fn list_agents(&self) -> Vec<Arc<dyn ExpertAgent>> {
-        self.agents.values().cloned().collect()
+        self.agents
+            .read()
+            .map(|agents| agents.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// 列出所有已注册专家的只读快照（用于适配器/表现层，不泄漏 trait 对象）
     pub fn list_agent_snapshots(&self) -> Vec<FrameworkExpertInfo> {
         self.agents
-            .values()
-            .map(|a| FrameworkExpertInfo::from_agent(a.as_ref()))
-            .collect()
+            .read()
+            .map(|agents| {
+                agents
+                    .values()
+                    .map(|a| FrameworkExpertInfo::from_agent(a.as_ref()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn agent_count(&self) -> usize {
-        self.agents.len()
+        self.agents.read().map(|a| a.len()).unwrap_or(0)
     }
 }
 
-pub struct GraphRegistry {
-    graphs: RwLock<HashMap<String, Arc<Graph>>>,
-    default_graph_name: RwLock<Option<String>>,
-}
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+    use crate::memory::{Memory, MemoryItem, SearchResult};
 
-impl GraphRegistry {
-    pub fn new() -> Self {
-        Self {
-            graphs: RwLock::new(HashMap::new()),
-            default_graph_name: RwLock::new(None),
+    struct MockActor {
+        id: String,
+        name: String,
+        tags: Vec<String>,
+    }
+
+    #[async_trait]
+    impl actor::Actor for MockActor {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn tags(&self) -> &[String] {
+            &self.tags
+        }
+        async fn perform(
+            &self,
+            _ctx: &mut AgentContext,
+            _state: &ExpertState,
+        ) -> crate::Result<String> {
+            Ok(self.name.clone())
         }
     }
 
-    pub fn register(&self, graph: Graph) {
-        let name = graph.name().to_string();
-        let arc_graph = Arc::new(graph);
-        self.graphs.write().unwrap().insert(name, arc_graph);
+    /// 测试用空 Memory 实现（ExpertState 构造需要，但本模块不依赖真实持久化）。
+    struct NoopMemory;
+    impl Memory for NoopMemory {
+        fn write_short_term(&self, _c: &str, _t: Vec<String>) {}
+        fn write_long_term(&self, _c: &str, _t: Vec<String>) {}
+        fn read(&self, _id: &str) -> Option<MemoryItem> {
+            None
+        }
+        fn delete(&self, _id: &str) {}
+        fn search(&self, _q: &str, _l: usize) -> Vec<SearchResult> {
+            Vec::new()
+        }
+        fn get_all(&self) -> Vec<MemoryItem> {
+            Vec::new()
+        }
+        fn clear(&self) {}
     }
 
-    /// 设置默认图（当无图匹配时使用）
-    pub fn set_default(&self, name: &str) {
-        *self.default_graph_name.write().unwrap() = Some(name.to_string());
+    fn orch_with_two_experts() -> Orchestrator {
+        let orch = Orchestrator::new();
+        orch.register_actor(Arc::new(MockActor {
+            id: "rust".into(),
+            name: "Rust 编程专家".into(),
+            tags: vec!["rust".into(), "code".into(), "programming".into()],
+        }));
+        orch.register_actor(Arc::new(MockActor {
+            id: "blender".into(),
+            name: "Blender 动画专家".into(),
+            tags: vec!["blender".into(), "3D".into(), "建模".into()],
+        }));
+        orch
     }
 
-    /// 获取默认图
-    pub fn get_default(&self) -> Option<Arc<Graph>> {
-        let name = self.default_graph_name.read().unwrap().clone()?;
-        self.graphs.read().unwrap().get(&name).cloned()
+    fn test_state() -> ExpertState {
+        ExpertState::builder(Arc::new(NoopMemory)).build()
     }
 
-    pub fn get(&self, name: &str) -> Option<Arc<Graph>> {
-        self.graphs.read().unwrap().get(name).cloned()
+    #[test]
+    fn relevance_picks_blender_expert_for_blender_question() {
+        let orch = orch_with_two_experts();
+        let picked = orch
+            .select_actor_by_relevance("教我怎么用Blender做阵列修改器循环建模")
+            .expect("应至少回退到一个专家");
+        assert_eq!(picked.name(), "Blender 动画专家");
     }
 
-    pub fn list(&self) -> Vec<String> {
-        self.graphs.read().unwrap().keys().cloned().collect()
+    #[test]
+    fn relevance_picks_rust_expert_for_code_question() {
+        let orch = orch_with_two_experts();
+        let picked = orch
+            .select_actor_by_relevance("用 rust 写一个异步爬虫")
+            .expect("应至少回退到一个专家");
+        assert_eq!(picked.name(), "Rust 编程专家");
     }
 
-    pub async fn find_matching_graph(&self, input: &str) -> Option<Arc<Graph>> {
-        let graphs = self.graphs.read().unwrap();
-        let available: Vec<String> = graphs.keys().cloned().collect();
-        tracing::debug!(
-            "find_matching_graph: 可用的图={:?}, input={}",
-            available,
-            input
+    /// 回归（M1c）：graph_name 元数据作为「专家 ID 精确指定」别名，
+    /// 应直接命中对应专家（等价于 expert_id），框架不再走任何图路由。
+    #[tokio::test]
+    async fn graph_name_routes_to_expert_by_id() {
+        let orch = orch_with_two_experts();
+        let mut ctx = AgentContext::new("教我怎么用Blender做阵列修改器", "default");
+        ctx.set_metadata("graph_name", "blender");
+        let res = orch.dispatch(&mut ctx, &test_state()).await;
+        assert!(res.success);
+        assert_eq!(res.expert_chain, vec!["Blender 动画专家".to_string()]);
+    }
+
+    /// 反向回归（M1c）：graph_name 命中专家标签时同样直接路由。
+    #[tokio::test]
+    async fn graph_name_routes_to_expert_by_tag() {
+        let orch = orch_with_two_experts();
+        let mut ctx = AgentContext::new("用 rust 写点东西", "default");
+        ctx.set_metadata("graph_name", "rust");
+        let res = orch.dispatch(&mut ctx, &test_state()).await;
+        assert!(res.success);
+        assert_eq!(res.expert_chain, vec!["Rust 编程专家".to_string()]);
+    }
+
+    #[test]
+    fn relevant_actors_single_domain_returns_one() {
+        let orch = orch_with_two_experts();
+        let rel = orch.relevant_actors("教我怎么用Blender做阵列修改器循环建模");
+        assert_eq!(rel.len(), 1, "纯 Blender 问题应只命中 1 个专家");
+        assert_eq!(rel[0].id(), "blender");
+    }
+
+    #[test]
+    fn relevant_actors_multi_domain_returns_many() {
+        let orch = orch_with_two_experts();
+        let rel = orch.relevant_actors("用 Rust 给 Blender 写个导出插件");
+        assert!(
+            rel.len() >= 2,
+            "Rust+Blender 混合问题应命中 ≥2 个专家，实际: {}",
+            rel.len()
         );
-        if graphs.is_empty() {
-            return None;
-        }
-
-        // 编程相关关键词（命中这些关键词才路由到编程图）
-        let code_keywords: &[&str] = &[
-            "代码",
-            "编程",
-            "开发",
-            "写代码",
-            "code",
-            "programming",
-            "rust",
-            "项目",
-            "创建",
-            "编译",
-            "运行",
-            "构建",
-            "测试",
-            "实现",
-            "函数",
-            "bug",
-            "错误",
-            "安装",
-            "配置",
-            "依赖",
-            "库",
-            "框架",
-            "接口",
-            "api",
-            "模块",
-            "struct",
-            "fn",
-            "cargo",
-            "src",
-            "main.rs",
-            "lib.rs",
-            "package",
-            "toml",
-            "项目",
-            "工程",
-            "应用",
-            "程序",
-            "脚本",
-            "命令行",
-            "cli",
-        ];
-        let input_lower = input.to_lowercase();
-        let is_code_query = code_keywords.iter().any(|kw| input_lower.contains(kw));
-
-        // 只有一个图时：如果是编程相关查询则返回，否则返回 None 走普通对话
-        if graphs.len() == 1 {
-            if is_code_query {
-                return graphs.values().next().cloned();
-            }
-            tracing::debug!("单图模式但输入非编程相关，跳过图匹配: {}", input);
-            return None;
-        }
-
-        // 排除默认图（它只作为兜底，不参与关键词匹配）
-        let default_name = self.default_graph_name.read().unwrap().clone();
-        let non_default: Vec<&Arc<Graph>> = graphs
-            .values()
-            .filter(|g| Some(g.name().to_string()) != default_name)
-            .collect();
-
-        if non_default.is_empty() {
-            return None;
-        }
-
-        for graph in &non_default {
-            if input_lower.contains(&graph.name().to_lowercase()) {
-                return Some((*graph).clone());
-            }
-        }
-
-        let review_keywords = ["评审", "审查", "审核", "review", "audit"];
-        let edit_keywords = ["修改", "编辑", "添加", "增加", "重构", "改造", "改", "edit"];
-
-        for graph in &non_default {
-            let name = graph.name().to_lowercase();
-            if name.contains("code")
-                || name.contains("dev")
-                || name.contains("programming")
-                || name.contains("rust")
-            {
-                for kw in code_keywords {
-                    if input_lower.contains(kw) {
-                        return Some((*graph).clone());
-                    }
-                }
-            }
-            if name.contains("review") || name.contains("audit") {
-                for kw in &review_keywords {
-                    if input_lower.contains(kw) {
-                        return Some((*graph).clone());
-                    }
-                }
-            }
-            if name.contains("edit") {
-                for kw in &edit_keywords {
-                    if input_lower.contains(kw) {
-                        return Some((*graph).clone());
-                    }
-                }
-            }
-        }
-
-        // 避免无关键词匹配时错误兜底到第一个图
-        None
     }
 
-    pub fn get_by_id(&self, id: &str) -> Option<Arc<Graph>> {
-        self.graphs.read().unwrap().get(id).cloned()
-    }
-}
-
-#[async_trait]
-pub trait GraphOrchestrator: Send + Sync {
-    async fn route_by_graph(&self, input: &str) -> Option<Arc<Graph>>;
-    async fn execute_graph(
-        &self,
-        graph: &Graph,
-        state: GraphState,
-        actor_registry: &ActorRegistry,
-        expert_state: &ExpertState,
-    ) -> crate::Result<GraphOutput>;
-    fn register_graph(&self, graph: Graph);
-    fn get_graph(&self, name: &str) -> Option<Arc<Graph>>;
-    fn list_graphs(&self) -> Vec<String>;
-}
-
-#[async_trait]
-impl GraphOrchestrator for Orchestrator {
-    async fn route_by_graph(&self, input: &str) -> Option<Arc<Graph>> {
-        self.graph_registry.find_matching_graph(input).await
-    }
-
-    async fn execute_graph(
-        &self,
-        graph: &Graph,
-        state: GraphState,
-        actor_registry: &ActorRegistry,
-        expert_state: &ExpertState,
-    ) -> crate::Result<GraphOutput> {
-        // GraphStarted/GraphCompleted 由 scheduler 内部负责 emit（带 trace_id）
-        let result = graph
-            .run_event_driven(state, actor_registry, expert_state)
-            .await;
-
-        if let Ok(ref output) = result {
-            tracing::debug!(
-                "📊 execute_graph 完成: graph={}, success={}, execution_path={:?}",
-                graph.name(),
-                output.success,
-                output.execution_path,
-            );
-        }
-        Ok(result?)
-    }
-
-    fn register_graph(&self, graph: Graph) {
-        self.graph_registry.register(graph);
-    }
-
-    fn get_graph(&self, name: &str) -> Option<Arc<Graph>> {
-        self.graph_registry.get(name)
-    }
-
-    fn list_graphs(&self) -> Vec<String> {
-        self.graph_registry.list()
+    #[test]
+    fn relevant_actors_no_hit_returns_empty() {
+        let orch = Orchestrator::new();
+        orch.register_actor(Arc::new(MockActor {
+            id: "rust".into(),
+            name: "Rust 编程专家".into(),
+            tags: vec!["rust".into()],
+        }));
+        let rel = orch.relevant_actors("今天天气真好");
+        assert!(rel.is_empty(), "无关键词命中应返回空");
     }
 }

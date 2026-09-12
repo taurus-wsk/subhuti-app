@@ -253,7 +253,7 @@ where
         }
 
         // ── L2 耗尽 → L3 降级 ──
-        if final_output.is_none() && failures.len() > 0 {
+        if final_output.is_none() && !failures.is_empty() {
             on_progress(&format!(
                 "⚠️ 步骤 {}/{} 技能执行失败 {} 次，降级为 LLM 按工具临时编排...",
                 step_num,
@@ -339,6 +339,7 @@ mod tests {
         }
     }
 
+    #[allow(non_snake_case)]
     #[tokio::test]
     async fn L1_直接成功不走L2L3() {
         let plan = SkillPlan::new("L1").add_step(PlanStep {
@@ -371,6 +372,7 @@ mod tests {
         assert!(!result.contains("降级"));
     }
 
+    #[allow(non_snake_case)]
     #[tokio::test]
     async fn L2_首败二次带反馈成功() {
         let plan = SkillPlan::new("L2").add_step(PlanStep {
@@ -424,6 +426,7 @@ mod tests {
         assert!(result.contains("retry-ok"));
     }
 
+    #[allow(non_snake_case)]
     #[tokio::test]
     async fn L3_重试耗尽后降级成功() {
         let plan = SkillPlan::new("L3").add_step(PlanStep {
@@ -458,6 +461,7 @@ mod tests {
         assert!(result.contains("hist=3"));
     }
 
+    #[allow(non_snake_case)]
     #[tokio::test]
     async fn L3_降级也失败则记为失败步骤并继续() {
         let plan = SkillPlan::new("L3fail")

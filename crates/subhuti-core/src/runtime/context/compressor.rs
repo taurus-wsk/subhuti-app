@@ -99,6 +99,12 @@ impl ContextCompressor {
 
 pub struct SummaryCompressor;
 
+impl Default for SummaryCompressor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SummaryCompressor {
     pub fn new() -> Self {
         Self
@@ -111,6 +117,12 @@ impl SummaryCompressor {
 }
 
 pub struct DeduplicationCompressor;
+
+impl Default for DeduplicationCompressor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl DeduplicationCompressor {
     pub fn new() -> Self {

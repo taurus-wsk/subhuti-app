@@ -173,15 +173,6 @@ pub enum AgentEventData {
     /// 记忆检索
     MemoryRetrieved { query: String, results_count: usize },
 
-    // ── Trace 事件 ──
-    /// Span 开始
-    SpanStarted {
-        span_name: String,
-        parent_id: Option<String>,
-    },
-    /// Span 结束
-    SpanEnded { span_name: String, duration_ms: u64 },
-
     // ── 图调度事件（事件驱动编排）──
     /// 图执行开始
     GraphStarted {
@@ -325,8 +316,6 @@ impl AgentEventData {
             Self::ToolResponded { .. } => "tool_responded",
             Self::MemoryWritten { .. } => "memory_written",
             Self::MemoryRetrieved { .. } => "memory_retrieved",
-            Self::SpanStarted { .. } => "span_started",
-            Self::SpanEnded { .. } => "span_ended",
             Self::GraphStarted { .. } => "graph_started",
             Self::NodeExecuteRequested { .. } => "node_execute_requested",
             Self::NodeCompleted { .. } => "node_completed",

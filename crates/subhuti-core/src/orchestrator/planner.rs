@@ -212,7 +212,63 @@ pub async fn generate_plan(
 
     let llm_output = llm.chat(messages).await?;
 
-    Ok(parse_plan_or_ask(&llm_output)?)
+    parse_plan_or_ask(&llm_output)
+}
+
+/// 框架主管（Planner/ReAct 主管）专用的「专家编排计划」生成器。
+///
+/// 与专家内部的 `generate_plan` 不同：这里的"技能"就是已注册专家本身，
+/// 计划步骤的 `skill_id` 直接是专家 id。主管据此把多领域请求拆给多个专家串行执行，
+/// 上一步专家的输出会作为下一步专家的输入（黑盒专家之间的上下文传递）。
+///
+/// 触发场景：用户输入同时命中多个专家的标签（多领域），需要多专家协作。
+pub async fn generate_expert_plan(
+    llm: &Arc<dyn LLM>,
+    input: &str,
+    experts: &[SkillInfo],
+    supervisor_name: &str,
+) -> Result<PlanOrAsk> {
+    let experts_desc: String = experts
+        .iter()
+        .map(|s| format!("- **{}** (id=`{}`): {}", s.name, s.id, s.description))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let system_prompt = format!(
+        r#"你是 {}，负责把用户的多领域请求拆给合适的专家串行处理。
+
+可用的专家（skill_id 即专家 id，必须严格从下列 id 中选择，不要编造）：
+{}
+
+规则：
+1. 先判断请求涉及几个领域；只涉及单个领域时，只排那一个专家即可
+2. 涉及多个领域时，按最自然的执行顺序排多个专家；前一步专家的输出会作为后一步专家的输入
+3. skill_id 必须精确等于上面列出的某个专家 id
+4. 尽量直接展开执行计划，不要用「确认需求」当第一步
+5. 仅当信息确实缺失且无法从上下文推断时，才返回提问（question + options）"#,
+        supervisor_name, experts_desc
+    );
+
+    let user_prompt = format!(
+        "用户需求：\n{}\n\n请制定专家编排计划，以以下 JSON 格式返回：\n```json\n{{\n  \"description\": \"计划描述\",\n  \"steps\": [\n    {{\n      \"order\": 1,\n      \"skill_id\": \"<专家id>\",\n      \"description\": \"步骤描述\",\n      \"params\": \"传递给该专家的输入（可留空，默认用上一位专家的输出）\"\n    }}\n  ]\n}}\n```\n\n仅当确实缺失关键信息、且无法推断时，改为返回提问：\n```json\n{{\n  \"question\": \"问题\",\n  \"options\": [\"选项1\", \"选项2\"],\n  \"context\": \"为何询问的说明\"\n}}\n```",
+        input
+    );
+
+    let messages = vec![
+        Message {
+            role: Role::System,
+            content: system_prompt,
+            tool_call_id: None,
+        },
+        Message {
+            role: Role::User,
+            content: user_prompt,
+            tool_call_id: None,
+        },
+    ];
+
+    let llm_output = llm.chat(messages).await?;
+    parse_plan_or_ask(&llm_output)
 }
 
 /// 按顺序执行计划（引擎侧的循环驱动机制）
@@ -538,5 +594,110 @@ mod tests {
         assert!(result.contains("步骤失败"));
         // 上一步输出被注入到失败步的输入（prev=ok 输出）
         assert!(result.contains("prev=ok 输出"));
+    }
+
+    // ── Mock LLM：generate_plan 决策路径测试 ──────────
+
+    struct MockLlm {
+        config: crate::runtime::llm::LLMConfig,
+        reply: Arc<std::sync::Mutex<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::runtime::llm::LLM for MockLlm {
+        fn provider(&self) -> crate::runtime::llm::LLMProvider {
+            crate::runtime::llm::LLMProvider::Custom
+        }
+        fn config(&self) -> &crate::runtime::llm::LLMConfig {
+            &self.config
+        }
+        async fn chat(&self, _m: Vec<Message>) -> crate::Result<String> {
+            Ok(self.reply.lock().unwrap().clone())
+        }
+        async fn chat_with_tools(
+            &self,
+            _m: Vec<Message>,
+            _tools: Vec<crate::runtime::llm::ToolInfo>,
+        ) -> crate::Result<crate::runtime::llm::LLMResponse> {
+            Ok(crate::runtime::llm::LLMResponse {
+                content: self.reply.lock().unwrap().clone(),
+                tool_call: None,
+                model: None,
+                prompt_tokens: None,
+                completion_tokens: None,
+                total_tokens: None,
+            })
+        }
+        async fn chat_streaming(
+            &self,
+            _m: Vec<Message>,
+            _callback: Box<dyn Fn(String) + Send>,
+        ) -> crate::Result<()> {
+            Ok(())
+        }
+        async fn health_check(&self) -> crate::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    fn mock_llm(reply: &str) -> Arc<dyn crate::runtime::llm::LLM> {
+        Arc::new(MockLlm {
+            config: crate::runtime::llm::LLMConfig::default(),
+            reply: Arc::new(std::sync::Mutex::new(reply.to_string())),
+        })
+    }
+
+    fn skills() -> Vec<SkillInfo> {
+        vec![SkillInfo {
+            id: "rust-chat".into(),
+            name: "rust-chat".into(),
+            description: "闲聊对话".into(),
+            parameters: vec!["query".into()],
+        }]
+    }
+
+    #[tokio::test]
+    async fn test_generate_plan_llm_returns_plan() {
+        let llm = mock_llm(
+            r#"{"description":"编码计划","steps":[{"order":1,"skill_id":"rust-chat","description":"回复","params":"你好"}]}"#,
+        );
+        let out = generate_plan(&llm, "你好", &skills(), "测试专家")
+            .await
+            .unwrap();
+        match out {
+            PlanOrAsk::Plan(p) => {
+                assert_eq!(p.description, "编码计划");
+                assert_eq!(p.step_count(), 1);
+                assert_eq!(p.steps[0].skill_id, "rust-chat");
+            }
+            PlanOrAsk::Ask(_) => panic!("应识别为执行计划"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_plan_llm_returns_ask() {
+        let llm = mock_llm(
+            r#"{"question":"请选择目标目录","options":["/tmp/a","/tmp/b"],"context":"编码需要目录"}"#,
+        );
+        let out = generate_plan(&llm, "帮我创建项目", &skills(), "测试专家")
+            .await
+            .unwrap();
+        match out {
+            PlanOrAsk::Ask(a) => {
+                assert_eq!(a.question, "请选择目标目录");
+                assert_eq!(a.options.len(), 2);
+            }
+            PlanOrAsk::Plan(_) => panic!("应识别为提问"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_plan_llm_error_propagates() {
+        let llm: Arc<dyn crate::runtime::llm::LLM> = Arc::new(MockLlm {
+            config: crate::runtime::llm::LLMConfig::default(),
+            reply: Arc::new(std::sync::Mutex::new(String::new())),
+        });
+        let result = generate_plan(&llm, "", &skills(), "测试专家").await;
+        assert!(result.is_err(), "空输出应被解析为错误");
     }
 }

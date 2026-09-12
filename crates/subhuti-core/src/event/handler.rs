@@ -2,7 +2,7 @@
 //!
 //! 定义事件处理 trait 和订阅管理。
 
-use super::types::{AgentEventData, Event};
+use super::types::Event;
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -188,60 +188,5 @@ impl EventHandler for LoggingEventHandler {
     }
 }
 
-/// 内置：Trace 事件处理器（将事件写入 Trace 系统）
-pub struct TraceEventHandler {
-    name: String,
-}
-
-impl TraceEventHandler {
-    pub fn new() -> Self {
-        Self {
-            name: "trace".to_string(),
-        }
-    }
-}
-
-impl Default for TraceEventHandler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl EventHandler for TraceEventHandler {
-    async fn handle(&self, event: &Event) {
-        // 只处理 Span 相关事件
-        match &event.data {
-            AgentEventData::SpanStarted { span_name, .. } => {
-                tracing::info!(
-                    handler = %self.name,
-                    span = %span_name,
-                    trace_id = ?event.metadata.trace_id,
-                    "Span started"
-                );
-            }
-            AgentEventData::SpanEnded {
-                span_name,
-                duration_ms,
-                ..
-            } => {
-                tracing::info!(
-                    handler = %self.name,
-                    span = %span_name,
-                    duration_ms = %duration_ms,
-                    trace_id = ?event.metadata.trace_id,
-                    "Span ended"
-                );
-            }
-            _ => {}
-        }
-    }
-
-    fn filter(&self) -> EventFilter {
-        EventFilter::Types(vec!["span_started", "span_ended"])
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-}
+// 注：原 `TraceEventHandler`（仅响应 `SpanStarted`/`SpanEnded`）已删除——
+// 这两个事件从未被 emit，链路 capture 由 `TraceEventBridge` 负责（监听 LLM/Tool 真实事件）。

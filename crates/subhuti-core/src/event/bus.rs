@@ -96,10 +96,8 @@ impl EventBus {
                 .await;
         }
 
-        if self.config.enable_trace {
-            self.subscribe(Arc::new(super::handler::TraceEventHandler::new()))
-                .await;
-        }
+        // 注：`TraceEventHandler`（响应 SpanStarted/SpanEnded）已删除——
+        // 这两个事件从未被 emit，链路 capture 由 `TraceEventBridge` 负责。
     }
 
     /// 订阅事件
