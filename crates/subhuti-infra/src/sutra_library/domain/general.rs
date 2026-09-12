@@ -8,6 +8,12 @@ use anyhow::Result;
 
 pub struct GeneralDomainParser;
 
+impl Default for GeneralDomainParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GeneralDomainParser {
     pub fn new() -> Self {
         Self
@@ -126,6 +132,12 @@ impl DomainParser for GeneralDomainParser {
 }
 
 pub struct GeneralDomainTokenizer;
+
+impl Default for GeneralDomainTokenizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl GeneralDomainTokenizer {
     pub fn new() -> Self {

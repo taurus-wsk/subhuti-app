@@ -42,6 +42,12 @@ pub struct SlotTree {
     by_node_id: HashMap<String, TreeNodeKey>,
 }
 
+impl Default for SlotTree {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SlotTree {
     pub fn new() -> Self {
         Self {
@@ -252,10 +258,10 @@ impl SlotTree {
 
     /// 检查节点是否已经挂载到指定集合
     pub fn is_already_mounted(&self, node_id: &str, collection_id: &str) -> bool {
-        self.by_node_id.get(node_id).map_or(false, |&key| {
-            self.nodes.get(key).map_or(false, |n| {
-                n.collection_id == collection_id && n.parent.is_some()
-            })
+        self.by_node_id.get(node_id).is_some_and(|&key| {
+            self.nodes
+                .get(key)
+                .is_some_and(|n| n.collection_id == collection_id && n.parent.is_some())
         })
     }
 
@@ -380,9 +386,9 @@ mod tests {
     #[test]
     fn test_slot_tree_add_and_get() {
         let mut tree = SlotTree::new();
-        let k1 = tree.add_node("root", None, "根", "col1");
-        let k2 = tree.add_node("child1", Some("root"), "子1", "col1");
-        let k3 = tree.add_node("child2", Some("root"), "子2", "col1");
+        let _k1 = tree.add_node("root", None, "根", "col1");
+        let _k2 = tree.add_node("child1", Some("root"), "子1", "col1");
+        let _k3 = tree.add_node("child2", Some("root"), "子2", "col1");
 
         assert_eq!(tree.len(), 3);
         assert_eq!(tree.get_path("root"), Some("/根".to_string()));

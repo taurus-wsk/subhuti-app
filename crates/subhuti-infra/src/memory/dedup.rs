@@ -418,11 +418,12 @@ mod tests {
 
     /// 辅助函数：创建测试用记忆项
     fn make_item(id: &str, content: &str, created_at: chrono::DateTime<Utc>) -> MemoryItem {
-        let mut item = MemoryItem::default();
-        item.id = id.to_string();
-        item.content = content.to_string();
-        item.created_at = created_at;
-        item
+        MemoryItem {
+            id: id.to_string(),
+            content: content.to_string(),
+            created_at,
+            ..MemoryItem::default()
+        }
     }
 
     // ── cosine_similarity 测试 ──────────────────────────

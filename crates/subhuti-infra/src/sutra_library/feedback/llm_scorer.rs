@@ -79,7 +79,7 @@ impl LlmScorer {
         // 基于计数器的采样：每 1/sample_rate 次采样一次
         let count = self.counter.fetch_add(1, Ordering::Relaxed);
         let threshold = (1.0 / self.sample_rate) as u64;
-        count % threshold == 0
+        count.is_multiple_of(threshold)
     }
 
     /// 构建 LLM 评分 Prompt

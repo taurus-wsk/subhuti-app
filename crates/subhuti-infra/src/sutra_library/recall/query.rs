@@ -357,7 +357,7 @@ mod tests {
     fn test_query_expansion() {
         let analyzer = QueryAnalyzer::new();
         let expansions = analyzer.expand_query("pg search");
-        assert!(expansions.len() >= 1);
+        assert!(!expansions.is_empty());
         // 应该包含原始查询
         assert!(expansions.contains(&"pg search".to_string()));
         // "pg" 应该被展开为 "PostgreSQL 数据库"
@@ -370,7 +370,7 @@ mod tests {
         let expansions = analyzer.expand_query("create api");
         // "create" 的同义词: "创建", "新建", "生成", "add", "new"
         // "api" 的同义词: "接口", "API接口"
-        assert!(expansions.len() >= 1);
+        assert!(!expansions.is_empty());
         assert!(expansions.contains(&"create api".to_string()));
     }
 

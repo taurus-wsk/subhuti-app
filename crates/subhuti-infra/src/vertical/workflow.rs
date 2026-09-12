@@ -9,6 +9,12 @@ pub struct MemoryWorkflowStore {
     workflows: RwLock<HashMap<String, Workflow>>,
 }
 
+impl Default for MemoryWorkflowStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MemoryWorkflowStore {
     pub fn new() -> Self {
         Self {

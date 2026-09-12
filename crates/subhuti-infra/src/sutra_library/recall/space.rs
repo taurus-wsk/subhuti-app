@@ -132,15 +132,15 @@ impl SpaceDepthStrategy {
     /// 正反馈实体的重合权重更高，使 liked 内容在空间通路中排名更靠前。
     fn sort_by_entity_overlap(
         &self,
-        candidates: &mut Vec<(ChunkUuid, MemoryNode)>,
+        candidates: &mut [(ChunkUuid, MemoryNode)],
         root_entity_set: &HashSet<EntityUuid>,
     ) {
         if root_entity_set.is_empty() {
             return;
         }
         candidates.sort_by(|a, b| {
-            let entities_a = collect_entities(&[a.1.clone()]);
-            let entities_b = collect_entities(&[b.1.clone()]);
+            let entities_a = collect_entities(std::slice::from_ref(&a.1));
+            let entities_b = collect_entities(std::slice::from_ref(&b.1));
             let overlap_a: f32 = entities_a
                 .iter()
                 .filter(|e| root_entity_set.contains(*e))

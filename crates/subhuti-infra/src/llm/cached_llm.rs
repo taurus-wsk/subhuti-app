@@ -23,12 +23,12 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use subhuti_core::runtime::llm::{LLMConfig, LLMProvider, LLMResponse, Message, ToolInfo, LLM};
 use tracing::{debug, info, warn};
 
@@ -192,22 +192,27 @@ impl CachedLLM {
     }
 
     /// 计算 cache key：`model + messages(role+content)` 的 128-bit hash hex
+    ///
+    /// 必须使用**确定性**哈希：此前用 `DefaultHasher`（SipHash，每进程随机种子），
+    /// 导致进程重启后同一输入算出的 key 完全不同，磁盘缓存 100% 失效——
+    /// 表现为「缓存文件有内容，但重启后一条都命中不了」。
+    /// 这里改用 SHA-256（前 128 bit），跨进程、跨机器结果稳定。
     fn make_key(model: &str, messages: &[Message]) -> String {
-        let mut h1 = std::collections::hash_map::DefaultHasher::new();
-        model.hash(&mut h1);
+        let mut hasher = Sha256::new();
+        // 0x1f 作字段分隔符，避免 "ab"+"c" 与 "a"+"bc" 拼出相同摘要
+        hasher.update(model.as_bytes());
+        hasher.update([0x1f]);
         for m in messages {
-            format!("{:?}", m.role).hash(&mut h1);
-            m.content.hash(&mut h1);
-            m.tool_call_id.hash(&mut h1);
+            hasher.update(format!("{:?}", m.role).as_bytes());
+            hasher.update([0x1f]);
+            hasher.update(m.content.as_bytes());
+            hasher.update([0x1f]);
+            hasher.update(format!("{:?}", m.tool_call_id).as_bytes());
+            hasher.update([0x1f]);
         }
-        let part1 = h1.finish();
-
-        let mut h2 = std::collections::hash_map::DefaultHasher::new();
-        part1.hash(&mut h2);
-        messages.len().hash(&mut h2);
-        let part2 = h2.finish();
-
-        format!("{:016x}{:016x}", part1, part2)
+        let digest = hasher.finalize();
+        // 取前 16 字节（128 bit），与原先两段 u64 hex 的长度保持一致
+        format!("{:x}", digest)[..32].to_string()
     }
 
     /// 命中缓存时取出，返回 Some(...)
@@ -532,7 +537,7 @@ mod tests {
         // 写 4 条，应当保留最后 3 条
         for i in 0..4 {
             let _ = cached
-                .chat(vec![Message::user(&format!("msg{}", i))])
+                .chat(vec![Message::user(format!("msg{}", i))])
                 .await
                 .unwrap();
         }
@@ -544,6 +549,40 @@ mod tests {
         drop(st);
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// 回归防护：cache key 必须是**确定性**的（跨进程稳定）
+    ///
+    /// 此前用 `DefaultHasher`（SipHash，每进程随机种子），重启后同一输入的 key
+    /// 全部改变，磁盘缓存 100% 失效。这里锁定三条不变量。
+    #[test]
+    fn make_key_is_deterministic_and_unambiguous() {
+        let msgs = vec![Message::user("hello"), Message::user("world")];
+        let k1 = CachedLLM::make_key("glm-4-flash", &msgs);
+        let k2 = CachedLLM::make_key("glm-4-flash", &msgs);
+
+        assert_eq!(k1, k2, "相同输入必须产生相同 key");
+        assert_eq!(k1.len(), 32, "128-bit hex 应为 32 个字符");
+        assert!(
+            k1.chars().all(|c| c.is_ascii_hexdigit()),
+            "key 应为纯 hex: {}",
+            k1
+        );
+
+        // 字段边界不能混淆：拆分/合并消息必须得到不同 key
+        let joined = vec![Message::user("helloworld")];
+        assert_ne!(
+            CachedLLM::make_key("m", &joined),
+            CachedLLM::make_key("m", &msgs),
+            "消息之间必须有分隔符，否则 'ab'+'c' 与 'a'+'bc' 会碰撞"
+        );
+
+        // 模型名参与哈希
+        assert_ne!(
+            CachedLLM::make_key("model-a", &msgs),
+            CachedLLM::make_key("model-b", &msgs),
+            "换模型必须换 key"
+        );
     }
 
     fn tempfile_path() -> PathBuf {

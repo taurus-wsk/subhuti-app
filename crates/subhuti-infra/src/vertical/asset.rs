@@ -9,6 +9,12 @@ pub struct MemoryAssetLibrary {
     assets: RwLock<HashMap<String, Asset>>,
 }
 
+impl Default for MemoryAssetLibrary {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MemoryAssetLibrary {
     pub fn new() -> Self {
         Self {

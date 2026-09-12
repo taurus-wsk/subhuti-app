@@ -46,6 +46,12 @@ pub struct JiebaTokenizer {
     jieba: Jieba,
 }
 
+impl Default for JiebaTokenizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JiebaTokenizer {
     pub fn new() -> Self {
         Self {
@@ -344,7 +350,11 @@ impl TantivyIndex {
             self.entity_ids => entity_ids_str.as_str(),
         );
 
-        let writer = self.writer.write().unwrap();
+        // 取读锁即可：tantivy 的 `IndexWriter::delete_term` / `add_document` 都是 `&self`
+        // 且内部自带同步，本就支持多线程并发写入。此前用写锁会把所有索引写入
+        // 串行化（clippy: this write lock is used only for reading）。
+        // 真正需要独占的只有 `commit()`（需要 `&mut self`），见下方。
+        let writer = self.writer.read().unwrap();
         // 先删除旧文档（幂等更新），再添加新文档
         let term = tantivy::Term::from_field_text(self.node_id, &node.node_id);
         let _ = writer.delete_term(term);
@@ -360,12 +370,16 @@ impl TantivyIndex {
 
     /// 从索引中删除节点
     pub fn delete_node(&self, node_id: &str) {
-        let writer = self.writer.write().unwrap();
+        // 同 `index_node`：`delete_term` 只需 `&self`，读锁即可
+        let writer = self.writer.read().unwrap();
         let term = tantivy::Term::from_field_text(self.node_id, node_id);
         let _ = writer.delete_term(term);
     }
 
     /// 提交索引（将内存缓冲区写入 segment）
+    ///
+    /// 这里必须用写锁：`IndexWriter::commit` 需要 `&mut self`，
+    /// 且语义上应与并发的 `index_node` / `delete_node` 互斥。
     pub fn commit(&self) {
         let mut writer = self.writer.write().unwrap();
         let _ = writer.commit();
@@ -663,8 +677,10 @@ mod tests {
         index.index_node(&node2);
         index.commit();
 
-        let mut filters = SearchFilters::default();
-        filters.domain = Some("blender".to_string());
+        let filters = SearchFilters {
+            domain: Some("blender".to_string()),
+            ..SearchFilters::default()
+        };
 
         let hits = index.search_with_filters("教程", &filters, 10);
         assert_eq!(hits.len(), 1, "应该只找到 Blender 文档");

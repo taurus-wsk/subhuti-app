@@ -13,6 +13,12 @@ use sha2::Digest;
 /// 使用正则表达式（未来可替换为 tree-sitter）解析代码结构。
 pub struct RustDomainParser;
 
+impl Default for RustDomainParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RustDomainParser {
     pub fn new() -> Self {
         Self
@@ -85,7 +91,7 @@ impl RustDomainParser {
         let re = Regex::new(r"(?ms)^\s*(?:pub\s+)?(?:unsafe\s+)?impl(?:<[^>]*>)?\s+(\w+(?:<[^>]*>)?)\s*(?:for\s+(\w+))?\s*\{([^}]*)\}").unwrap();
         for cap in re.captures_iter(code) {
             let target = if let Some(t) = cap.get(2) {
-                format!("{} for {}", cap[1].to_string(), t.as_str())
+                format!("{} for {}", &cap[1], t.as_str())
             } else {
                 cap[1].to_string()
             };
@@ -224,6 +230,12 @@ impl DomainParser for RustDomainParser {
 }
 
 pub struct RustDomainTokenizer;
+
+impl Default for RustDomainTokenizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl RustDomainTokenizer {
     pub fn new() -> Self {

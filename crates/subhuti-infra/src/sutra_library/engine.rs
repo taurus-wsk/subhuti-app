@@ -8,6 +8,7 @@ use crate::sutra_library::feedback::{
 };
 use crate::sutra_library::hotness::HotnessCalculator;
 use crate::sutra_library::models::*;
+use crate::sutra_library::persistence::PersistencePort;
 use crate::sutra_library::recall::pipeline::default_query_analyzer;
 use crate::sutra_library::recall::{
     self, collect_entities, BaseSearch, ChunkUuid, EntityGraph, EntityUuid, GraphPassageStrategy,
@@ -27,7 +28,8 @@ use uuid::Uuid;
 /// 藏经阁引擎（入站端口）
 pub struct MemoryEnginePort {
     memory: Arc<MemoryStorage>,
-    pg: Option<Arc<PgStorage>>,
+    /// 核心持久化后端（PG 或 SQLite 降级），可为空（纯内存）
+    persistence: Option<Arc<dyn PersistencePort>>,
     domain_router: Arc<DomainRouter>,
     retrieval: RetrievalScheduler,
     /// 新版召回引擎子模块（参考《藏经阁召回引擎·高层整合终极方案》）
@@ -49,10 +51,12 @@ pub struct MemoryEnginePort {
 impl MemoryEnginePort {
     pub fn new(
         memory: Arc<MemoryStorage>,
-        pg: Option<Arc<PgStorage>>,
+        persistence: Option<Arc<dyn PersistencePort>>,
+        feedback_pg: Option<Arc<PgStorage>>,
         domain_router: Arc<DomainRouter>,
     ) -> Self {
-        let retrieval = RetrievalScheduler::new(memory.clone(), pg.clone(), domain_router.clone());
+        let retrieval =
+            RetrievalScheduler::new(memory.clone(), persistence.clone(), domain_router.clone());
         let entity_graph = Arc::new(EntityGraph::new());
         let graph_strategy = GraphPassageStrategy::new(entity_graph.clone());
 
@@ -70,12 +74,12 @@ impl MemoryEnginePort {
             tree: RwLock::new(SlotTree::new()),
             feedback_analyzer: Arc::new(FeedbackAnalyzer::new(
                 entity_graph.clone(),
-                pg.clone(),
+                feedback_pg,
                 FeedbackConfig::default(),
             )),
             last_retrieve_cache: RwLock::new(HashMap::new()),
             memory,
-            pg,
+            persistence,
             domain_router,
             retrieval,
         }
@@ -126,6 +130,7 @@ impl MemoryEnginePort {
     /// - `graph`: 对话图谱 ID
     /// - `domain`: 领域
     /// - `session_id`: 会话 ID（可选）
+    #[allow(clippy::too_many_arguments)]
     pub fn record_execution(
         &self,
         query: &str,
@@ -197,7 +202,7 @@ impl MemoryEnginePort {
         self.memory.create_collection(collection.clone());
 
         // 异步 PG 落库
-        if let Some(pg) = &self.pg {
+        if let Some(pg) = &self.persistence {
             let pg = pg.clone();
             let col = collection.clone();
             tokio::task::spawn(async move {
@@ -382,7 +387,7 @@ impl MemoryEnginePort {
         }
 
         // 7. 异步 PG 落库
-        if let Some(pg) = &self.pg {
+        if let Some(pg) = &self.persistence {
             let pg = pg.clone();
             let nodes = all_nodes.clone();
             tokio::task::spawn(async move {
@@ -436,7 +441,7 @@ impl MemoryEnginePort {
         }
 
         // 异步 PG 删除
-        if let Some(pg) = &self.pg {
+        if let Some(pg) = &self.persistence {
             let pg = pg.clone();
             let ids = subtree.clone();
             tokio::task::spawn(async move {
@@ -539,7 +544,7 @@ impl MemoryEnginePort {
                 tantivy.index_node(&n);
             }
 
-            if let Some(pg) = &self.pg {
+            if let Some(pg) = &self.persistence {
                 let pg = pg.clone();
                 tokio::task::spawn(async move {
                     if let Err(e) = pg.write_node(&n).await {
@@ -635,7 +640,7 @@ impl MemoryEnginePort {
             node.updated_at = chrono::Utc::now().timestamp();
             self.memory.write_node(&node);
 
-            if let Some(pg) = &self.pg {
+            if let Some(pg) = &self.persistence {
                 let pg = pg.clone();
                 tokio::task::spawn(async move {
                     if let Err(e) = pg.write_node(&node).await {
@@ -886,9 +891,9 @@ impl SutraLibraryPort for MemoryEnginePort {
     // ─── 知识库 CRUD 实现 ──────────────────────────────────────
 
     async fn list_knowledge_bases(&self) -> String {
-        let pg = match &self.pg {
+        let pg = match &self.persistence {
             Some(pg) => pg,
-            None => return "⚠️ 未配置 PostgreSQL，无法查询知识库".to_string(),
+            None => return "⚠️ 无持久化后端，无法查询知识库".to_string(),
         };
 
         match pg.list_knowledge_bases().await {
@@ -901,9 +906,9 @@ impl SutraLibraryPort for MemoryEnginePort {
     }
 
     async fn list_chunks(&self, kb_id: &str) -> String {
-        let pg = match &self.pg {
+        let pg = match &self.persistence {
             Some(pg) => pg,
-            None => return "⚠️ 未配置 PostgreSQL，无法查询知识库切片".to_string(),
+            None => return "⚠️ 无持久化后端，无法查询知识库切片".to_string(),
         };
 
         match pg.list_chunks(kb_id).await {
@@ -916,9 +921,9 @@ impl SutraLibraryPort for MemoryEnginePort {
     }
 
     async fn get_knowledge_base_by_expert(&self, expert_id: &str) -> String {
-        let pg = match &self.pg {
+        let pg = match &self.persistence {
             Some(pg) => pg,
-            None => return "⚠️ 未配置 PostgreSQL，无法查询专家知识库".to_string(),
+            None => return "⚠️ 无持久化后端，无法查询专家知识库".to_string(),
         };
 
         // 先获取所有知识库，然后过滤出 expert_id 匹配的

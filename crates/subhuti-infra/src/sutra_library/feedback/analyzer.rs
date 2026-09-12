@@ -87,7 +87,7 @@ impl FeedbackAnalyzer {
         {
             let window = self.window.read().unwrap();
             let len = window.len();
-            if len > 0 && len % 10 == 0 {
+            if len > 0 && len.is_multiple_of(10) {
                 // 用最近 10 条日志做轻度共现分析
                 let recent: Vec<ExecutionLog> = window.iter().rev().take(10).cloned().collect();
                 drop(window);
@@ -251,7 +251,7 @@ impl FeedbackAnalyzer {
             for chunk_id in &log.used_chunk_ids {
                 let chunk_entities = self
                     .entity_graph
-                    .get_entities_of_chunks(&[chunk_id.clone()]);
+                    .get_entities_of_chunks(std::slice::from_ref(chunk_id));
                 entities.extend(chunk_entities);
             }
 
@@ -297,7 +297,7 @@ impl FeedbackAnalyzer {
                 .map(|(_, _, w)| *w)
                 .unwrap_or(0.0);
 
-            let new_weight = (current_weight + delta).min(1.0).max(0.0);
+            let new_weight = (current_weight + delta).clamp(0.0, 1.0);
             self.entity_graph.add_learned_edge(from, to, new_weight);
         }
 
@@ -626,7 +626,7 @@ impl FeedbackAnalyzer {
             for chunk_id in &log.used_chunk_ids {
                 let chunk_entities = self
                     .entity_graph
-                    .get_entities_of_chunks(&[chunk_id.clone()]);
+                    .get_entities_of_chunks(std::slice::from_ref(chunk_id));
                 entities.extend(chunk_entities);
             }
 

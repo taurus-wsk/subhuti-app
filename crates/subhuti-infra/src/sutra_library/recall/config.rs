@@ -52,9 +52,10 @@ impl Default for LibraryRetrieveConfig {
 impl LibraryRetrieveConfig {
     /// 深度问答增强配置（打开二阶图谱）
     pub fn deep_qa() -> Self {
-        let mut cfg = Self::default();
-        cfg.graph_second_pass_from_space = true;
-        cfg
+        Self {
+            graph_second_pass_from_space: true,
+            ..Self::default()
+        }
     }
 
     /// 精准检索模式：仅同抽屉，无图谱

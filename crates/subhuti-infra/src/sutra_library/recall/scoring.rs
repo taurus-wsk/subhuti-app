@@ -6,18 +6,13 @@
 use crate::sutra_library::recall::{Candidate, RetrieveSource};
 
 /// 归一化策略
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NormalizeStrategy {
     /// 基于排名的归一化：score = (max_rank - rank) / max_rank
+    #[default]
     RankBased,
     /// 不归一化（直接相加）
     None,
-}
-
-impl Default for NormalizeStrategy {
-    fn default() -> Self {
-        Self::RankBased
-    }
 }
 
 /// 对候选列表进行分数归一化

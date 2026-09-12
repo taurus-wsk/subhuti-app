@@ -5,25 +5,26 @@
 use crate::sutra_library::domain::DomainRouter;
 use crate::sutra_library::hotness::HotnessCalculator;
 use crate::sutra_library::models::*;
-use crate::sutra_library::storage::{MemoryStorage, PgStorage};
+use crate::sutra_library::persistence::PersistencePort;
+use crate::sutra_library::storage::MemoryStorage;
 use std::sync::Arc;
 
 /// 检索调度器
 pub struct RetrievalScheduler {
     memory: Arc<MemoryStorage>,
-    pg: Option<Arc<PgStorage>>,
+    persistence: Option<Arc<dyn PersistencePort>>,
     domain_router: Arc<DomainRouter>,
 }
 
 impl RetrievalScheduler {
     pub fn new(
         memory: Arc<MemoryStorage>,
-        pg: Option<Arc<PgStorage>>,
+        persistence: Option<Arc<dyn PersistencePort>>,
         domain_router: Arc<DomainRouter>,
     ) -> Self {
         Self {
             memory,
-            pg,
+            persistence,
             domain_router,
         }
     }
@@ -73,8 +74,8 @@ impl RetrievalScheduler {
             }
         }
 
-        // 3. PG 冷库（如果配置了）
-        if let Some(pg) = &self.pg {
+        // 3. 持久化冷库（PG 或 SQLite，如果配置了）
+        if let Some(pg) = &self.persistence {
             if let Ok(pg_nodes) = pg
                 .search_fts(
                     &query.text,
@@ -124,12 +125,12 @@ impl RetrievalScheduler {
 
         // 更新热度
         for scored in &all {
-            self.memory.read_node(&scored.node.node_id).map(|mut n| {
+            if let Some(mut n) = self.memory.read_node(&scored.node.node_id) {
                 n.access_count += 1;
                 n.last_accessed_at = now_ts;
                 n.base_activation = HotnessCalculator::compute_activation(&n, now_ts);
                 self.memory.write_node(&n);
-            });
+            }
         }
 
         RetrievalResult {

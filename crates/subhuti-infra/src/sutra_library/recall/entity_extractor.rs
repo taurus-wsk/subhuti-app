@@ -191,13 +191,13 @@ impl EntityExtractor {
                 current.clear();
             }
         }
-        if !current.is_empty() && current.len() > 1 {
-            if current
+        if !current.is_empty()
+            && current.len() > 1
+            && current
                 .chars()
                 .any(|ch| ch.is_ascii_alphabetic() || ch.is_ascii_digit())
-            {
-                tokens.push(current);
-            }
+        {
+            tokens.push(current);
         }
 
         tokens.sort();

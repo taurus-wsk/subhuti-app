@@ -13,6 +13,12 @@ pub struct MemoryProjectMemory {
     notes: RwLock<HashMap<String, Vec<ProjectNote>>>,
 }
 
+impl Default for MemoryProjectMemory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MemoryProjectMemory {
     pub fn new() -> Self {
         Self {

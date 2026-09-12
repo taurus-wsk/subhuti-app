@@ -99,7 +99,7 @@ use std::sync::OnceLock;
 
 fn global_extractor() -> &'static EntityExtractor {
     static EXTRACTOR: OnceLock<EntityExtractor> = OnceLock::new();
-    EXTRACTOR.get_or_init(|| EntityExtractor::new())
+    EXTRACTOR.get_or_init(EntityExtractor::new)
 }
 
 /// 从 MemoryNode 提取实体 ID 列表（使用增强实体提取器）

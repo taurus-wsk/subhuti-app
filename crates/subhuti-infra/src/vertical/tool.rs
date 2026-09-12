@@ -8,6 +8,12 @@ pub struct MemoryToolRegistry {
     tools: RwLock<HashMap<String, Arc<dyn ToolIntegration>>>,
 }
 
+impl Default for MemoryToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MemoryToolRegistry {
     pub fn new() -> Self {
         Self {

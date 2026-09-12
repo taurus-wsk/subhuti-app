@@ -14,6 +14,12 @@ use sha2::Digest;
 /// Blender 场景解析器
 pub struct BlenderDomainParser;
 
+impl Default for BlenderDomainParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BlenderDomainParser {
     pub fn new() -> Self {
         Self
@@ -85,7 +91,7 @@ impl BlenderDomainParser {
         let re = Regex::new(r#"(?ms)(\w+)\.keyframe_insert\(\s*["']([^"']+)["']"#).unwrap();
         for cap in re.captures_iter(text) {
             items.push(BlenderItem {
-                name: format!("keyframe_{}", cap[2].to_string()),
+                name: format!("keyframe_{}", &cap[2]),
                 item_type: "animation".to_string(),
                 content: cap[0].to_string(),
                 line: text[..cap.get(0).unwrap().start()].lines().count() + 1,
@@ -244,32 +250,33 @@ impl DomainParser for BlenderDomainParser {
             // 材质 → 对象关联
             if node.node_type == "material" {
                 for other in nodes {
-                    if other.node_type.starts_with("object_") && other.node_id != node.node_id {
-                        if node.content.contains(&other.title)
-                            || other.content.contains(&node.title)
-                        {
-                            edges.push(RefEdge {
-                                target_node_id: other.node_id.clone(),
-                                target_collection_id: other.collection_id.clone(),
-                                edge_type: RefType::Uses,
-                                weight: 0.7,
-                            });
-                        }
+                    if other.node_type.starts_with("object_")
+                        && other.node_id != node.node_id
+                        && (node.content.contains(&other.title)
+                            || other.content.contains(&node.title))
+                    {
+                        edges.push(RefEdge {
+                            target_node_id: other.node_id.clone(),
+                            target_collection_id: other.collection_id.clone(),
+                            edge_type: RefType::Uses,
+                            weight: 0.7,
+                        });
                     }
                 }
             }
             // 修改器 → 对象关联
             if node.node_type.starts_with("modifier_") {
                 for other in nodes {
-                    if other.node_type.starts_with("object_") && other.node_id != node.node_id {
-                        if node.content.contains(&other.title) {
-                            edges.push(RefEdge {
-                                target_node_id: other.node_id.clone(),
-                                target_collection_id: other.collection_id.clone(),
-                                edge_type: RefType::DependsOn,
-                                weight: 0.6,
-                            });
-                        }
+                    if other.node_type.starts_with("object_")
+                        && other.node_id != node.node_id
+                        && node.content.contains(&other.title)
+                    {
+                        edges.push(RefEdge {
+                            target_node_id: other.node_id.clone(),
+                            target_collection_id: other.collection_id.clone(),
+                            edge_type: RefType::DependsOn,
+                            weight: 0.6,
+                        });
                     }
                 }
             }
@@ -377,6 +384,12 @@ impl DomainParser for BlenderDomainParser {
 
 /// Blender 领域分词器
 pub struct BlenderDomainTokenizer;
+
+impl Default for BlenderDomainTokenizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl BlenderDomainTokenizer {
     pub fn new() -> Self {

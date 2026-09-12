@@ -9,36 +9,29 @@
 //! - **应用层**: 业务实现，使用 core 接口和 infra 实现
 
 pub mod config;
-pub mod debug;
+pub mod data_dir;
 pub mod llm;
 pub mod memory;
 pub mod sutra_library;
-pub mod tool;
+pub mod trace_store;
 pub mod vertical;
 
 pub use config::{
     BigFive, EmotionalTendency, FeedbackType, FlowConfig, FlowTemplate, InteractionStats,
     RuntimeConfig, SoulProfile, SubhutiConfig, TokenUsage, ToneStyle,
 };
-pub use debug::{
-    assert_with_context, debug_print, diagnose_value, measure_time, HealthReport, HealthStatus,
-    LockDetector, Profiler, TestTracker,
-};
 pub use llm::{
     CacheStats, CachedLLM, DoubaoClient, DoubaoConfig, MockLLM, OllamaClient, OllamaConfig,
     OpenAIClient, OpenAIConfig, ZhipuClient, ZhipuConfig,
 };
 pub use memory::{
-    BaseStats, ConnectionDynamics, ConvoExchange, ConvoMiner, Database, DatabaseStore, DbConfig,
-    DedupConfig, DedupResult, Deduplicator, DefaultMemory, EmbeddingConfig, EmbeddingService,
-    Entity, EntityExtractor, EntityRegistry, EntitySource, EntityType, FactChecker, FactIssue,
-    FeedbackRow, HistoryRow, HybridSearchResult, HybridSearcher, IssueType, KeepStrategy,
-    KnowledgeGraph, KnowledgeGraphStats, KnowledgeMemory, LayerOutput, LongTermMemory, Memory,
-    MemoryConfig, MemoryItem, MemoryLayer, MemoryLayerConfig, MemoryRow, MemoryStack, MemoryStats,
-    MemoryStore, MinedMemory, PersonaData, PersonaRow, QueryDirection, SearchResult,
-    SemanticSearchResult, ShortTermMemory, SqliteMemoryStore, Triple,
+    BaseStats, ConnectionDynamics, ConvoExchange, ConvoMiner, DedupConfig, DedupResult,
+    Deduplicator, EmbeddingConfig, EmbeddingService, Entity, EntityExtractor, EntityRegistry,
+    EntitySource, EntityType, FactChecker, FactIssue, IssueType, KeepStrategy, KnowledgeMemory,
+    LayerOutput, LongTermMemory, Memory, MemoryConfig, MemoryItem, MemoryLayer, MemoryLayerConfig,
+    MemoryStack, MemoryStats, MemoryStore, MinedMemory, SearchResult, SemanticSearchResult,
+    ShortTermMemory,
 };
-pub use tool::{CalculatorTool, FileReadTool, FileWriteTool, WeatherTool, WebSearchTool};
 pub use vertical::{
     MemoryAssetLibrary, MemoryProjectMemory, MemoryToolRegistry, MemoryWorkflowStore,
 };

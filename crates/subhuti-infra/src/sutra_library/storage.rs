@@ -73,7 +73,7 @@ impl Bm25Index {
     /// 移除文档
     pub fn remove_document(&mut self, doc_id: &str) {
         if let Some(term_freq) = self.tf.remove(doc_id) {
-            for (term, _) in &term_freq {
+            for term in term_freq.keys() {
                 if let Some(count) = self.df.get_mut(term) {
                     *count -= 1;
                     if *count == 0 {
@@ -546,13 +546,13 @@ impl PgStorage {
         .bind(&node.metadata)
         .bind(&node.version_tag)
         .bind(&node.snapshot_id)
-        .bind(node.base_activation as f32)
+        .bind(node.base_activation)
         .bind(node.importance as i16)
         .bind(node.access_count as i32)
-        .bind(node.feedback_score as f32)
-        .bind(node.last_accessed_at as i64)
-        .bind(node.created_at as i64)
-        .bind(node.updated_at as i64)
+        .bind(node.feedback_score)
+        .bind(node.last_accessed_at)
+        .bind(node.created_at)
+        .bind(node.updated_at)
         .execute(&*self.pool)
         .await?;
         Ok(())
@@ -575,7 +575,7 @@ impl PgStorage {
         .bind(&collection.name)
         .bind(&collection.domain)
         .bind(&collection.description)
-        .bind(collection.created_at as i64)
+        .bind(collection.created_at)
         .execute(&*self.pool)
         .await?;
         Ok(())

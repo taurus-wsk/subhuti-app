@@ -31,9 +31,14 @@ macro_rules! export_expert_plugin {
             ptr
         }
 
+        /// WASM 宿主调用入口：`input_ptr` / `input_len` 描述一段宿主内存。
+        ///
+        /// 标记为 `unsafe extern "C"`：本函数会解引用宿主传入的裸指针，
+        /// 安全性由调用方（WASM host）保证。ABI 与 `extern "C" fn` 完全一致，
+        /// 不影响导出符号。
         #[no_mangle]
-        pub extern "C" fn run(input_ptr: *const u8, input_len: usize) -> *mut u8 {
-            let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
+        pub unsafe extern "C" fn run(input_ptr: *const u8, input_len: usize) -> *mut u8 {
+            let input = std::slice::from_raw_parts(input_ptr, input_len);
             let input_str = std::str::from_utf8(input).unwrap();
             let response = <$plugin as ExpertPlugin>::run(input_str);
             let len = response.len();

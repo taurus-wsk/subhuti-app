@@ -105,7 +105,42 @@ async fn parse_zhipu_json<T: for<'de> Deserialize<'de>>(
             hint
         )));
     }
-    response.json::<T>().await.map_err(|e| map_reqwest_error(e))
+    response.json::<T>().await.map_err(map_reqwest_error)
+}
+
+/// 逐「完整行」消费流式响应体，避免网络分片把一行（乃至一个 UTF-8 多字节字符）
+/// 从中间截断，导致 `data:` 行解析失败、delta 被**静默丢弃**。
+///
+/// 实现要点：把收到的字节累积进 `buf`，只在遇到 `\n` 时取出一整行交给 `on_line`，
+/// 未闭合的尾巴留到下一片继续拼接（这正是一次流式丢字的根因）。
+/// `on_line` 返回 `true` 表示提前结束（例如遇到 `data: [DONE]`）。
+///
+/// 各家协议共用本函数：OpenAI / Zhipu / Doubao 用 `data: {json}` 行，Ollama 用裸 JSON 行，
+/// 差异只在 `on_line` 内部。
+async fn drain_stream_lines<F>(
+    response: &mut reqwest::Response,
+    mut on_line: F,
+) -> subhuti_core::Result<()>
+where
+    F: FnMut(&str) -> bool + Send,
+{
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(map_reqwest_error)? {
+        buf.extend_from_slice(&chunk);
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&line_bytes);
+            if on_line(line.trim_end_matches(['\r', '\n'])) {
+                return Ok(());
+            }
+        }
+    }
+    // 收尾：最后一行可能没有以 \n 结尾
+    if !buf.is_empty() {
+        let line = String::from_utf8_lossy(&buf);
+        let _ = on_line(line.trim_end_matches(['\r', '\n']));
+    }
+    Ok(())
 }
 
 pub struct MockLLM {
@@ -115,6 +150,12 @@ pub struct MockLLM {
     captured_messages: Mutex<Vec<Vec<Message>>>,
     call_count: Mutex<usize>,
     default_echo: bool,
+}
+
+impl Default for MockLLM {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MockLLM {
@@ -504,24 +545,24 @@ impl LLM for OpenAIClient {
             .await
             .map_err(map_reqwest_error)?;
 
-        while let Some(chunk) = response.chunk().await.map_err(map_reqwest_error)? {
-            let text = String::from_utf8_lossy(&chunk);
-            for line in text.lines() {
-                if line.starts_with("data: ") {
-                    let data = line.strip_prefix("data: ").unwrap_or(line);
-                    if data == "[DONE]" {
-                        return Ok(());
-                    }
-                    if let Ok(event) = serde_json::from_str::<OpenAIStreamEvent>(data) {
-                        if let Some(content) = event.choices[0].delta.content.clone() {
-                            callback(content);
+        let cb = callback;
+        drain_stream_lines(&mut response, move |line| {
+            if let Some(data) = line.strip_prefix("data: ") {
+                if data == "[DONE]" {
+                    return true;
+                }
+                if let Ok(event) = serde_json::from_str::<OpenAIStreamEvent>(data) {
+                    // 部分分片 choices 为空（如仅含 role/usage），用 first() 避免越界 panic
+                    if let Some(choice) = event.choices.first() {
+                        if let Some(content) = choice.delta.content.clone() {
+                            cb(content);
                         }
                     }
                 }
             }
-        }
-
-        Ok(())
+            false
+        })
+        .await
     }
 
     async fn health_check(&self) -> subhuti_core::Result<bool> {
@@ -764,19 +805,20 @@ impl LLM for OllamaClient {
             .await
             .map_err(map_reqwest_error)?;
 
-        while let Some(chunk) = response.chunk().await.map_err(map_reqwest_error)? {
-            let text = String::from_utf8_lossy(&chunk);
-            for line in text.lines() {
-                if let Ok(event) = serde_json::from_str::<OllamaStreamEvent>(line) {
-                    callback(event.message.content);
-                    if event.done {
-                        return Ok(());
-                    }
+        let cb = callback;
+        drain_stream_lines(&mut response, move |line| {
+            if line.trim().is_empty() {
+                return false;
+            }
+            if let Ok(event) = serde_json::from_str::<OllamaStreamEvent>(line) {
+                cb(event.message.content);
+                if event.done {
+                    return true;
                 }
             }
-        }
-
-        Ok(())
+            false
+        })
+        .await
     }
 
     async fn health_check(&self) -> subhuti_core::Result<bool> {
@@ -975,19 +1017,20 @@ impl LLM for DoubaoClient {
             .await
             .map_err(map_reqwest_error)?;
 
-        while let Some(chunk) = response.chunk().await.map_err(map_reqwest_error)? {
-            let text = String::from_utf8_lossy(&chunk);
-            for line in text.lines() {
-                if let Ok(event) = serde_json::from_str::<DoubaoStreamEvent>(line) {
-                    callback(event.content);
-                    if event.is_finish {
-                        return Ok(());
-                    }
+        let cb = callback;
+        drain_stream_lines(&mut response, move |line| {
+            if line.trim().is_empty() {
+                return false;
+            }
+            if let Ok(event) = serde_json::from_str::<DoubaoStreamEvent>(line) {
+                cb(event.content);
+                if event.is_finish {
+                    return true;
                 }
             }
-        }
-
-        Ok(())
+            false
+        })
+        .await
     }
 
     async fn health_check(&self) -> subhuti_core::Result<bool> {
@@ -1261,24 +1304,24 @@ impl LLM for ZhipuClient {
             )));
         }
 
-        while let Some(chunk) = response.chunk().await.map_err(map_reqwest_error)? {
-            let text = String::from_utf8_lossy(&chunk);
-            for line in text.lines() {
-                if line.starts_with("data: ") {
-                    let data = line.strip_prefix("data: ").unwrap_or(line);
-                    if data == "[DONE]" {
-                        return Ok(());
-                    }
-                    if let Ok(event) = serde_json::from_str::<ZhipuStreamEvent>(data) {
-                        if let Some(content) = event.choices[0].delta.content.clone() {
-                            callback(content);
+        let cb = callback;
+        drain_stream_lines(&mut response, move |line| {
+            if let Some(data) = line.strip_prefix("data: ") {
+                if data == "[DONE]" {
+                    return true;
+                }
+                if let Ok(event) = serde_json::from_str::<ZhipuStreamEvent>(data) {
+                    // 部分分片 choices 为空（如仅含 role/usage），用 first() 避免越界 panic
+                    if let Some(choice) = event.choices.first() {
+                        if let Some(content) = choice.delta.content.clone() {
+                            cb(content);
                         }
                     }
                 }
             }
-        }
-
-        Ok(())
+            false
+        })
+        .await
     }
 
     async fn health_check(&self) -> subhuti_core::Result<bool> {

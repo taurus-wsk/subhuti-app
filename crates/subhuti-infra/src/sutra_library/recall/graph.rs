@@ -763,7 +763,9 @@ impl GraphPassageStrategy {
                     continue;
                 }
 
-                let neighbor_chunks = self.graph.get_chunks_of_entities(&[neighbor.clone()]);
+                let neighbor_chunks = self
+                    .graph
+                    .get_chunks_of_entities(std::slice::from_ref(neighbor));
                 for chunk_id in &neighbor_chunks {
                     if visited_chunks.insert(chunk_id.clone()) {
                         let mut entity_path = path.clone();
