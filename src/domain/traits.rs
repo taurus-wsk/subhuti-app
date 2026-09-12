@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use crate::domain::ports::CommandPort;
 use crate::domain::ports::FileSystemPort;
 use crate::domain::ports::ToolchainPort;
+use subhuti_core::event::EventBus;
 
 /// 领域技能信息（纯领域 DTO）
 ///
@@ -78,6 +79,8 @@ pub struct DomainExecutionContext {
     pub command: Option<Arc<dyn CommandPort>>,
     /// 进度报告通道（可选，用于实时推送执行进度到 SSE 流）
     pub progress_tx: Option<mpsc::Sender<String>>,
+    /// 框架事件总线（可选，用于把记忆检索等动作事件透传为 SSE 阶段流）
+    pub event_bus: Option<Arc<EventBus>>,
 }
 
 impl Clone for DomainExecutionContext {
@@ -94,6 +97,7 @@ impl Clone for DomainExecutionContext {
             file_system: self.file_system.clone(),
             command: self.command.clone(),
             progress_tx: self.progress_tx.clone(),
+            event_bus: self.event_bus.clone(),
         }
     }
 }
@@ -197,9 +201,11 @@ pub trait DomainExpert: Send + Sync {
             skills.len()
         );
 
-        // 1. 发送进度通知：开始规划
-        send_progress(
+        // 1. 发送进度通知：开始规划（phase = plan，让前端分类渲染）
+        send_phase_progress(
             &exec_ctx.progress_tx,
+            "plan",
+            &expert_name,
             &format!("🔍 {} 正在分析需求，制定执行计划...", expert_name),
         );
 
@@ -297,8 +303,10 @@ pub trait DomainExpert: Send + Sync {
         // 若 planner 判定无需执行任何技能（0 步骤，典型如问候语/普通对话），
         // 不再空跑执行链（否则会输出「共执行 0 个步骤」），而是退化为 LLM 直接对话回答。
         if plan.steps.is_empty() {
-            send_progress(
+            send_phase_progress(
                 &exec_ctx.progress_tx,
+                "answer",
+                &expert_name,
                 &format!("💬 {} 正在回答...", expert_name),
             );
             tracing::info!(
@@ -320,8 +328,10 @@ pub trait DomainExpert: Send + Sync {
             // 真流式：逐 delta 推给前端（首字即出），同时累积为完整答案返回
             let answer =
                 chat_stream_to_progress(&exec_ctx.llm, msgs, &exec_ctx.progress_tx).await?;
-            send_progress(
+            send_phase_progress(
                 &exec_ctx.progress_tx,
+                "done",
+                &expert_name,
                 &format!("✅ {} 回答完成", expert_name),
             );
             return Ok(answer);
@@ -418,6 +428,30 @@ fn send_struct_progress(
             "message": message,
             "done_count": done,
             "total_count": total,
+        })
+        .to_string(),
+    );
+}
+
+/// 推送带阶段标识(step)的执行进度事件。
+///
+/// 与 `send_struct_progress` 不同，它强调「当前处于哪个 workflow 阶段」(plan/answer/done 等)，
+/// 并携带 `expert` 真实专家名，让编排层能透传 `phase`/`expert` 给前端做分类渲染。
+fn send_phase_progress(
+    tx: &Option<mpsc::Sender<String>>,
+    phase: &str,
+    expert: &str,
+    message: &str,
+) {
+    send_progress(
+        tx,
+        &serde_json::json!({
+            "type": "step",
+            "phase": phase,
+            "expert": expert,
+            "message": message,
+            "done_count": 0,
+            "total_count": 0,
         })
         .to_string(),
     );

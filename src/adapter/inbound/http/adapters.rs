@@ -197,12 +197,16 @@ fn stream_to_sse(
                     }).to_string();
                     yield Ok(Event::default().data(decorate(json)));
                 }
-                StreamEvent::Step { message, expert, todo_state } => {
+                StreamEvent::Step { message, expert, phase, todo_state } => {
                     let mut payload = serde_json::json!({
                         "type": "step",
                         "message": message,
                         "expert": expert,
                     });
+                    if let Some(p) = phase {
+                        payload.as_object_mut()
+                            .map(|o| o.insert("phase".into(), p.into()));
+                    }
                     if let Some(ts) = todo_state {
                         payload.as_object_mut()
                             .map(|o| o.insert("todo_state".into(), ts.into()));

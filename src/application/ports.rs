@@ -37,6 +37,10 @@ pub enum StreamEvent {
     Step {
         message: String,
         expert: Option<String>,
+        /// 阶段标识（可选）：workflow 阶段（analyze/plan/edit/verify/fix/complete）
+        /// 或框架阶段（think/plan/tool/retrieve/edit/verify/answer/done），
+        /// 由专家/编排层透传，前端据此做分类渲染（如 WorkBuddy 的 think→plan→exe 阶段流）。
+        phase: Option<String>,
         /// 完整打勾态的唯一待办清单快照（可选）。前端用它「原位替换」待办清单以动态打勾，
         /// 而非每步追加新清单，避免聊天里清单重复堆叠。
         todo_state: Option<String>,

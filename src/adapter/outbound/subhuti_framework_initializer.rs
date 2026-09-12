@@ -24,8 +24,8 @@ use subhuti_infra::vertical::{
 };
 use subhuti_infra::CachedLLM;
 use subhuti_infra::{
-    DoubaoClient, DoubaoConfig, MockLLM, OllamaClient, OllamaConfig, OpenAIClient, OpenAIConfig,
-    ZhipuClient, ZhipuConfig,
+    ContextLimitLLM, DoubaoClient, DoubaoConfig, LimitConfig, MockLLM, OllamaClient, OllamaConfig,
+    OpenAIClient, OpenAIConfig, RetryConfig, RetryLLM, ZhipuClient, ZhipuConfig,
 };
 
 use crate::adapter::outbound::rules;
@@ -201,6 +201,35 @@ impl SubhutiFrameworkInitializer {
                 }
             };
 
+            // ── P0 韧性：上下文裁剪 → 重试/超时（由内到外，顺序有意义）──
+            //   1) ContextLimitLLM（最内）：先把 messages 裁到预算内，再交给重试层，
+            //      保证每次重试用的都是同一份已裁剪输入，不会因重试而放大请求体
+            //   2) RetryLLM（外一层）：对临时性失败（超时 / 429 / 5xx）指数退避重试，
+            //      并给每次调用套整体超时
+            //   3) CachedLLM（最外，仅调试）：以「裁剪后」的输入为 cache key，
+            //      与真实发给模型的请求保持一致
+            let limit_cfg = LimitConfig::from_env();
+            let retry_cfg = RetryConfig::from_env();
+            let llm_client: Arc<dyn subhuti_core::LLM> =
+                RetryLLM::wrap(ContextLimitLLM::wrap(llm_client, limit_cfg), retry_cfg);
+            record_fn_log(
+                None,
+                "",
+                LogLevel::Info,
+                format!(
+                    "🛡️ LLM 韧性：上下文裁剪={}(messages≤{}, chars≤{}) ｜ 重试={}(尝试≤{}次, 超时={}s, 退避={}~{}ms)",
+                    if limit_cfg.enabled { "开" } else { "关" },
+                    limit_cfg.max_messages,
+                    limit_cfg.max_chars,
+                    if retry_cfg.enabled { "开" } else { "关" },
+                    retry_cfg.max_attempts,
+                    retry_cfg.timeout_secs,
+                    retry_cfg.base_delay_ms,
+                    retry_cfg.max_delay_ms,
+                ),
+                None,
+            );
+
             // 🧪 调试缓存：env SUBHUTI_LLM_CACHE=1 时用 CachedLLM 包装真实 client，
             //    相同输入直接返回缓存结果，避免反复打智谱 API（默认上限 100 条，LRU）
             //
@@ -334,6 +363,7 @@ impl SubhutiFrameworkInitializer {
         let expert_name = expert.name().to_string();
 
         // 创建领域专家适配器（领域→框架）
+        let event_bus = self.subhuti.event_bus().clone();
         let adapter: Arc<
             crate::adapter::outbound::domain_expert_adapter::DomainExpertAdapter<dyn DomainExpert>,
         > = Arc::new(
@@ -343,6 +373,7 @@ impl SubhutiFrameworkInitializer {
                 toolchain,
                 file_system,
                 command,
+                Some(event_bus),
             ),
         );
 

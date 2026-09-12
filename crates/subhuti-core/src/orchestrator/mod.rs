@@ -764,6 +764,19 @@ impl Orchestrator {
         let actor_name = actor.name().to_string();
         let actor_id = actor.id().to_string();
 
+        // 发布专家匹配事件（route 阶段）：让 ProgressEventBridge 透传到 SSE，
+        // 使前端能渲染「🧭 匹配专家: XXX」的阶段分类
+        self.emit_event(
+            ctx,
+            AgentEventData::AgentMatched {
+                agent_id: actor_id.clone(),
+                agent_name: actor_name.clone(),
+                match_score: 1.0,
+                candidates: Vec::new(),
+            },
+        )
+        .await;
+
         self.emit_event(
             ctx,
             AgentEventData::ChainSelected {

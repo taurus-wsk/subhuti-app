@@ -14,6 +14,7 @@ use crate::domain::traits::{
     chat_stream_to_progress, DomainExecutionContext, DomainExpert, DomainMessage, DomainResult,
     DomainRole, DomainSkill,
 };
+use subhuti_core::event::AgentEventData;
 
 /// Blender 动画制作专家
 ///
@@ -117,6 +118,20 @@ impl DomainExpert for BlenderExpert {
             sutra.add_session(session_id, &exec_ctx.ctx.input, "blender");
 
             // 使用新版召回流水线搜索相关记忆（五阶段：BaseSearch → Space → Graph → 合并 → 排序）
+            // 发射 MemoryRetrieved（retrieve 阶段）：仅在带 trace_id 且接入了 EventBus 时
+            if let (Some(bus), Some(tid)) = (&exec_ctx.event_bus, &exec_ctx.ctx.trace_id) {
+                if !tid.is_empty() {
+                    bus.emit_with_trace(
+                        AgentEventData::MemoryRetrieved {
+                            query: exec_ctx.ctx.input.clone(),
+                            results_count: 0,
+                        },
+                        tid.clone(),
+                        exec_ctx.ctx.session_id.clone(),
+                    )
+                    .await;
+                }
+            }
             let history = sutra.library_retrieve(&exec_ctx.ctx.input, 3).await;
             if !history.contains("未找到") && !history.contains("⚠️") {
                 record_fn_log(

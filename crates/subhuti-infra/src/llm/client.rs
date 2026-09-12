@@ -8,7 +8,30 @@ use subhuti_core::runtime::llm::{
 };
 use tracing::debug;
 
+/// 判断 HTTP 状态码是否属于「临时性失败」，值得重试。
+///
+/// - 408 请求超时、429 限流 → 可重试
+/// - 5xx 服务端错误 → 可重试
+/// - 其余 4xx（400/401/403/404/422…）多为请求本身的问题，重试无意义 → 不重试
+fn status_is_retryable(status: u16) -> bool {
+    status == 408 || status == 429 || (500..600).contains(&status)
+}
+
+/// 构造一个带连接超时的 HTTP 客户端。
+///
+/// `Client::new()` 默认**没有任何超时**，一句 `connect_timeout` 都没有：
+/// 目标不可达时会一直挂到内核 TCP 超时（可能几分钟），表现为「编排整条卡死」。
+/// 这里只设「建连超时」——**整体超时**由上层 `RetryLLM` 控制，避免与它打架。
+fn build_http_client() -> Client {
+    Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| Client::new())
+}
+
 fn map_reqwest_error(e: reqwest::Error) -> subhuti_core::Error {
+    let status = e.status().map(|s| s.as_u16());
+
     // 归类网络层错误，方便前端/日志快速定位根因
     let mut kind = if e.is_timeout() {
         "网络超时"
@@ -31,8 +54,8 @@ fn map_reqwest_error(e: reqwest::Error) -> subhuti_core::Error {
 
     // 记录 HTTP 状态码：若错误携带 status（如 4xx 上下文超限/401/429），优先展示，
     // 便于区分「服务端拒绝(4xx)」与「网络层失败(无 status)」
-    if let Some(status) = e.status() {
-        kind = format!("HTTP {} ", status.as_u16());
+    if let Some(code) = status {
+        kind = format!("HTTP {} ", code);
     }
 
     // 递归收集底层错误链（hyper/tonic 的连接、TLS、超时等具体原因）
@@ -46,12 +69,21 @@ fn map_reqwest_error(e: reqwest::Error) -> subhuti_core::Error {
         source = s.source();
     }
 
+    // 可重试判定：
+    //  - 有状态码：仅 408 / 429 / 5xx 可重试
+    //  - 无状态码：超时、连接失败、请求未发出、响应体中断均可重试；解析/构建错误不可
+    let retryable = match status {
+        Some(code) => status_is_retryable(code),
+        None => e.is_timeout() || e.is_connect() || e.is_request() || e.is_body(),
+    };
+
     let full = format!("[{}] {}", kind, e);
-    if detail.is_empty() {
-        subhuti_core::Error::Any(anyhow::anyhow!("LLM HTTP {}: {}", kind, full))
+    let message = if detail.is_empty() {
+        format!("LLM HTTP {}", full)
     } else {
-        subhuti_core::Error::Any(anyhow::anyhow!("LLM HTTP {}: {}{}", kind, full, detail))
-    }
+        format!("LLM HTTP {}{}", full, detail)
+    };
+    subhuti_core::Error::llm(status, retryable, message)
 }
 
 /// 对成功发送但返回非 2xx 的响应，提取 status + 响应体片段构成清晰错误。
@@ -71,11 +103,11 @@ async fn ensure_http_success(
     } else {
         snippet
     };
-    Err(subhuti_core::Error::Any(anyhow::anyhow!(
-        "LLM HTTP {} (status): {}",
-        status.as_u16(),
-        hint
-    )))
+    Err(subhuti_core::Error::llm(
+        Some(status.as_u16()),
+        status_is_retryable(status.as_u16()),
+        format!("LLM HTTP {} (status): {}", status.as_u16(), hint),
+    ))
 }
 
 /// 智谱 API 返回的标准错误体
@@ -375,7 +407,7 @@ impl OpenAIClient {
         Self {
             config,
             llm_config,
-            http_client: Client::new(),
+            http_client: build_http_client(),
         }
     }
 
@@ -691,7 +723,7 @@ impl OllamaClient {
         Self {
             config,
             llm_config,
-            http_client: Client::new(),
+            http_client: build_http_client(),
         }
     }
 
@@ -898,7 +930,7 @@ impl DoubaoClient {
         Self {
             config,
             llm_config,
-            http_client: Client::new(),
+            http_client: build_http_client(),
         }
     }
 
@@ -1121,7 +1153,7 @@ impl ZhipuClient {
         Self {
             config,
             llm_config,
-            http_client: Client::new(),
+            http_client: build_http_client(),
         }
     }
 

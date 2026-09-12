@@ -182,6 +182,11 @@ impl ChatPort for OrchestrationService {
         let workspace_folder = request.workspace_folder.unwrap_or_default();
         let system_prompt = request.system_prompt.unwrap_or_default();
 
+        // 按 trace_id 注册 SSE 通道，使 ProgressEventBridge 能把框架事件路由到本请求
+        if !trace_id.is_empty() {
+            crate::application::stream_registry::register_stream_tx(&trace_id, tx.clone());
+        }
+
         // 创建进度通道并注册到全局注册表
         let (progress_tx, mut progress_rx) = mpsc::channel::<String>(100);
         crate::adapter::outbound::domain_expert_adapter::register_progress_tx(
@@ -216,6 +221,56 @@ impl ChatPort for OrchestrationService {
             };
             let _ = tx.send(StreamEvent::Plan { message: plan_msg }).await;
 
+            // 把进度 JSON 转换为带阶段(phase)与真实专家名的 Step 事件。
+            // 此前编排层只取 message/done_count/total_count/todo_state，丢掉了 phase，
+            // 且把 expert 硬编码成 "rust-expert"（无论实际跑哪个专家都显示 Rust）。
+            let build_step = |progress_json: &serde_json::Value| -> StreamEvent {
+                let step_msg = progress_json
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("执行中");
+                let done_count = progress_json
+                    .get("done_count")
+                    .and_then(|m| m.as_u64())
+                    .unwrap_or(0);
+                let total_count = progress_json
+                    .get("total_count")
+                    .and_then(|m| m.as_u64())
+                    .unwrap_or(0);
+                let phase = progress_json
+                    .get("phase")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string());
+                // 优先用进度 JSON 自带的 expert（专家侧已上报真实名字）；
+                // 没有则回退到请求指定的 expert_id（自动匹配路径下可能为空）。
+                let expert = progress_json
+                    .get("expert")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        if !expert_id.is_empty() {
+                            Some(expert_id.clone())
+                        } else {
+                            None
+                        }
+                    });
+                let todo_state = progress_json
+                    .get("todo_state")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string());
+                let message = if total_count > 0 {
+                    format!("{} ({}/{})", step_msg, done_count, total_count)
+                } else {
+                    step_msg.to_string()
+                };
+                StreamEvent::Step {
+                    message,
+                    expert,
+                    phase,
+                    todo_state,
+                }
+            };
+
             // 执行阶段
             let _ = tx
                 .send(StreamEvent::Step {
@@ -225,6 +280,7 @@ impl ChatPort for OrchestrationService {
                     } else {
                         None
                     },
+                    phase: Some("run".to_string()),
                     todo_state: None,
                 })
                 .await;
@@ -295,19 +351,7 @@ impl ChatPort for OrchestrationService {
                                         }).await;
                                     }
                                     Some("step") => {
-                                        let step_msg = progress_json.get("message").and_then(|m| m.as_str()).unwrap_or("执行中");
-                                        let done_count = progress_json.get("done_count").and_then(|m| m.as_u64()).unwrap_or(0);
-                                        let total_count = progress_json.get("total_count").and_then(|m| m.as_u64()).unwrap_or(0);
-                                        let todo_state = progress_json
-                                            .get("todo_state")
-                                            .and_then(|m| m.as_str())
-                                            .map(|s| s.to_string());
-
-                                        let _ = tx.send(StreamEvent::Step {
-                                            message: format!("{} ({}/{})", step_msg, done_count, total_count),
-                                            expert: Some("rust-expert".to_string()),
-                                            todo_state,
-                                        }).await;
+                                        let _ = tx.send(build_step(&progress_json)).await;
                                     }
                                     // 真流式：模型增量文本，原样转成 Chunk 即时下发
                                     Some("chunk") => {
@@ -357,6 +401,10 @@ impl ChatPort for OrchestrationService {
 
             // 注销进度通道
             crate::adapter::outbound::domain_expert_adapter::unregister_progress_tx(&session_id);
+            // 注销 SSE 通道注册（按 trace_id），避免内存泄漏与跨请求误投递
+            if !trace_id.is_empty() {
+                crate::application::stream_registry::unregister_stream_tx(&trace_id);
+            }
 
             // 消费剩余的进度事件（确保不丢失最后的进度更新）
             while let Ok(progress_str) = progress_rx.try_recv() {
@@ -375,14 +423,11 @@ impl ChatPort for OrchestrationService {
                         }
                         continue;
                     }
-                    if let Some(step_msg) = progress_json.get("message").and_then(|m| m.as_str()) {
-                        let _ = tx
-                            .send(StreamEvent::Step {
-                                message: step_msg.to_string(),
-                                expert: Some("rust-expert".to_string()),
-                                todo_state: None,
-                            })
-                            .await;
+                    if let Some(_) = progress_json
+                        .get("message")
+                        .or_else(|| progress_json.get("phase"))
+                    {
+                        let _ = tx.send(build_step(&progress_json)).await;
                     }
                 }
             }
@@ -403,6 +448,7 @@ impl ChatPort for OrchestrationService {
                                     .unwrap_or(&"".to_string())
                                     .clone(),
                             ),
+                            phase: Some("done".to_string()),
                             todo_state: None,
                         })
                         .await;

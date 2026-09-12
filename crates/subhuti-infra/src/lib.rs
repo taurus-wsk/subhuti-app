@@ -21,8 +21,9 @@ pub use config::{
     RuntimeConfig, SoulProfile, SubhutiConfig, TokenUsage, ToneStyle,
 };
 pub use llm::{
-    CacheStats, CachedLLM, DoubaoClient, DoubaoConfig, MockLLM, OllamaClient, OllamaConfig,
-    OpenAIClient, OpenAIConfig, ZhipuClient, ZhipuConfig,
+    CacheStats, CachedLLM, ContextLimitLLM, DoubaoClient, DoubaoConfig, LimitConfig, MockLLM,
+    OllamaClient, OllamaConfig, OpenAIClient, OpenAIConfig, RetryConfig, RetryLLM, ZhipuClient,
+    ZhipuConfig,
 };
 pub use memory::{
     BaseStats, ConnectionDynamics, ConvoExchange, ConvoMiner, DedupConfig, DedupResult,

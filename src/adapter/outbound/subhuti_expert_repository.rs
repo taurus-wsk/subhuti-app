@@ -68,7 +68,7 @@ impl ExpertRepositoryPort for SubhutiExpertRepository {
         let subhuti = self.subhuti.clone();
         // 将领域专家转换为框架专家（传递 repository）
         let framework_expert = Arc::new(DomainExpertAdapter::new(
-            expert, repository, None, None, None,
+            expert, repository, None, None, None, None,
         ));
         Box::pin(async move {
             subhuti.register_orchestrator_expert(framework_expert).await;

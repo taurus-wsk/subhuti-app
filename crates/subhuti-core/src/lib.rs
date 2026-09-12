@@ -81,6 +81,49 @@ pub enum Error {
     Serde(#[from] serde_json::Error),
     #[error("Any: {0}")]
     Any(#[from] anyhow::Error),
+    /// LLM 调用错误（结构化，便于上层决定是否重试）
+    ///
+    /// 之所以单独建模而不是继续用 `Any`：重试/降级需要**可靠地**判断
+    /// 「这个错误重试有没有意义」。靠解析错误字符串太脆弱，所以在产生错误的
+    /// 地方（HTTP 层）就把 `status` 与 `retryable` 标出来。
+    #[error("LLM: {message}")]
+    Llm {
+        /// HTTP 状态码（若来自 HTTP 响应）
+        status: Option<u16>,
+        /// 是否可安全重试（超时 / 429 / 5xx 等临时性失败）
+        retryable: bool,
+        /// 面向人的错误描述
+        message: String,
+    },
+}
+
+impl Error {
+    /// 构造结构化的 LLM 错误
+    pub fn llm(status: Option<u16>, retryable: bool, message: impl Into<String>) -> Self {
+        Self::Llm {
+            status,
+            retryable,
+            message: message.into(),
+        }
+    }
+
+    /// 该错误是否值得重试
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Error::Llm { retryable, .. } => *retryable,
+            other => matches!(other.kind(), ErrorKind::Retryable),
+        }
+    }
+
+    /// 该错误是否由限流（HTTP 429）导致
+    pub fn is_rate_limited(&self) -> bool {
+        match self {
+            Error::Llm {
+                status, message, ..
+            } => *status == Some(429) || message.contains("429"),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Copy)]
@@ -110,6 +153,13 @@ impl ClassifiableError for Error {
             Error::Io(_) => ErrorKind::Retryable,
             Error::Serde(_) => ErrorKind::Fixable,
             Error::Any(_) => ErrorKind::Fatal,
+            Error::Llm { retryable, .. } => {
+                if *retryable {
+                    ErrorKind::Retryable
+                } else {
+                    ErrorKind::Fatal
+                }
+            }
         }
     }
 }

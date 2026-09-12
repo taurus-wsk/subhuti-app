@@ -25,6 +25,7 @@ use crate::domain::traits::{
     chat_stream_to_progress, DomainContext, DomainError, DomainExecutionContext, DomainExpert,
     DomainMessage, DomainResult, DomainRole, DomainSkill,
 };
+use subhuti_core::event::AgentEventData;
 
 /// Rust 编程专家
 ///
@@ -542,6 +543,8 @@ src/
                 let _ = sender.try_send(msg);
             }
         };
+        // 真实专家名（让编排层不必硬编码 "rust-expert"）
+        let expert_name = self.name().to_string();
         // 阶段进度推送：结构化 step 事件，附 phase 字段标识当前 Workflow 阶段
         let push_phase = |tx: &Option<mpsc::Sender<String>>,
                           out: &String,
@@ -552,6 +555,7 @@ src/
             let progress_json = serde_json::json!({
                 "type": "step",
                 "phase": phase,
+                "expert": expert_name,
                 "message": step_msg,
                 "todo_state": out,
                 "done_count": done,
@@ -1024,6 +1028,20 @@ src/
             // 根据主题从藏经阁召回知识库内容
             if let Some(sutra) = &exec_ctx.sutra_library {
                 // 1. 先尝试使用 library_retrieve 进行语义召回
+                // 发射 MemoryRetrieved（retrieve 阶段）：仅在带 trace_id 且接入了 EventBus 时
+                if let (Some(bus), Some(tid)) = (&exec_ctx.event_bus, &exec_ctx.ctx.trace_id) {
+                    if !tid.is_empty() {
+                        bus.emit_with_trace(
+                            AgentEventData::MemoryRetrieved {
+                                query: topic.to_string(),
+                                results_count: 0,
+                            },
+                            tid.clone(),
+                            exec_ctx.ctx.session_id.clone(),
+                        )
+                        .await;
+                    }
+                }
                 let retrieve_result = sutra.library_retrieve(topic, 5).await;
                 if !retrieve_result.contains("⚠️") && !retrieve_result.contains("未找到") {
                     tracing::info!("[skill_knowledge_query] 藏经阁召回成功");
@@ -1317,15 +1335,37 @@ src/
     ) -> DomainResult<String> {
         let max_retries = 3;
         let mut current_req = instruction.to_string();
+        // 阶段进度推送（与 skill_coding 共用 phase 词汇表：edit/verify/fix）
+        let expert_name = self.name().to_string();
+        let push_phase = |tx: &Option<mpsc::Sender<String>>, phase: &str, step_msg: &str| {
+            let progress_json = serde_json::json!({
+                "type": "step",
+                "phase": phase,
+                "expert": expert_name,
+                "message": step_msg,
+                "done_count": 0,
+                "total_count": 0,
+            })
+            .to_string();
+            if let Some(sender) = tx {
+                let _ = sender.try_send(progress_json);
+            }
+        };
 
         for retry in 0..=max_retries {
             // 1. 调用 LLM 生成代码
+            push_phase(
+                &exec_ctx.progress_tx,
+                "edit",
+                &format!("✏️ {} 正在生成代码...", expert_name),
+            );
             let response = exec_ctx
                 .llm
                 .chat(self.build_messages(sys, &current_req))
                 .await?;
 
             // 2. 如果没有工具链，直接返回
+            push_phase(&exec_ctx.progress_tx, "verify", "🔍 正在验证编译...");
             let toolchain = match &exec_ctx.toolchain {
                 Some(t) => t.clone(),
                 None => {
@@ -1358,6 +1398,11 @@ src/
             }
 
             // 5. 用错误信息重新请求 LLM 修复
+            push_phase(
+                &exec_ctx.progress_tx,
+                "fix",
+                &format!("🔧 编译失败，第 {} 轮修复中...", retry + 1),
+            );
             let code = self.extract_code(&response);
             current_req = format!(
                 "原始需求：{}\n\n上次生成的代码：\n```rust\n{}\n```\n\n编译错误（请修复，只输出修复后的完整代码）：\n{}",

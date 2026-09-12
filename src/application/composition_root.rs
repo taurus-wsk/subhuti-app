@@ -299,6 +299,22 @@ impl CompositionRoot {
             None,
         );
 
+        // 8e. 注册 ProgressEventBridge：把框架 EventBus 的细粒度动作事件
+        //     （专家匹配 / LLM 推理 / 工具调用 / 记忆检索）→ 按 trace_id 路由到 SSE 通道，
+        //     让前端渲染 WorkBuddy 式阶段流（route/think/tool/retrieve）。
+        let progress_bridge =
+            Arc::new(crate::adapter::outbound::event_bridge::ProgressEventBridge::new());
+        framework_initializer
+            .register_event_handler(progress_bridge)
+            .await;
+        record_fn_log(
+            None,
+            "",
+            LogLevel::Info,
+            "✅ ProgressEventBridge 已注册到框架 EventBus（阶段事件 → SSE）",
+            None,
+        );
+
         record_fn_log(
             None,
             "",

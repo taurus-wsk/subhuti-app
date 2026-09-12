@@ -15,6 +15,8 @@ use async_trait::async_trait;
 use subhuti_core::event::{AgentEventData, Event, EventFilter, EventHandler};
 
 use crate::application::observer::{SpanData, TraceObserverPort};
+use crate::application::ports::StreamEvent;
+use crate::application::stream_registry;
 
 /// Trace 事件桥接处理器
 pub struct TraceEventBridge {
@@ -411,6 +413,154 @@ impl EventHandler for TraceEventBridge {
                 self.trace_observer.record_span(trace_id, span);
             }
         }
+    }
+}
+
+/// # 进度事件桥（EventBus → SSE）
+///
+/// 订阅框架 EventBus，把携带 trace_id 的「框架动作事件」翻译成协议中立的
+/// `StreamEvent::Step`（带 phase），按 `trace_id` 路由到对应请求的 SSE 通道。
+///
+/// 这一步把原本只对 trace 观察者可见的细粒度动作（专家匹配、LLM 推理、工具调用、
+/// 记忆检索）也透传到流式输出，使前端能渲染出 WorkBuddy 式的阶段流
+/// （route → think → tool → retrieve → … → done）。
+///
+/// 与 `TraceEventBridge` 的区别：
+/// - `TraceEventBridge`：事件 → `SpanData` → trace 观察者（事后查询链路树）
+/// - `ProgressEventBridge`：事件 → `StreamEvent::Step` → SSE（实时进度）
+pub struct ProgressEventBridge;
+
+impl ProgressEventBridge {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// 把框架事件翻译成流式 Step 事件（无对应 phase 的事件返回 None）
+    fn to_step(data: &AgentEventData) -> Option<StreamEvent> {
+        use AgentEventData::*;
+        let (phase, message, expert) = match data {
+            AgentMatched { agent_name, .. } => (
+                "route",
+                format!("🧭 匹配专家: {agent_name}"),
+                Some(agent_name.clone()),
+            ),
+            LLMCalling { .. } => ("think", "🤔 模型推理中…".to_string(), None),
+            ToolCalling { tool_name, .. } => ("tool", format!("🔧 调用工具: {tool_name}"), None),
+            ToolResponded {
+                tool_name, success, ..
+            } => (
+                "tool",
+                format!(
+                    "✅ 工具完成: {} ({})",
+                    tool_name,
+                    if *success { "成功" } else { "失败" }
+                ),
+                None,
+            ),
+            MemoryRetrieved {
+                query,
+                results_count,
+            } => (
+                "retrieve",
+                format!("📚 检索记忆: {query} ({results_count} 条)"),
+                None,
+            ),
+            // 其余事件（AgentStarted/Completed、LLMResponded 等）不在此桥渲染，
+            // 避免与编排层自身发出的 run/done 阶段重复
+            _ => return None,
+        };
+        Some(StreamEvent::Step {
+            message,
+            expert,
+            phase: Some(phase.to_string()),
+            todo_state: None,
+        })
+    }
+}
+
+#[async_trait]
+impl EventHandler for ProgressEventBridge {
+    fn name(&self) -> &str {
+        "progress_event_bridge"
+    }
+
+    fn filter(&self) -> EventFilter {
+        EventFilter::Types(vec![
+            "agent_matched",
+            "llm_calling",
+            "tool_calling",
+            "tool_responded",
+            "memory_retrieved",
+        ])
+    }
+
+    async fn handle(&self, event: &Event) {
+        // 仅处理带 trace_id 的事件（否则无法路由到具体会话）
+        let trace_id = match event.metadata.trace_id.as_ref() {
+            Some(t) if !t.is_empty() => t,
+            _ => return,
+        };
+        let tx = match stream_registry::get_stream_tx(trace_id) {
+            Some(tx) => tx,
+            None => return, // 该 trace 没有活跃流式会话（如 MCP 调用、离线 trace）
+        };
+        if let Some(step) = Self::to_step(&event.data) {
+            // 非阻塞投递：通道满或已关闭则丢弃，绝不反向阻塞 EventBus
+            let _ = tx.try_send(step);
+        }
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn test_to_step_agent_matched() {
+        let e = AgentEventData::AgentMatched {
+            agent_id: "rust-expert".into(),
+            agent_name: "Rust 编程专家".into(),
+            match_score: 1.0,
+            candidates: vec![],
+        };
+        let (phase, expert, message) =
+            match ProgressEventBridge::to_step(&e).expect("应映射为 Step") {
+                StreamEvent::Step {
+                    phase,
+                    expert,
+                    message,
+                    ..
+                } => (phase, expert, message),
+                _ => panic!("应为 Step 变体"),
+            };
+        assert_eq!(phase.as_deref(), Some("route"));
+        assert_eq!(expert.as_deref(), Some("Rust 编程专家"));
+        assert!(message.contains("Rust 编程专家"));
+    }
+
+    #[test]
+    fn test_to_step_llm_calling_is_think() {
+        let e = AgentEventData::LLMCalling {
+            messages_count: 3,
+            model: Some("zhipu".into()),
+        };
+        let (phase, expert) = match ProgressEventBridge::to_step(&e).expect("应映射为 Step") {
+            StreamEvent::Step { phase, expert, .. } => (phase, expert),
+            _ => panic!("应为 Step 变体"),
+        };
+        assert_eq!(phase.as_deref(), Some("think"));
+        assert_eq!(expert, None);
+    }
+
+    #[test]
+    fn test_to_step_agent_completed_is_none() {
+        // AgentCompleted 不在本桥渲染范围内
+        let e = AgentEventData::AgentCompleted {
+            agent_id: "x".into(),
+            output: "ok".into(),
+            duration_ms: 1,
+        };
+        assert!(ProgressEventBridge::to_step(&e).is_none());
     }
 }
 

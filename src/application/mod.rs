@@ -27,6 +27,7 @@ pub mod composition_root;
 pub mod observer;
 pub mod orchestration_service;
 pub mod ports;
+pub mod stream_registry;
 pub mod trace_decorator;
 
 pub use composition_root::CompositionRoot;

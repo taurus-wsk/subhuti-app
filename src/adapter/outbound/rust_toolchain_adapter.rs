@@ -8,6 +8,9 @@
 //! - 供 RustExpert 等需要编译验证的领域专家使用
 
 use std::process::Command;
+use std::sync::Arc;
+
+use subhuti_core::event::{AgentEventData, EventBus};
 
 use crate::domain::dto::ToolchainResult;
 use crate::domain::ports::ToolchainPort;
@@ -94,5 +97,139 @@ impl ToolchainPort for RustToolchainAdapter {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send>> {
         // rustfmt 只能格式化文件，此处返回原样
         Box::pin(std::future::ready(_code.to_string()))
+    }
+}
+
+/// 带事件发射的工具链适配器（per-request 包裹层）
+///
+/// 在 `check` / `clippy` 前后发射 `ToolCalling` / `ToolResponded`，
+/// 由 `ProgressEventBridge` 桥接成 SSE 的 `tool` 阶段。
+///
+/// 之所以用包裹层而非给 `RustToolchainAdapter` 单例加 trace_id：单例的 trace_id
+/// 在并发请求之间会互相覆盖；这里每次请求新建一个包裹层，携带本请求的
+/// trace_id / session_id，与第二步里 `SubhutiLlmAdapter` 的模式一致。
+pub struct TracedToolchainAdapter {
+    inner: Arc<dyn ToolchainPort>,
+    event_bus: Option<Arc<EventBus>>,
+    trace_id: Option<String>,
+    session_id: Option<String>,
+}
+
+impl TracedToolchainAdapter {
+    pub fn new(
+        inner: Arc<dyn ToolchainPort>,
+        event_bus: Option<Arc<EventBus>>,
+        trace_id: Option<String>,
+        session_id: Option<String>,
+    ) -> Self {
+        Self {
+            inner,
+            event_bus,
+            trace_id,
+            session_id,
+        }
+    }
+}
+
+impl ToolchainPort for TracedToolchainAdapter {
+    fn check(
+        &self,
+        project_path: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolchainResult> + Send>> {
+        let inner = self.inner.clone();
+        let bus = self.event_bus.clone();
+        let tid = self.trace_id.clone();
+        let sid = self.session_id.clone();
+        let path = project_path.to_string();
+        Box::pin(async move {
+            if let (Some(bus), Some(tid)) = (&bus, &tid) {
+                if !tid.is_empty() {
+                    bus.emit_with_trace(
+                        AgentEventData::ToolCalling {
+                            tool_name: "cargo check".to_string(),
+                            args: serde_json::Value::Null,
+                        },
+                        tid.clone(),
+                        sid.clone(),
+                    )
+                    .await;
+                }
+            }
+            let result = inner.check(&path).await;
+            if let (Some(bus), Some(tid)) = (&bus, &tid) {
+                if !tid.is_empty() {
+                    bus.emit_with_trace(
+                        AgentEventData::ToolResponded {
+                            tool_name: "cargo check".to_string(),
+                            result: if result.success {
+                                "ok".to_string()
+                            } else {
+                                "fail".to_string()
+                            },
+                            success: result.success,
+                            duration_ms: 0,
+                        },
+                        tid.clone(),
+                        sid.clone(),
+                    )
+                    .await;
+                }
+            }
+            result
+        })
+    }
+
+    fn clippy(
+        &self,
+        project_path: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolchainResult> + Send>> {
+        let inner = self.inner.clone();
+        let bus = self.event_bus.clone();
+        let tid = self.trace_id.clone();
+        let sid = self.session_id.clone();
+        let path = project_path.to_string();
+        Box::pin(async move {
+            if let (Some(bus), Some(tid)) = (&bus, &tid) {
+                if !tid.is_empty() {
+                    bus.emit_with_trace(
+                        AgentEventData::ToolCalling {
+                            tool_name: "cargo clippy".to_string(),
+                            args: serde_json::Value::Null,
+                        },
+                        tid.clone(),
+                        sid.clone(),
+                    )
+                    .await;
+                }
+            }
+            let result = inner.clippy(&path).await;
+            if let (Some(bus), Some(tid)) = (&bus, &tid) {
+                if !tid.is_empty() {
+                    bus.emit_with_trace(
+                        AgentEventData::ToolResponded {
+                            tool_name: "cargo clippy".to_string(),
+                            result: if result.success {
+                                "ok".to_string()
+                            } else {
+                                "fail".to_string()
+                            },
+                            success: result.success,
+                            duration_ms: 0,
+                        },
+                        tid.clone(),
+                        sid.clone(),
+                    )
+                    .await;
+                }
+            }
+            result
+        })
+    }
+
+    fn format(
+        &self,
+        code: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send>> {
+        self.inner.format(code)
     }
 }

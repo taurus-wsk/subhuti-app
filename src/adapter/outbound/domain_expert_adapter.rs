@@ -13,11 +13,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
+use subhuti_core::event::{AgentEventData, EventBus};
 use subhuti_core::orchestrator::{
     AgentContext, ExpertAgent, ExpertState, FromState, Llm, SkillInfo,
 };
 use subhuti_core::Result;
 
+use crate::adapter::outbound::rust_toolchain_adapter::TracedToolchainAdapter;
 use crate::application::observer::{record_fn_log, LogLevel};
 use crate::domain::ports::CommandPort;
 use crate::domain::ports::FileSystemPort;
@@ -83,6 +85,9 @@ where
     command: Option<Arc<dyn CommandPort>>,
     /// 进度报告通道（可选，用于实时推送执行进度）
     progress_tx: Option<mpsc::Sender<String>>,
+    /// 框架事件总线（可选，用于把 LLM 调用等动作事件发到 EventBus，
+    /// 由 ProgressEventBridge 桥接成 SSE 阶段流）
+    event_bus: Option<Arc<EventBus>>,
 }
 
 impl<D: ?Sized> DomainExpertAdapter<D>
@@ -96,6 +101,7 @@ where
         toolchain: Option<Arc<dyn ToolchainPort>>,
         file_system: Option<Arc<dyn FileSystemPort>>,
         command: Option<Arc<dyn CommandPort>>,
+        event_bus: Option<Arc<EventBus>>,
     ) -> Self {
         // 预计算并缓存技能信息，避免每次调用 skills() 时重复转换
         let skills = domain_expert
@@ -117,6 +123,7 @@ where
             file_system,
             command,
             progress_tx: None,
+            event_bus,
         }
     }
 
@@ -166,6 +173,7 @@ where
         // 2. 创建领域 LLM 适配器（携带 trace_id / session_id，使专家内 LLM 调用可与全链路关联）
         let domain_llm = Arc::new(SubhutiLlmAdapter {
             llm: llm.clone(),
+            event_bus: self.event_bus.clone(),
             trace_id: ctx
                 .metadata
                 .get("trace_id")
@@ -234,6 +242,22 @@ where
         // 从全局注册表获取 progress_tx（按 session_id 查找）
         let session_id = ctx.session.id().to_string();
         let progress_tx = get_progress_tx(&session_id).or_else(|| self.progress_tx.clone());
+        // 若本请求带 trace_id 且框架已接入 EventBus，用包裹层把工具调用事件透传为 SSE 的 tool 阶段。
+        // RustToolchainAdapter 是单例，不能让它持有 trace_id，否则并发请求会互相覆盖；
+        // 这里每次请求新建一个包裹层，携带本请求的 trace_id / session_id（与 SubhutiLlmAdapter 同模式）。
+        let toolchain: Option<Arc<dyn ToolchainPort>> =
+            match (&self.event_bus, &domain_ctx.trace_id) {
+                (Some(bus), Some(tid)) if !tid.is_empty() => self.toolchain.as_ref().map(|t| {
+                    Arc::new(TracedToolchainAdapter::new(
+                        t.clone(),
+                        Some(bus.clone()),
+                        Some(tid.clone()),
+                        Some(session_id.clone()),
+                    )) as Arc<dyn ToolchainPort>
+                }),
+                _ => self.toolchain.clone(),
+            };
+
         let exec_ctx = DomainExecutionContext {
             ctx: domain_ctx,
             llm: domain_llm,
@@ -249,11 +273,12 @@ where
             } else {
                 Some(params.clone())
             },
-            toolchain: self.toolchain.clone(),
+            toolchain,
             sutra_library: state.sutra_library_cloned(),
             file_system: self.file_system.clone(),
             command: self.command.clone(),
             progress_tx,
+            event_bus: self.event_bus.clone(),
         };
 
         // 6. 根据是否有技能ID选择执行方式
@@ -290,6 +315,7 @@ where
 /// 使专家内的每次 LLM 调用日志都能与 `trace_id`、`session_id` 关联。
 struct SubhutiLlmAdapter {
     llm: Arc<dyn subhuti_core::LLM>,
+    event_bus: Option<Arc<EventBus>>,
     trace_id: Option<String>,
     session_id: Option<String>,
 }
@@ -324,6 +350,21 @@ impl DomainLlm for SubhutiLlmAdapter {
         );
         let _enter = span.enter();
 
+        // 发射 LLMCalling（think 阶段）：仅在带 trace_id 时，避免无关联噪声
+        if let (Some(bus), Some(tid)) = (&self.event_bus, &self.trace_id) {
+            if !tid.is_empty() {
+                bus.emit_with_trace(
+                    AgentEventData::LLMCalling {
+                        messages_count: messages.len(),
+                        model: None,
+                    },
+                    tid.clone(),
+                    self.session_id.clone(),
+                )
+                .await;
+            }
+        }
+
         // 调用框架 LLM
         let response = self.llm.chat(domain_to_framework_messages(messages)).await;
 
@@ -349,6 +390,21 @@ impl DomainLlm for SubhutiLlmAdapter {
             session_id = %self.session_id.as_deref().unwrap_or("-"),
         );
         let _enter = span.enter();
+
+        // 发射 LLMCalling（think 阶段）：仅在带 trace_id 时，避免无关联噪声
+        if let (Some(bus), Some(tid)) = (&self.event_bus, &self.trace_id) {
+            if !tid.is_empty() {
+                bus.emit_with_trace(
+                    AgentEventData::LLMCalling {
+                        messages_count: messages.len(),
+                        model: None,
+                    },
+                    tid.clone(),
+                    self.session_id.clone(),
+                )
+                .await;
+            }
+        }
 
         // callback 是 `Fn`（不可变），用 Arc<Mutex> 共享累积缓冲
         let acc = Arc::new(Mutex::new(String::new()));
