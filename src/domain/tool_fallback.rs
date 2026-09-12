@@ -265,6 +265,7 @@ impl subhuti_core::ToolExecutor for DomainToolExecutor {
 /// 失败时让 LLM 直接完成该步骤并输出普通的「结果文本」。
 /// - 有工具（已注入 file_system / command）→ 走多轮 function-calling
 /// - 无工具 → 纯文本一次性生成
+///
 /// 任何情况下都**不**生成计划、不调用技能/专家接口，杜绝递归。
 struct DomainLlmFallback {
     llm: Arc<dyn subhuti_core::LLM>,

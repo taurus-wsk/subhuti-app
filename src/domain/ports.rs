@@ -51,6 +51,7 @@ pub trait OrchestrationEnginePort: Send + Sync + 'static {
     /// - `expert_id`: 指定专家 ID（优先级最高，直接路由到该专家）
     /// - `workspace_folder`: 项目工作目录路径（透传给专家）
     /// - `system_prompt`: 自定义系统提示词（覆盖专家默认 system prompt）
+    #[allow(clippy::too_many_arguments)]
     fn orchestrate(
         &self,
         message: &str,

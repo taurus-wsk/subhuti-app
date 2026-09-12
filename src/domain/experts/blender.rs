@@ -11,7 +11,8 @@ use async_trait::async_trait;
 
 use crate::application::observer::{record_fn_log, LogLevel};
 use crate::domain::traits::{
-    DomainExecutionContext, DomainExpert, DomainMessage, DomainResult, DomainRole, DomainSkill,
+    chat_stream_to_progress, DomainExecutionContext, DomainExpert, DomainMessage, DomainResult,
+    DomainRole, DomainSkill,
 };
 
 /// Blender 动画制作专家
@@ -184,7 +185,9 @@ impl DomainExpert for BlenderExpert {
         ];
 
         // 调用 LLM
-        let response = exec_ctx.llm.chat(messages).await?;
+        // 真流式：逐 delta 下发，首字即出（同时累积为完整答案返回）
+        let response =
+            chat_stream_to_progress(&exec_ctx.llm, messages, &exec_ctx.progress_tx).await?;
 
         // 记录执行日志到反馈分析器（反馈闭环入口）
         if let Some(ref sutra) = exec_ctx.sutra_library {
@@ -292,7 +295,9 @@ impl DomainExpert for BlenderExpert {
         ];
 
         // 调用 LLM
-        let response = exec_ctx.llm.chat(messages).await?;
+        // 真流式：逐 delta 下发，首字即出（同时累积为完整答案返回）
+        let response =
+            chat_stream_to_progress(&exec_ctx.llm, messages, &exec_ctx.progress_tx).await?;
 
         // 记录执行日志到反馈分析器
         if let Some(ref sutra) = exec_ctx.sutra_library {

@@ -10,6 +10,11 @@
 //!
 //! ## 生成流程（验证修复闭环）
 //! 需求拆解 → 知识检索(内嵌) → 约束注入 → LLM生成 → cargo check → 错误修复 → 循环直到通过
+//!
+//! ## Workflow 归属（架构关键）
+//! 多步流水线（analyze → plan → edit → verify → complete + 条件 fix）**完全下沉到专家内部**，
+//! 由 `skill_coding` 以确定性代码驱动（仅生成/规划走 LLM）。框架不再持有任何 Graph，
+//! 专家对编排层是黑盒：编排层只看到「调用了哪个专家」，看不到内部 Workflow。
 
 use std::sync::Arc;
 
@@ -17,8 +22,8 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 use crate::domain::traits::{
-    DomainContext, DomainError, DomainExecutionContext, DomainExpert, DomainMessage, DomainResult,
-    DomainRole, DomainSkill,
+    chat_stream_to_progress, DomainContext, DomainError, DomainExecutionContext, DomainExpert,
+    DomainMessage, DomainResult, DomainRole, DomainSkill,
 };
 
 /// Rust 编程专家
@@ -28,6 +33,12 @@ use crate::domain::traits::{
 pub struct RustExpert {
     skills: Vec<DomainSkill>,
     tags: Vec<String>,
+}
+
+impl Default for RustExpert {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RustExpert {
@@ -468,19 +479,31 @@ src/
             question
         );
 
-        exec_ctx.llm.chat(messages).await
+        // 真流式：闲聊/问答逐 delta 下发，首字即出
+        chat_stream_to_progress(&exec_ctx.llm, messages, &exec_ctx.progress_tx).await
     }
 
     /// 技能: rust-coding — 在项目工作目录中执行完整编码任务
     ///
     /// 流程：生成计划 → 展示待办 → 创建代码 → 写入文件 → cargo check → 修复
+    /// 技能: rust-coding — 在项目工作目录中执行完整编码任务
+    ///
+    /// **Workflow 已下沉到专家内部**：原先由框架 `rust_edit` 图
+    /// (`analyze → diff_plan → edit_files → verify → complete` + 条件 `fix_errors`)
+    /// 编排的多步流水线，现在完全由本专家以**确定性代码**驱动（仅代码生成/规划走 LLM），
+    /// 框架不再持有任何 Graph。各阶段对应原图节点：
+    ///   - `analyze`  ：勘察项目状态（是否已有 Cargo.toml / 现有 .rs 文件）
+    ///   - `plan`     ：LLM 制定执行计划（markdown 待办清单）
+    ///   - `edit`     ：(必要时 cargo init) + LLM 生成代码 + 写入文件
+    ///   - `verify`   ：cargo check（优先 toolchain，否则 command）
+    ///   - `complete` ：编译通过即完成
+    ///   - `fix`(条件)：编译失败则携错误回灌 LLM 修复，循环至通过或达上限
     async fn skill_coding(
         &self,
         exec_ctx: DomainExecutionContext,
         task: &str,
     ) -> DomainResult<String> {
         // ── 智能路由：判断是否为编码查询 ──────────────────────
-        // 如果不是编码相关的查询，走聊天模式
         if !Self::is_coding_query(task) {
             tracing::info!("检测到非编码查询，转为聊天模式: {}", task);
             return self.skill_chat(exec_ctx, task).await;
@@ -508,22 +531,40 @@ src/
             .ok_or_else(|| DomainError::ExecutionError("命令执行端口未注入".to_string()))?
             .clone();
         let llm = exec_ctx.llm.clone();
+        let toolchain = exec_ctx.toolchain.clone();
 
         let mut output = String::new();
         let progress_tx = exec_ctx.progress_tx.clone();
 
-        // 辅助函数：推送进度到 SSE 流
+        // 辅助函数：推送进度到 SSE 流（非阻塞，通道满则丢弃）
         let send_progress = |tx: &Option<mpsc::Sender<String>>, msg: String| {
             if let Some(sender) = tx {
-                // 非阻塞发送，若通道满则丢弃（不影响主流程）
                 let _ = sender.try_send(msg);
             }
         };
+        // 阶段进度推送：结构化 step 事件，附 phase 字段标识当前 Workflow 阶段
+        let push_phase = |tx: &Option<mpsc::Sender<String>>,
+                          out: &String,
+                          phase: &str,
+                          step_msg: &str,
+                          done: usize,
+                          total: usize| {
+            let progress_json = serde_json::json!({
+                "type": "step",
+                "phase": phase,
+                "message": step_msg,
+                "todo_state": out,
+                "done_count": done,
+                "total_count": total,
+            })
+            .to_string();
+            send_progress(tx, progress_json);
+        };
 
-        // ── 0. 检查项目状态 ──────────────────────────────────────
+        // ── 阶段 1: ANALYZE 项目状态勘察 ───────────────────────
+        push_phase(&progress_tx, &output, "analyze", "🔍 分析项目状态...", 0, 1);
         let has_project = fs.exists(&format!("{}/Cargo.toml", &ws)).await;
         let existing_files = fs.search_files("**/*.rs", &ws).await.unwrap_or_default();
-
         output.push_str(&format!("📂 **项目目录**: `{}`\n\n", ws));
         if !has_project {
             output.push_str("🆕 项目尚未创建，需要执行 `cargo init` 初始化\n\n");
@@ -537,21 +578,22 @@ src/
         // 获取技能列表信息
         let skills_info = self.format_skills_info();
 
-        // ── 1. LLM 生成计划（markdown 清单） ────────────────────
+        // ── 阶段 2: PLAN 制定执行计划 ──────────────────────────
+        push_phase(&progress_tx, &output, "plan", "📋 制定执行计划...", 0, 1);
         output.push_str("## 📋 执行计划\n\n");
         let plan_prompt = format!(
             "你是一个 Rust 编程专家，正在项目目录 `{}` 中工作。\n\n\
-            当前项目状态：\n\
-            - Cargo.toml 存在: {}\n\
-            - 已存在的 Rust 文件: {}\n\n\
-            ## 你的可用技能\n{}\n\
-            用户任务：{}\n\n\
-            请先制定一个详细的执行计划，以 markdown 任务清单（`- [ ]`）格式列出每一步。\n\
-            例如：\n\
-            - [ ] 创建项目结构（Cargo.toml + src/main.rs）\n\
-            - [ ] 实现核心逻辑\n\
-            - [ ] 编译验证\n\n\
-            注意：只输出计划本身，不要输出代码。",
+             当前项目状态：\n\
+             - Cargo.toml 存在: {}\n\
+             - 已存在的 Rust 文件: {}\n\n\
+             ## 你的可用技能\n{}\n\
+             用户任务：{}\n\n\
+             请先制定一个详细的执行计划，以 markdown 任务清单（`- [ ]`）格式列出每一步。\n\
+             例如：\n\
+             - [ ] 创建项目结构（Cargo.toml + src/main.rs）\n\
+             - [ ] 实现核心逻辑\n\
+             - [ ] 编译验证\n\n\
+             注意：只输出计划本身，不要输出代码。",
             ws,
             if has_project { "是" } else { "否" },
             existing_files.join(", "),
@@ -585,8 +627,6 @@ src/
         let mut next_item = 0usize;
 
         // 辅助函数：标记未完成的计划项并返回标记数量
-        // count=Some(n): 标记下 n 项（用于中间阶段展示进度）
-        // count=None: 标记全部剩余（用于最终完成阶段）
         let mark_done =
             |out: &mut String, next: &mut usize, count: Option<usize>, items: &[String]| -> usize {
                 let mut marked = 0usize;
@@ -601,32 +641,25 @@ src/
                 marked
             };
 
-        // 辅助函数：推送当前执行状态到前端
-        let push_progress = |tx: &Option<mpsc::Sender<String>>,
-                             out: &String,
-                             step_msg: &str,
-                             done: usize,
-                             total: usize| {
-            let progress_json = serde_json::json!({
-                "type": "step",
-                "message": step_msg,
-                "todo_state": out,
-                "done_count": done,
-                "total_count": total,
-            })
-            .to_string();
-            send_progress(tx, progress_json);
-        };
-
-        // ── 2. 如果项目不存在，先 cargo init ─────────────────────
+        // ── 阶段 3: EDIT 生成 + 写入文件 ──────────────────────
+        push_phase(
+            &progress_tx,
+            &output,
+            "edit",
+            "✏️ 生成并写入代码...",
+            next_item,
+            plan_total.max(1),
+        );
+        // 3.1 若项目不存在，先 cargo init
         if !has_project {
             mark_done(&mut output, &mut next_item, Some(1), &plan_items);
-            push_progress(
+            push_phase(
                 &progress_tx,
                 &output,
-                "初始化项目...",
+                "edit",
+                "📦 初始化项目 (cargo init)...",
                 next_item,
-                plan_total,
+                plan_total.max(1),
             );
             let init = cmd
                 .run_command(
@@ -643,9 +676,16 @@ src/
             }
         }
 
-        // ── 3. LLM 生成代码 ─────────────────────────────────────
+        // 3.2 LLM 生成代码
         mark_done(&mut output, &mut next_item, Some(1), &plan_items);
-        push_progress(&progress_tx, &output, "生成代码...", next_item, plan_total);
+        push_phase(
+            &progress_tx,
+            &output,
+            "edit",
+            "🤖 LLM 生成代码...",
+            next_item,
+            plan_total.max(1),
+        );
         let sys_prompt = format!(
             "你是一个 Rust 编程专家，正在项目目录 `{}` 中工作。\n\
              \n当前项目状态：\n\
@@ -679,9 +719,16 @@ src/
             .chat(self.build_messages(&sys_prompt, &user_prompt))
             .await?;
 
-        // ── 4. 写入文件 ─────────────────────────────────────────
+        // 3.3 写入文件
         mark_done(&mut output, &mut next_item, Some(1), &plan_items);
-        push_progress(&progress_tx, &output, "写入文件...", next_item, plan_total);
+        push_phase(
+            &progress_tx,
+            &output,
+            "edit",
+            "💾 写入文件...",
+            next_item,
+            plan_total.max(1),
+        );
         let written = self
             .write_files_from_llm_output(&ws, &llm_response, &fs)
             .await;
@@ -697,39 +744,107 @@ src/
             }
         }
 
-        // ── 5. 编译验证 ─────────────────────────────────────────
-        // 最终阶段：标记全部剩余计划项为完成
-        mark_done(&mut output, &mut next_item, None, &plan_items);
-        push_progress(&progress_tx, &output, "编译验证...", next_item, plan_total);
-        let check = cmd
-            .run_command("cargo", &["check"].map(String::from), &ws)
-            .await
-            .map_err(|e| DomainError::ExecutionError(format!("cargo check 失败: {}", e)))?;
-        output.push_str(&format!("> `cargo check`: exit={}\n", check.exit_code));
-
-        if check.exit_code == 0 {
-            output.push_str("\n\n---\n\n## ✅ 任务完成\n\n所有步骤均已完成，项目已可正常编译。");
-        } else {
-            // 编译错误，尝试修复
-            let stderr_snippet = if check.stderr.len() > 2000 {
-                format!("{}...（截断）", &check.stderr[..2000])
+        // ── 阶段 4+5: VERIFY / FIX / COMPLETE ─────────────────
+        // 统一验证-修复闭环：优先 toolchain.check，否则 command.run_command("cargo", ["check"])。
+        // 失败则携编译错误回灌 LLM 修复，循环至通过或达上限（MAX_FIX_RETRIES）。
+        const MAX_FIX_RETRIES: usize = 3;
+        for attempt in 0..=MAX_FIX_RETRIES {
+            push_phase(
+                &progress_tx,
+                &output,
+                "verify",
+                &format!("🔧 编译验证 (第 {} 次)...", attempt + 1),
+                next_item,
+                plan_total.max(1),
+            );
+            let check = if let Some(tc) = &toolchain {
+                let r = tc.check(&ws).await;
+                Some((r.success, r.errors.join("\n"), r.output))
             } else {
-                check.stderr.clone()
+                None
             };
-            output.push_str(&format!("> ⚠️ 编译错误:\n```\n{}\n```\n", stderr_snippet));
+            let (ok, detail) = match check {
+                Some((success, errors, _out)) => {
+                    if success {
+                        (true, "> `cargo check` (toolchain): 通过\n".to_string())
+                    } else {
+                        (false, format!("> ⚠️ 编译错误:\n```\n{}\n```\n", errors))
+                    }
+                }
+                None => {
+                    let r = cmd
+                        .run_command("cargo", &["check"].map(String::from), &ws)
+                        .await
+                        .map_err(|e| {
+                            DomainError::ExecutionError(format!("cargo check 失败: {}", e))
+                        })?;
+                    if r.exit_code == 0 {
+                        (true, format!("> `cargo check`: exit={}\n", r.exit_code))
+                    } else {
+                        let stderr_snippet = if r.stderr.len() > 2000 {
+                            format!("{}...（截断）", &r.stderr[..2000])
+                        } else {
+                            r.stderr.clone()
+                        };
+                        (
+                            false,
+                            format!("> ⚠️ 编译错误:\n```\n{}\n```\n", stderr_snippet),
+                        )
+                    }
+                }
+            };
 
+            if ok {
+                output.push_str(&detail);
+                mark_done(&mut output, &mut next_item, None, &plan_items);
+                push_phase(
+                    &progress_tx,
+                    &output,
+                    "complete",
+                    "✅ 任务完成",
+                    plan_total.max(1),
+                    plan_total.max(1),
+                );
+                output
+                    .push_str("\n\n---\n\n## ✅ 任务完成\n\n所有步骤均已完成，项目已可正常编译。");
+                return Ok(output);
+            }
+
+            output.push_str(&detail);
+            if attempt >= MAX_FIX_RETRIES {
+                mark_done(&mut output, &mut next_item, None, &plan_items);
+                push_phase(
+                    &progress_tx,
+                    &output,
+                    "complete",
+                    "⚠️ 需要手动修复",
+                    plan_total.max(1),
+                    plan_total.max(1),
+                );
+                output.push_str("\n\n---\n\n## ⚠️ 需要手动修复\n\n自动修复未能解决所有编译错误，请查看上方错误信息手动修复。");
+                return Ok(output);
+            }
+
+            // 条件阶段 FIX：携错误回灌 LLM 重新生成并写入
+            push_phase(
+                &progress_tx,
+                &output,
+                "fix",
+                &format!("🩹 修复编译错误 (第 {} 次)...", attempt + 1),
+                next_item,
+                plan_total.max(1),
+            );
             let fix_prompt = format!(
-                "以下 Rust 项目编译失败。\n\n编译错误：\n{}\n\n请分析错误原因并修复。输出所有需要修改的文件，每个文件用 File: 路径 标记。",
-                stderr_snippet
+                "以下 Rust 项目（目录 `{}`）编译失败。\n\n编译错误：\n{}\n\n请分析错误原因并修复。输出所有需要修改的文件，每个文件用 File: 路径 标记。",
+                ws, detail
             );
             let fix_response = llm
                 .chat(self.build_messages(&sys_prompt, &fix_prompt))
                 .await?;
-
-            let written_fix = self
+            match self
                 .write_files_from_llm_output(&ws, &fix_response, &fs)
-                .await;
-            match written_fix {
+                .await
+            {
                 Ok(files) => {
                     for f in &files {
                         output.push_str(&format!("> 📄 修复 `{}`\n", f));
@@ -738,21 +853,6 @@ src/
                 Err(e) => {
                     output.push_str(&format!("> ⚠️ 修复写入失败: {}\n", e));
                 }
-            }
-
-            // 再次检查
-            let check2 = cmd
-                .run_command("cargo", &["check"].map(String::from), &ws)
-                .await
-                .map_err(|e| DomainError::ExecutionError(format!("cargo check 失败: {}", e)))?;
-            output.push_str(&format!(
-                "> `cargo check` (重试): exit={}\n",
-                check2.exit_code
-            ));
-            if check2.exit_code == 0 {
-                output.push_str("\n\n---\n\n## ✅ 任务完成\n\n编译错误已修复，项目可正常编译。");
-            } else {
-                output.push_str("\n\n---\n\n## ⚠️ 需要手动修复\n\n自动修复未能解决所有编译错误，请查看上方错误信息手动修复。");
             }
         }
 
@@ -815,7 +915,12 @@ src/
             skills_info
         );
         let msg = format!("请审查以下 Rust 代码：\n\n```rust\n{}\n```", code);
-        exec_ctx.llm.chat(self.build_messages(&sys, &msg)).await
+        chat_stream_to_progress(
+            &exec_ctx.llm,
+            self.build_messages(&sys, &msg),
+            &exec_ctx.progress_tx,
+        )
+        .await
     }
 
     /// 技能: rust-fix — 修复编译错误
@@ -835,7 +940,12 @@ src/
             skills_info
         );
         let msg = format!("## 代码与编译错误\n\n{}", input);
-        exec_ctx.llm.chat(self.build_messages(&sys, &msg)).await
+        chat_stream_to_progress(
+            &exec_ctx.llm,
+            self.build_messages(&sys, &msg),
+            &exec_ctx.progress_tx,
+        )
+        .await
     }
 
     /// 技能: rust-refactor — 重构代码符合范式
@@ -852,7 +962,12 @@ src/
             skills_info
         );
         let msg = format!("请重构以下 Rust 代码：\n\n```rust\n{}\n```", code);
-        exec_ctx.llm.chat(self.build_messages(&sys, &msg)).await
+        chat_stream_to_progress(
+            &exec_ctx.llm,
+            self.build_messages(&sys, &msg),
+            &exec_ctx.progress_tx,
+        )
+        .await
     }
 
     /// 技能: rust-skill-list — 查询并返回技能列表（不调用LLM）
@@ -1312,12 +1427,8 @@ src/
         let mut written = Vec::new();
         let mut remaining = llm_output;
 
-        loop {
+        while let Some(file_start) = remaining.find("File: ") {
             // 查找 "File: " 标记
-            let file_start = match remaining.find("File: ") {
-                Some(pos) => pos,
-                None => break,
-            };
             remaining = &remaining[file_start + 6..];
 
             // 提取文件路径

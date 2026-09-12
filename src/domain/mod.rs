@@ -14,7 +14,7 @@
 //!
 //! 框架核心（`subhuti-core`）提供执行管线和机制：
 //! - `Orchestrator`（命运编织者）：决定走哪条路
-//! - `Graph` / `RuleEngine`（执行引擎）：按路径执行
+//! - `SkillPlan` / `RuleEngine`（执行引擎）：按规划路径执行（框架不再持有 Graph）
 //!
 //! 应用层（`CompositionRoot`）作为组合根，将领域专家注册到框架核心。
 //!

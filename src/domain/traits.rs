@@ -34,7 +34,14 @@ pub struct DomainSkill {
 #[derive(Debug, Clone)]
 pub struct DomainContext {
     pub input: String,
+    /// 会话 ID —— 一条会话链路内恒定，供会话归属、进度通道注册、SSE 关联使用。
     pub session_id: Option<String>,
+    /// 追踪 ID —— 一次用户请求的全链路标识（TraceAppService 生成）。
+    ///
+    /// 跨模块串联标准：HTTP 入口 → TraceAppService → OrchestrationService →
+    /// 引擎 ctx.metadata["trace_id"] → DomainContext，专家内所有 LLM/工具/事件
+    /// 活动都应从本字段派生追踪标识，保证全链路可用 [`trace_id`] 关联。
+    pub trace_id: Option<String>,
     pub user_id: Option<String>,
     /// 项目工作目录路径（前端聊天设置传入）
     pub workspace_folder: Option<String>,
@@ -310,7 +317,9 @@ pub trait DomainExpert: Send + Sync {
                 role: DomainRole::User,
                 content: input.clone(),
             });
-            let answer = exec_ctx.llm.chat(msgs).await?;
+            // 真流式：逐 delta 推给前端（首字即出），同时累积为完整答案返回
+            let answer =
+                chat_stream_to_progress(&exec_ctx.llm, msgs, &exec_ctx.progress_tx).await?;
             send_progress(
                 &exec_ctx.progress_tx,
                 &format!("✅ {} 回答完成", expert_name),
@@ -414,6 +423,41 @@ fn send_struct_progress(
     );
 }
 
+/// 推送流式文本分片（前端按 `type = "data"` 增量渲染）
+///
+/// 与 `plan`/`step` 等结构化进度不同，这里承载的是**模型真实输出的增量文本**，
+/// 由编排层原样转成 `StreamEvent::Chunk` 后即时下发，不再做任何人为切块/延时。
+fn send_chunk(tx: &Option<mpsc::Sender<String>>, content: &str) {
+    if content.is_empty() {
+        return;
+    }
+    send_progress(
+        tx,
+        &serde_json::json!({
+            "type": "chunk",
+            "content": content,
+        })
+        .to_string(),
+    );
+}
+
+/// 以**流式**方式调用 LLM：每个 delta 既通过 `progress_tx` 增量下发（真流式），
+/// 又累积成完整文本返回；未配置 `progress_tx` 时只是多一层回调，无额外开销。
+///
+/// 仅用于「输出即为最终回答」的场景（闲聊、代码审查/修复/重构、0 步骤直接对话）。
+/// 中间产物（计划、代码生成、修复回灌）不要走这里，否则会把过程文本也吐给用户。
+pub(crate) async fn chat_stream_to_progress(
+    llm: &Arc<dyn DomainLlm>,
+    messages: Vec<DomainMessage>,
+    tx: &Option<mpsc::Sender<String>>,
+) -> DomainResult<String> {
+    let tx_owned = tx.clone();
+    let on_delta: Box<dyn Fn(String) + Send> = Box::new(move |delta: String| {
+        send_chunk(&tx_owned, &delta);
+    });
+    llm.chat_stream(messages, on_delta).await
+}
+
 /// 领域 LLM 接口（纯领域类型）
 ///
 /// 定义领域层使用的 LLM 能力，不依赖框架实现。
@@ -421,6 +465,23 @@ fn send_struct_progress(
 pub trait DomainLlm: Send + Sync {
     /// 发送消息并获取响应
     async fn chat(&self, messages: Vec<DomainMessage>) -> DomainResult<String>;
+
+    /// 流式对话：模型每产出一个 delta 就回调一次 `on_delta`
+    ///
+    /// 默认实现**退化为一次性 [`chat`]**：拿到全文后作为单个 delta 回调一次。
+    /// 这样未支持流式的适配器（测试替身、其他 provider）无需改动即可继续编译运行，
+    /// 前端也会退化成「一次性显示」，不会报错。
+    ///
+    /// 返回值为**完整文本**，便于调用方在流结束后仍能拿到全文。
+    async fn chat_stream(
+        &self,
+        messages: Vec<DomainMessage>,
+        on_delta: Box<dyn Fn(String) + Send>,
+    ) -> DomainResult<String> {
+        let full = self.chat(messages).await?;
+        on_delta(full.clone());
+        Ok(full)
+    }
 
     /// 获取模型名称
     fn model_name(&self) -> &str;
