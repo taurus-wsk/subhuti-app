@@ -27,8 +27,8 @@ pub struct PlanStep {
     pub skill_id: String,
     /// 步骤描述
     pub description: String,
-    /// 技能参数（可以是字符串或对象，统一转为字符串）
-    #[serde(deserialize_with = "deserialize_params")]
+    /// 技能参数（可以是字符串或对象，统一转为字符串；LLM 常漏掉此字段，缺省为空串）
+    #[serde(default, deserialize_with = "deserialize_params")]
     pub params: String,
 }
 
@@ -71,13 +71,83 @@ impl SkillPlan {
     }
 }
 
+/// 计划执行的汇总结果：产物 + 步骤成败统计。
+///
+/// 存在的意义：**整体成败必须由步骤成败聚合得出**。执行链不再"永远返回 Ok"——
+/// 上层（专家 → 框架 → 编排 → 入站适配器）据此把失败判为整体失败，
+/// 而不是把一个通篇写着 `[失败]` 的产物当成成功结果交给调用方。
+pub struct PlanExecution {
+    /// 汇总后的 markdown 产物（含每步结果与失败原因）
+    pub output: String,
+    /// 计划中的步骤总数
+    pub total_steps: usize,
+    /// 执行成功的步骤数
+    pub succeeded_steps: usize,
+}
+
+impl PlanExecution {
+    /// 失败的步骤数
+    pub fn failed_steps(&self) -> usize {
+        self.total_steps.saturating_sub(self.succeeded_steps)
+    }
+
+    /// 整体是否失败 —— **产品规则（2026-09-13 定稿）：只要有任意一步失败即判整体失败**。
+    ///
+    /// 为什么取严（而不是"全部步骤均失败才算失败"）：
+    /// 1. 与框架多专家路径（`Orchestrator::dispatch_with_plan` 的 `all_ok`）语义一致，
+    ///    全局只有一条成败口径；
+    /// 2. **不随 planner 拆步粒度抖动**——同一句请求可能被 LLM 拆成 1/2/3 步，
+    ///    "全败才算失败"会让同一请求时而成功时而失败；
+    /// 3. 失败必须让调用方**可程序化判别**（`isError=true`），不能只埋在产物正文里。
+    ///
+    /// 代价（已知并接受）：`[生成代码][编译验证]` 这类计划里，编译失败会把
+    /// "已生成代码"的部分交付一并判为整体失败。产物本身仍完整返回，
+    /// 调用方可从 `## 步骤 N … [失败]` 读到细节。
+    ///
+    /// 空计划（0 步）不算失败——「无事可做」不是「失败」。
+    pub fn has_failed_steps(&self) -> bool {
+        self.failed_steps() > 0
+    }
+}
+
+impl std::fmt::Debug for PlanExecution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlanExecution")
+            .field("total_steps", &self.total_steps)
+            .field("succeeded_steps", &self.succeeded_steps)
+            .field("failed_steps", &self.failed_steps())
+            .field("output_len", &self.output.len())
+            .finish()
+    }
+}
+
 /// 解析 LLM 输出的执行计划
 ///
 /// 兼容纯 JSON 与 markdown 代码块（```` ```json ... ``` ````）包裹两种形式。
 pub fn parse_plan(output: &str) -> Result<SkillPlan> {
     let json_str = extract_json(output);
-    serde_json::from_str(&json_str)
-        .map_err(|e| crate::Error::Expert(format!("解析执行计划失败: {}, 原始输出: {}", e, output)))
+    serde_json::from_str(&json_str).map_err(|e| {
+        crate::Error::Expert(format!(
+            "解析执行计划失败: {}, 原始输出: {}",
+            e,
+            output_preview(output)
+        ))
+    })
+}
+
+/// 错误文案里的 LLM 原始输出**预览**：最多 200 字符。
+///
+/// 不截断的话，解析失败会把几千字乱码原样塞进用户可见的报错（早期实测出现过），
+/// 既不可读也淹没真正的错误原因。完整输出仍可从日志里查。
+const OUTPUT_PREVIEW_CHARS: usize = 200;
+
+fn output_preview(output: &str) -> String {
+    let trimmed = output.trim();
+    if trimmed.chars().count() <= OUTPUT_PREVIEW_CHARS {
+        return trimmed.to_string();
+    }
+    let head: String = trimmed.chars().take(OUTPUT_PREVIEW_CHARS).collect();
+    format!("{}…(已截断)", head)
 }
 
 /// 从 LLM 输出中抽取 JSON 文本（兼容纯 JSON 与 markdown 代码块包裹）
@@ -128,20 +198,194 @@ pub enum PlanOrAsk {
 pub fn parse_plan_or_ask(output: &str) -> Result<PlanOrAsk> {
     let json_str = extract_json(output);
     let value: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| {
-        crate::Error::Expert(format!("解析规划结果失败: {}, 原始输出: {}", e, output))
+        crate::Error::Expert(format!(
+            "解析规划结果失败: {}, 原始输出: {}",
+            e,
+            output_preview(output)
+        ))
     })?;
 
     if value.get("question").is_some() && value.get("options").is_some() {
         let ask: AskRequest = serde_json::from_value(value).map_err(|e| {
-            crate::Error::Expert(format!("解析提问请求失败: {}, 原始输出: {}", e, output))
+            crate::Error::Expert(format!(
+                "解析提问请求失败: {}, 原始输出: {}",
+                e,
+                output_preview(output)
+            ))
         })?;
         Ok(PlanOrAsk::Ask(ask))
     } else {
         let plan: SkillPlan = serde_json::from_value(value).map_err(|e| {
-            crate::Error::Expert(format!("解析执行计划失败: {}, 原始输出: {}", e, output))
+            crate::Error::Expert(format!(
+                "解析执行计划失败: {}, 原始输出: {}",
+                e,
+                output_preview(output)
+            ))
         })?;
         Ok(PlanOrAsk::Plan(plan))
     }
+}
+
+/// 规划结果解析失败时的**纠错重试指令**。
+///
+/// 实测（2026-09-13）：LLM 偶发把 JSON 截断（如只吐到 `{"desc`）或在 JSON 前后
+/// 夹带大段解释，导致 `serde_json` 报 `expected ',' or '}'`。这类失败**与用户输入
+/// 无关**，纯属输出格式抖动，重试一次即可恢复——若不重试，任意请求都可能因一次
+/// 格式抖动而整体失败（实测「帮我写首诗赞美大海」即被此问题击穿）。
+const PLAN_RETRY_INSTRUCTION: &str = "你上一次的输出不是合法 JSON，无法解析。\n\
+请**只输出一个完整、闭合的 JSON 对象**：\n\
+- 不要任何解释、寒暄、前后缀文字；\n\
+- 不要用 markdown 代码块包裹；\n\
+- 确保括号配对、无尾随逗号；\n\
+- 步骤数不超过 3 个；\n\
+- 若需要提问，也必须是一个合法 JSON 对象（含 question 与 options）。";
+
+/// 「只提问、不产出」的占位步骤特征词。
+///
+/// **为什么在代码层再兜一道**：即便 system prompt 已明确禁止，LLM 仍会偶发把
+/// 「与用户沟通」「询问用户所在位置」这类**没有交付物**的动作排成步骤。实测
+/// （2026-09-13 多轮 MCP 探针）后果被放大得很明显：
+///   - 「用 rust 写一个函数并说明模块划分」→ **226.6 s**
+///   - 「再补充一下错误处理」→ **95.7 s**
+/// 而这些耗时换来的产物只有一句「抱歉，我无法获取您当前的地理位置」。
+/// 提示词约束不可靠，故在此加一层**确定性**过滤。
+///
+/// 词表收得很窄：只匹配语义明确等于「停下来问用户」的短语，
+/// 避免误伤「确认目标目录是否存在」这类确实有产出的步骤。
+const PLACEHOLDER_STEP_MARKERS: &[&str] = &[
+    "与用户沟通",
+    "和用户沟通",
+    "与用户交流",
+    "询问用户",
+    "向用户询问",
+    "咨询用户",
+    "与用户确认",
+    "向用户确认",
+    "确认需求",
+    "澄清需求",
+    "澄清用户",
+    "收集信息",
+    "获取更多信息",
+    "了解用户意图",
+    "了解用户需求",
+];
+
+/// 该步骤是否为「只提问、不产出」的占位步骤
+pub fn is_placeholder_step(step: &PlanStep) -> bool {
+    PLACEHOLDER_STEP_MARKERS
+        .iter()
+        .any(|m| step.description.contains(m))
+}
+
+/// 过滤掉占位步骤，返回被剔除的条数，并把剩余步骤的 `order` 重新编号为连续值
+/// （执行链与前端展示都依赖 order 连续）。
+///
+/// 过滤后若计划为空，上层会退化为「直接对话回答」
+/// （见 `DomainExpert::plan_and_execute` 的空计划分支）——这比执行一个
+/// 没有交付物的提问步骤更符合预期，也更省一轮 LLM 编排。
+pub fn strip_placeholder_steps(plan: &mut SkillPlan) -> usize {
+    let before = plan.steps.len();
+    plan.steps.retain(|s| !is_placeholder_step(s));
+    for (i, s) in plan.steps.iter_mut().enumerate() {
+        s.order = (i + 1) as u32;
+    }
+    before - plan.steps.len()
+}
+
+/// 规划结果出厂前的收尾：把「只提问不产出」的占位步骤剔掉（仅对 `Plan` 生效）。
+fn finalize_plan(mut parsed: PlanOrAsk, label: &str) -> PlanOrAsk {
+    if let PlanOrAsk::Plan(ref mut plan) = parsed {
+        let removed = strip_placeholder_steps(plan);
+        if removed > 0 {
+            tracing::warn!(
+                "[planner] {} 剔除 {} 个「只提问不产出」的占位步骤，剩余 {} 步",
+                label,
+                removed,
+                plan.steps.len()
+            );
+        }
+    }
+    parsed
+}
+
+/// 两套规划 prompt（专家内部 `generate_plan` / 主管 `generate_expert_plan`）
+/// 共享的**公共约束段**。抽成常量：这三条规则对「选技能」与「选专家」同等成立，
+/// 此前在两端各写一份，改一块容易漏另一块。
+///
+/// ① 每步必须产出交付物；② 严禁「只提问、不产出」的占位步骤（实测 226s / 95.7s
+/// 耗时的元凶，既无产物又把整体耗时拖长一个数量级）；③ 提问是 planner 层的**返回**
+/// （question + options），不是 steps 里的一步。
+const PLAN_COMMON_RULES: &str = "\
+4. **每个步骤都必须产出实际交付物**（代码 / 分析 / 文件 / 结论）。\n\
+   ⚠️ 严禁出现「与用户沟通」「询问用户」「确认需求」「澄清需求」「收集信息」\n\
+   「了解用户意图」这类**只提问、不产出**的占位步骤——这类步骤既无交付物，\n\
+   又会把整体耗时拖长一个数量级。需要什么信息就从用户需求中合理推断，\n\
+   或直接在步骤描述里写明采用的假设。\n\
+5. 仅当用户需求缺失完成它所必需的关键信息且无从推断（而不是含糊）时，\n\
+   才允许返回一个提问（question + options）征询用户；通常不要提问。\n\
+   （注意：**提问是 planner 层的返回，不是计划里的一个步骤**——不要在 steps 里造提问步骤）";
+
+/// 计划 JSON 输出模板（两套规划共用的逐字格式）。
+///
+/// 注意：本常量作为 `format!` 的**参数**传入外层模板，其内部 `{}`/`{}` 的花括号
+/// 不会被外层 `format!` 解析，安全。
+const PLAN_OUTPUT_EXAMPLE: &str = "```json\n\
+{\n  \"description\": \"计划描述\",\n  \"steps\": [\n\
+    {\n      \"order\": 1, \"skill_id\": \"<技能或专家id>\", \"description\": \"步骤描述\", \"params\": \"参数\" }\n\
+  ]\n}\n```";
+
+/// 提问 JSON 输出模板（两套规划共用）。
+const ASK_OUTPUT_EXAMPLE: &str = "```json\n\
+{\n  \"question\": \"问题\", \"options\": [\"选项1\", \"选项2\"], \"context\": \"为何询问的说明\"\n}\n```";
+
+/// 调用 LLM 生成规划结果，并在**解析失败时自动纠错重试一次**。
+///
+/// 为什么在框架层做：`generate_plan`（专家内部规划）与 `generate_expert_plan`
+/// （主管多专家编排）共享同一种"LLM 输出格式抖动"故障，收敛到一处避免各修一遍。
+///
+/// 重试策略：把上一次的**原始输出**作为 assistant 消息回喂，再补一条强约束的
+/// 用户指令（`PLAN_RETRY_INSTRUCTION`），要求只产出合法 JSON。一次仍失败则放弃，
+/// 抛出**精简后**的错误（不含原始输出全文，避免把几千字乱码甩给用户）。
+async fn chat_and_parse_plan(
+    llm: &Arc<dyn LLM>,
+    messages: Vec<Message>,
+    label: &str,
+) -> Result<PlanOrAsk> {
+    let llm_output = llm.chat(messages.clone()).await?;
+    let first_err = match parse_plan_or_ask(&llm_output) {
+        Ok(parsed) => return Ok(finalize_plan(parsed, label)),
+        Err(e) => e,
+    };
+
+    tracing::warn!(
+        "[planner] {} 首次输出无法解析，带纠错提示重试一次: {}",
+        label,
+        first_err
+    );
+
+    let mut retry_messages = messages;
+    retry_messages.push(Message {
+        role: Role::Assistant,
+        content: llm_output,
+        tool_call_id: None,
+    });
+    retry_messages.push(Message {
+        role: Role::User,
+        content: PLAN_RETRY_INSTRUCTION.to_string(),
+        tool_call_id: None,
+    });
+
+    let retry_output = llm.chat(retry_messages).await?;
+    parse_plan_or_ask(&retry_output)
+        .map(|parsed| finalize_plan(parsed, label))
+        .map_err(|second| {
+            // 只带第二次（重试后）的解析错误：它已足够定位问题，
+            // 且避免把两份原始输出拼成超长报错。
+            crate::Error::Expert(format!(
+                "规划结果解析失败（已自动重试一次仍不合法）: {}",
+                second
+            ))
+        })
 }
 
 /// 使用 LLM 生成执行计划
@@ -183,18 +427,16 @@ pub async fn generate_plan(
 
 规则：
 1. 根据用户需求选择 1-3 个技能组合执行，技能按顺序执行，前一步输出作为后一步输入
-2. 尽量直接、具体地展开执行计划，不要用「确认需求」这类占位步骤充当第一步
-3. 当用户需求已明确给出（如目标目录、语言、项目名、具体任务）时，直接规划并执行
-4. 如果用户只是闲聊或询问信息，只需使用 chat 技能
-5. 如果用户需求缺失完成它所必需的关键信息且无从推断（而不是含糊），
-   才允许返回一个提问（question + options）征询用户；通常不要提问
+2. 当用户需求已明确给出（如目标目录、语言、项目名、具体任务）时，直接规划并执行
+3. 如果用户只是闲聊或询问信息，只需使用 chat 技能
+{}
 6. 以 JSON 格式返回执行计划（除非规则 5 需要提问）"#,
-        expert_name, skills_desc
+        expert_name, skills_desc, PLAN_COMMON_RULES
     );
 
     let user_prompt = format!(
-        "用户需求：\n{}\n\n请制定执行计划，以以下 JSON 格式返回：\n```json\n{{\n  \"description\": \"计划描述\",\n  \"steps\": [\n    {{\n      \"order\": 1,\n      \"skill_id\": \"rust-chat\",\n      \"description\": \"步骤描述\",\n      \"params\": \"技能参数\"\n    }}\n  ]\n}}\n```\n\n仅当确实缺失关键信息、且无法从上下文中推断时，才改为返回提问：\n```json\n{{\n  \"question\": \"问题\",\n  \"options\": [\"选项1\", \"选项2\"],\n  \"context\": \"为何询问的说明\"\n}}\n```",
-        input
+        "用户需求：\n{}\n\n请制定执行计划，以以下 JSON 格式返回：\n{}\n\n仅当确实缺失关键信息、且无法从上下文中推断时，才改为返回提问：\n{}",
+        input, PLAN_OUTPUT_EXAMPLE, ASK_OUTPUT_EXAMPLE
     );
 
     let messages = vec![
@@ -210,9 +452,7 @@ pub async fn generate_plan(
         },
     ];
 
-    let llm_output = llm.chat(messages).await?;
-
-    parse_plan_or_ask(&llm_output)
+    chat_and_parse_plan(llm, messages, &format!("专家 {} 内部规划", expert_name)).await
 }
 
 /// 框架主管（Planner/ReAct 主管）专用的「专家编排计划」生成器。
@@ -244,14 +484,14 @@ pub async fn generate_expert_plan(
 1. 先判断请求涉及几个领域；只涉及单个领域时，只排那一个专家即可
 2. 涉及多个领域时，按最自然的执行顺序排多个专家；前一步专家的输出会作为后一步专家的输入
 3. skill_id 必须精确等于上面列出的某个专家 id
-4. 尽量直接展开执行计划，不要用「确认需求」当第一步
-5. 仅当信息确实缺失且无法从上下文推断时，才返回提问（question + options）"#,
-        supervisor_name, experts_desc
+{}
+6. 以 JSON 格式返回专家编排计划（除非规则 5 需要提问）"#,
+        supervisor_name, experts_desc, PLAN_COMMON_RULES
     );
 
     let user_prompt = format!(
-        "用户需求：\n{}\n\n请制定专家编排计划，以以下 JSON 格式返回：\n```json\n{{\n  \"description\": \"计划描述\",\n  \"steps\": [\n    {{\n      \"order\": 1,\n      \"skill_id\": \"<专家id>\",\n      \"description\": \"步骤描述\",\n      \"params\": \"传递给该专家的输入（可留空，默认用上一位专家的输出）\"\n    }}\n  ]\n}}\n```\n\n仅当确实缺失关键信息、且无法推断时，改为返回提问：\n```json\n{{\n  \"question\": \"问题\",\n  \"options\": [\"选项1\", \"选项2\"],\n  \"context\": \"为何询问的说明\"\n}}\n```",
-        input
+        "用户需求：\n{}\n\n请制定专家编排计划，以以下 JSON 格式返回：\n{}\n\n仅当确实缺失关键信息、且无法从上下文中推断时，才改为返回提问：\n{}",
+        input, PLAN_OUTPUT_EXAMPLE, ASK_OUTPUT_EXAMPLE
     );
 
     let messages = vec![
@@ -267,8 +507,12 @@ pub async fn generate_expert_plan(
         },
     ];
 
-    let llm_output = llm.chat(messages).await?;
-    parse_plan_or_ask(&llm_output)
+    chat_and_parse_plan(
+        llm,
+        messages,
+        &format!("主管 {} 多专家编排", supervisor_name),
+    )
+    .await
 }
 
 /// 按顺序执行计划（引擎侧的循环驱动机制）
@@ -284,13 +528,13 @@ pub async fn generate_expert_plan(
 /// - `run_step`: 单步执行器 `FnMut(skill_id, params, prev_output) -> Future`
 ///
 /// # 返回
-/// - 汇总后的执行结果 markdown
+/// - 汇总后的执行结果（产物 + 步骤成败统计），由上层据 `has_failed_steps()` 判整体成败
 pub async fn execute_plan<F, Fut>(
     expert_name: &str,
     plan: &SkillPlan,
     mut on_progress: impl FnMut(&str),
     mut run_step: F,
-) -> Result<String>
+) -> Result<PlanExecution>
 where
     F: FnMut(&str, &str, &str) -> Fut,
     Fut: std::future::Future<Output = Result<String>>,
@@ -306,6 +550,7 @@ where
     let mut results: Vec<String> = Vec::new();
     // 上一步输出作为下一步输入
     let mut prev_output: Option<String> = None;
+    let mut succeeded_steps: usize = 0;
 
     for (idx, step) in plan.steps.iter().enumerate() {
         let step_num = idx + 1;
@@ -329,6 +574,7 @@ where
                     step_num, step.description, output
                 ));
                 prev_output = Some(output.clone());
+                succeeded_steps += 1;
             }
             Err(e) => {
                 on_progress(&format!(
@@ -344,12 +590,16 @@ where
         }
     }
 
-    Ok(format!(
-        "# {} 执行结果\n\n{}\n\n---\n共执行 {} 个步骤",
-        expert_name,
-        results.join("\n\n---\n\n"),
-        total_steps
-    ))
+    Ok(PlanExecution {
+        output: format!(
+            "# {} 执行结果\n\n{}\n\n---\n共执行 {} 个步骤",
+            expert_name,
+            results.join("\n\n---\n\n"),
+            total_steps
+        ),
+        total_steps,
+        succeeded_steps,
+    })
 }
 
 #[cfg(test)]
@@ -543,10 +793,14 @@ mod tests {
         // 步骤按序调用
         assert_eq!(call_order, vec!["skill-a", "skill-b"]);
         // 汇总包含两步结果
-        assert!(result.contains("测试专家 执行结果"));
-        assert!(result.contains("第一步"));
-        assert!(result.contains("第二步"));
-        assert!(result.contains("共执行 2 个步骤"));
+        assert!(result.output.contains("测试专家 执行结果"));
+        assert!(result.output.contains("第一步"));
+        assert!(result.output.contains("第二步"));
+        assert!(result.output.contains("共执行 2 个步骤"));
+        // 两步全成功 → 不算整体失败
+        assert_eq!(result.total_steps, 2);
+        assert_eq!(result.succeeded_steps, 2);
+        assert!(!result.has_failed_steps());
         // 会有进度推送
         assert!(!progress_log.is_empty());
     }
@@ -587,13 +841,73 @@ mod tests {
         .unwrap();
 
         // 失败标记仍汇入结果，且流程继续
-        assert!(result.contains("[失败]"));
-        assert!(result.contains("成功步"));
-        assert!(result.contains("失败步"));
+        assert!(result.output.contains("[失败]"));
+        assert!(result.output.contains("成功步"));
+        assert!(result.output.contains("失败步"));
         // 失败步的错误被汇总
-        assert!(result.contains("步骤失败"));
+        assert!(result.output.contains("步骤失败"));
         // 上一步输出被注入到失败步的输入（prev=ok 输出）
-        assert!(result.contains("prev=ok 输出"));
+        assert!(result.output.contains("prev=ok 输出"));
+        // 部分失败 → 严格口径下即判整体失败（失败信息必须可程序化判别）
+        assert_eq!(result.succeeded_steps, 1);
+        assert_eq!(result.failed_steps(), 1);
+        assert!(
+            result.has_failed_steps(),
+            "任一步骤失败即判整体失败（严格口径）"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_plan_any_failed_step_flags_overall_failure() {
+        // 规则：**任一步骤失败 → 整体失败**（与框架多专家路径 all_ok 同口径）
+        let plan = SkillPlan::new("全败").add_step(PlanStep {
+            order: 1,
+            skill_id: "bad-a".into(),
+            description: "失败步 A".into(),
+            params: "".into(),
+        });
+        let plan = plan.add_step(PlanStep {
+            order: 2,
+            skill_id: "bad-b".into(),
+            description: "失败步 B".into(),
+            params: "".into(),
+        });
+
+        let result = execute_plan(
+            "测试专家",
+            &plan,
+            |_| {},
+            |skill_id, _, _| {
+                let sid = skill_id.to_string();
+                async move { Err(crate::Error::Expert(format!("{} 失败", sid))) }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.total_steps, 2);
+        assert_eq!(result.succeeded_steps, 0);
+        assert_eq!(result.failed_steps(), 2);
+        assert!(result.has_failed_steps(), "所有步骤均失败必须判整体失败");
+        // 失败原因仍完整保留在产物里（用于给调用方可操作的反馈）
+        assert!(result.output.contains("bad-a 失败"));
+        assert!(result.output.contains("bad-b 失败"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_plan_empty_plan_is_not_overall_failure() {
+        // 空计划（0 步）不算失败——「无事可做」不是「失败」
+        let plan = SkillPlan::new("空计划");
+        let result = execute_plan(
+            "测试专家",
+            &plan,
+            |_| {},
+            |_, _, _| async move { Ok("never".to_string()) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.total_steps, 0);
+        assert!(!result.has_failed_steps());
     }
 
     // ── Mock LLM：generate_plan 决策路径测试 ──────────
@@ -699,5 +1013,238 @@ mod tests {
         });
         let result = generate_plan(&llm, "", &skills(), "测试专家").await;
         assert!(result.is_err(), "空输出应被解析为错误");
+    }
+
+    // ─── 解析失败 → 纠错重试（2026-09-13 实测故障的回归用例）──────────────
+
+    /// 按顺序返回预设回复的 LLM，并记录每次 `chat` 收到的消息内容。
+    struct ScriptedLlm {
+        config: crate::runtime::llm::LLMConfig,
+        replies: std::sync::Mutex<std::collections::VecDeque<String>>,
+        /// 每次调用的消息内容快照（用于断言重试时带了纠错指令）
+        seen: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::runtime::llm::LLM for ScriptedLlm {
+        fn provider(&self) -> crate::runtime::llm::LLMProvider {
+            crate::runtime::llm::LLMProvider::Custom
+        }
+        fn config(&self) -> &crate::runtime::llm::LLMConfig {
+            &self.config
+        }
+        async fn chat(&self, m: Vec<Message>) -> crate::Result<String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(m.iter().map(|x| x.content.clone()).collect());
+            Ok(self.replies.lock().unwrap().pop_front().unwrap_or_default())
+        }
+        async fn chat_with_tools(
+            &self,
+            _m: Vec<Message>,
+            _tools: Vec<crate::runtime::llm::ToolInfo>,
+        ) -> crate::Result<crate::runtime::llm::LLMResponse> {
+            Ok(crate::runtime::llm::LLMResponse {
+                content: self.replies.lock().unwrap().pop_front().unwrap_or_default(),
+                tool_call: None,
+                model: None,
+                prompt_tokens: None,
+                completion_tokens: None,
+                total_tokens: None,
+            })
+        }
+        async fn chat_streaming(
+            &self,
+            _m: Vec<Message>,
+            _callback: Box<dyn Fn(String) + Send>,
+        ) -> crate::Result<()> {
+            Ok(())
+        }
+        async fn health_check(&self) -> crate::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    fn scripted(replies: Vec<&str>) -> Arc<ScriptedLlm> {
+        Arc::new(ScriptedLlm {
+            config: crate::runtime::llm::LLMConfig::default(),
+            replies: std::sync::Mutex::new(replies.into_iter().map(String::from).collect()),
+            seen: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn good_plan_json() -> &'static str {
+        r#"{"description":"直答","steps":[{"order":1,"skill_id":"rust-chat","description":"回答","params":"x"}]}"#
+    }
+
+    /// 首次输出被截断（实测故障形态：只吐到 `{"desc`）→ 自动带纠错提示重试一次并恢复。
+    #[tokio::test]
+    async fn plan_parse_failure_retries_once_and_recovers() {
+        let llm = scripted(vec!["```json\n{\n  \"desc", good_plan_json()]);
+        let dyn_llm: Arc<dyn crate::runtime::llm::LLM> = llm.clone();
+        let out = generate_plan(&dyn_llm, "帮我写首诗赞美大海", &skills(), "测试专家")
+            .await
+            .expect("首次坏 JSON 应被重试救回，而不是整体失败");
+        match out {
+            PlanOrAsk::Plan(p) => assert_eq!(p.step_count(), 1),
+            PlanOrAsk::Ask(_) => panic!("不应识别为提问"),
+        }
+
+        let seen = llm.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "应恰好两次 LLM 调用（1 次原始 + 1 次重试）");
+        let retry = &seen[1];
+        assert!(
+            retry
+                .iter()
+                .any(|c| c.contains("只输出一个完整、闭合的 JSON 对象")),
+            "重试消息必须带上纠错指令"
+        );
+        assert!(
+            retry.iter().any(|c| c.contains("\"desc")),
+            "重试消息必须回喂上一次的坏输出"
+        );
+    }
+
+    /// 两次都不合法 → 报错，但**错误文案必须精简**（不含原始输出全文）。
+    #[tokio::test]
+    async fn plan_parse_failure_twice_yields_concise_error() {
+        let junk = "抱歉，我无法完成这个请求。".repeat(50);
+        let llm = scripted(vec![junk.as_str(), junk.as_str()]);
+        let dyn_llm: Arc<dyn crate::runtime::llm::LLM> = llm.clone();
+        let err = generate_plan(&dyn_llm, "x", &skills(), "测试专家")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("已自动重试一次仍不合法"),
+            "文案应说明已重试过: {msg}"
+        );
+        assert!(
+            !msg.contains(&junk),
+            "不应把原始输出全文塞进错误文案（应截断为预览）"
+        );
+        assert!(
+            msg.chars().count() < 500,
+            "错误文案应精简，实际 {} 字: {msg}",
+            msg.chars().count()
+        );
+        assert_eq!(llm.seen.lock().unwrap().len(), 2, "应重试过恰好一次");
+    }
+
+    /// 首次即合法 → 不做多余重试（不白花一次 LLM 调用）。
+    #[tokio::test]
+    async fn plan_parse_success_does_not_retry() {
+        let llm = scripted(vec![good_plan_json(), "不该被调用"]);
+        let dyn_llm: Arc<dyn crate::runtime::llm::LLM> = llm.clone();
+        generate_plan(&dyn_llm, "x", &skills(), "测试专家")
+            .await
+            .unwrap();
+        assert_eq!(llm.seen.lock().unwrap().len(), 1, "解析成功时不应触发重试");
+    }
+
+    /// 输出预览：超长输出必须被截断，短输出原样保留。
+    #[test]
+    fn output_preview_truncates_long_text() {
+        let long = "a".repeat(5000);
+        let p = output_preview(&long);
+        assert!(p.chars().count() <= OUTPUT_PREVIEW_CHARS + 10);
+        assert!(p.ends_with("…(已截断)"));
+        assert_eq!(output_preview("  hello  "), "hello");
+    }
+
+    // ─── 占位步骤过滤（实测 226s / 95.7s 耗时的元凶）──────────────
+
+    /// 「只提问不产出」的步骤必须被剔除，且 order 重新编号连续。
+    #[test]
+    fn placeholder_steps_are_stripped_and_reordered() {
+        let mut plan = SkillPlan::new("含占位步")
+            .add_step(PlanStep {
+                order: 1,
+                skill_id: "rust-chat".into(),
+                description: "与用户沟通以获取函数的具体用途".into(),
+                params: "".into(),
+            })
+            .add_step(PlanStep {
+                order: 2,
+                skill_id: "rust-generate".into(),
+                description: "生成斐波那契函数实现".into(),
+                params: "".into(),
+            })
+            .add_step(PlanStep {
+                order: 3,
+                skill_id: "rust-chat".into(),
+                description: "询问用户希望使用哪种错误处理风格".into(),
+                params: "".into(),
+            });
+
+        let removed = strip_placeholder_steps(&mut plan);
+        assert_eq!(removed, 2, "两个占位步骤都应被剔除");
+        assert_eq!(plan.step_count(), 1);
+        assert_eq!(plan.steps[0].skill_id, "rust-generate");
+        assert_eq!(plan.steps[0].order, 1, "剔除后 order 应重排为连续值");
+    }
+
+    /// 有实际产出的步骤不能被误伤（词表必须收得足够窄）。
+    #[test]
+    fn productive_steps_are_kept() {
+        let mut plan = SkillPlan::new("正常计划")
+            .add_step(PlanStep {
+                order: 1,
+                skill_id: "rust-coding".into(),
+                description: "检查目标目录是否存在并初始化 cargo 工程".into(),
+                params: "".into(),
+            })
+            .add_step(PlanStep {
+                order: 2,
+                skill_id: "rust-generate".into(),
+                description: "编写 fib 函数并运行 cargo check 验证".into(),
+                params: "".into(),
+            });
+        assert_eq!(strip_placeholder_steps(&mut plan), 0, "正常步骤不应被剔除");
+        assert_eq!(plan.step_count(), 2);
+    }
+
+    /// 全是占位步骤 → 过滤后为空计划（上层据此退化为「直接对话回答」）。
+    #[tokio::test]
+    async fn all_placeholder_plan_becomes_empty_via_generate_plan() {
+        let json = r#"{"description":"全是占位步","steps":[
+            {"order":1,"skill_id":"rust-chat","description":"与用户沟通以确认需求","params":""}
+        ]}"#;
+        let llm = scripted(vec![json]);
+        let dyn_llm: Arc<dyn crate::runtime::llm::LLM> = llm.clone();
+        let out = generate_plan(&dyn_llm, "写个函数", &skills(), "测试专家")
+            .await
+            .unwrap();
+        match out {
+            PlanOrAsk::Plan(p) => assert_eq!(
+                p.step_count(),
+                0,
+                "占位步骤应被剔空，交由上层退化为直接回答"
+            ),
+            PlanOrAsk::Ask(_) => panic!("不应识别为提问"),
+        }
+    }
+
+    /// 端到端：占位步骤过滤在 `generate_plan` 里生效（混入 1 个占位 + 1 个真步骤）。
+    #[tokio::test]
+    async fn generate_plan_strips_placeholder_but_keeps_real_step() {
+        let json = r#"{"description":"混合","steps":[
+            {"order":1,"skill_id":"rust-chat","description":"询问用户希望实现什么功能","params":""},
+            {"order":2,"skill_id":"rust-generate","description":"生成并写入实现代码","params":"fib"}
+        ]}"#;
+        let llm = scripted(vec![json]);
+        let dyn_llm: Arc<dyn crate::runtime::llm::LLM> = llm.clone();
+        let out = generate_plan(&dyn_llm, "写个函数", &skills(), "测试专家")
+            .await
+            .unwrap();
+        match out {
+            PlanOrAsk::Plan(p) => {
+                assert_eq!(p.step_count(), 1);
+                assert_eq!(p.steps[0].skill_id, "rust-generate");
+                assert_eq!(p.steps[0].order, 1);
+            }
+            PlanOrAsk::Ask(_) => panic!("不应识别为提问"),
+        }
     }
 }

@@ -135,14 +135,13 @@ pub struct OrchestrateRequest {
     pub user_id: Option<String>,
     pub session_id: Option<String>,
     pub chain: Option<String>,
-    /// 指定要使用的图名称（为空时自动匹配）
-    pub graph: Option<String>,
-    /// 指定要使用的专家 ID（优先级高于 graph，直接路由到该专家）
+    /// 指定要使用的专家 ID（优先级最高，直接路由到该专家）
     pub expert_id: Option<String>,
-    /// 项目工作目录路径（前端聊天设置传入，透传给专家）
-    pub workspace_folder: Option<String>,
     /// 自定义系统提示词（前端聊天设置传入，覆盖专家默认 system prompt）
     pub system_prompt: Option<String>,
+    /// 任意扩展参数（JSON 对象）。workspace_folder 等配置都从这里传入，
+    /// 出站层会摊平进框架 ctx.metadata，领域专家按需读取。
+    pub extra: Option<serde_json::Value>,
 }
 
 // ─── 工具函数 ──────────────────────────────────────────────────
@@ -183,25 +182,11 @@ fn stream_to_sse(
                 StreamEvent::Start => {
                     yield Ok(Event::default().data(decorate(r#"{"type":"start"}"#.into())));
                 }
-                StreamEvent::Thought { message } => {
-                    let json = serde_json::json!({
-                        "type": "thought",
-                        "message": message,
-                    }).to_string();
-                    yield Ok(Event::default().data(decorate(json)));
-                }
-                StreamEvent::Plan { message } => {
-                    let json = serde_json::json!({
-                        "type": "plan",
-                        "message": message,
-                    }).to_string();
-                    yield Ok(Event::default().data(decorate(json)));
-                }
-                StreamEvent::Step { message, expert, phase, todo_state } => {
+                StreamEvent::Step { message, source, phase, todo_state } => {
                     let mut payload = serde_json::json!({
                         "type": "step",
                         "message": message,
-                        "expert": expert,
+                        "source": source,
                     });
                     if let Some(p) = phase {
                         payload.as_object_mut()
@@ -295,11 +280,10 @@ async fn orchestrate_json(state: AppState, req: OrchestrateRequest) -> Response 
             user_id: Some(user_id.clone()),
             session_id: Some(session_id.clone()),
             chain: req.chain.clone(),
-            graph: req.graph.clone(),
             expert_id: req.expert_id.clone(),
             trace_id: None,
-            workspace_folder: req.workspace_folder.clone(),
             system_prompt: req.system_prompt.clone(),
+            extra: req.extra.clone(),
         })
         .await;
 
@@ -368,11 +352,10 @@ fn orchestrate_sse(state: AppState, req: OrchestrateRequest) -> Response {
         user_id: Some(user_id.clone()),
         session_id: Some(session_id.clone()),
         chain: req.chain.clone(),
-        graph: req.graph.clone(),
         expert_id: req.expert_id.clone(),
         trace_id: None,
-        workspace_folder: req.workspace_folder.clone(),
         system_prompt: req.system_prompt.clone(),
+        extra: req.extra.clone(),
     });
 
     Sse::new(stream_to_sse(receiver, session_id)).into_response()
@@ -524,7 +507,8 @@ pub struct HttpAdapterFactory {
     expert_query_port: Arc<dyn ExpertQueryPort>,
     trace_observer: Arc<dyn TraceObserverPort>,
     session_observer: Arc<dyn SessionObserverPort>,
-    pg_storage: Option<Arc<subhuti_infra::sutra_library::storage::PgStorage>>,
+    pg_storage: Option<Arc<dyn subhuti_infra::sutra_library::PersistencePort>>,
+    sutra_library: Option<Arc<dyn subhuti_core::SutraLibraryPort>>,
 }
 
 impl HttpAdapterFactory {
@@ -533,7 +517,8 @@ impl HttpAdapterFactory {
         expert_query_port: Arc<dyn ExpertQueryPort>,
         trace_observer: Arc<dyn TraceObserverPort>,
         session_observer: Arc<dyn SessionObserverPort>,
-        pg_storage: Option<Arc<subhuti_infra::sutra_library::storage::PgStorage>>,
+        pg_storage: Option<Arc<dyn subhuti_infra::sutra_library::PersistencePort>>,
+        sutra_library: Option<Arc<dyn subhuti_core::SutraLibraryPort>>,
     ) -> Self {
         Self {
             chat_port,
@@ -541,6 +526,7 @@ impl HttpAdapterFactory {
             trace_observer,
             session_observer,
             pg_storage,
+            sutra_library,
         }
     }
 
@@ -552,6 +538,7 @@ impl HttpAdapterFactory {
             trace_observer: self.trace_observer.clone(),
             session_observer: self.session_observer.clone(),
             pg_storage: self.pg_storage.clone(),
+            sutra_library: self.sutra_library.clone(),
         }
     }
 

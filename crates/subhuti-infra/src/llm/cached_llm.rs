@@ -325,6 +325,29 @@ impl LLM for CachedLLM {
         Ok(resp)
     }
 
+    /// 带用量的对话：复用 `chat` 的缓存槽（正文相同）。
+    ///
+    /// 命中缓存时 token 用量返回 `None` —— 缓存里没有存用量，且真实调用并未发生，
+    /// 此时把用量算作 0 才诚实（成本统计不应把「没花钱的调用」计成开销）。
+    async fn chat_counted(
+        &self,
+        messages: Vec<Message>,
+    ) -> subhuti_core::Result<(String, Option<u64>)> {
+        let key = Self::make_key(&self.inner.config().model, &messages);
+        if let Some(cached) = self.lookup_chat(&key) {
+            info!(
+                "[CachedLLM] 命中缓存，跳过 LLM 调用 (key={}.., resp_len={})",
+                &key[..8.min(key.len())],
+                cached.len()
+            );
+            return Ok((cached, None));
+        }
+        info!("[CachedLLM] 未命中，调用真实 LLM ...");
+        let (resp, tokens) = self.inner.chat_counted(messages).await?;
+        self.store_chat(key, resp.clone());
+        Ok((resp, tokens))
+    }
+
     async fn chat_with_tools(
         &self,
         messages: Vec<Message>,
@@ -353,6 +376,15 @@ impl LLM for CachedLLM {
     ) -> subhuti_core::Result<()> {
         // 流式不缓存，直接透传
         self.inner.chat_streaming(messages, callback).await
+    }
+
+    async fn chat_streaming_counted(
+        &self,
+        messages: Vec<Message>,
+        callback: Box<dyn Fn(String) + Send>,
+    ) -> subhuti_core::Result<Option<u64>> {
+        // 流式不缓存，直接透传（真实用量仍然落到 span 里）
+        self.inner.chat_streaming_counted(messages, callback).await
     }
 
     async fn health_check(&self) -> subhuti_core::Result<bool> {

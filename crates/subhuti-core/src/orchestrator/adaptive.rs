@@ -15,6 +15,23 @@
 //!      │ 仍失败 → 作为失败步骤记录（带失败历史），继续后续步骤
 //! ```
 //!
+//! **例外（前置条件短路）**：若失败为 `Error::Precondition`（缺必需配置、端口未注入
+//! 等确定性失败），则**跳过 L2 重试与 L3 降级**，直接记为失败步骤——
+//! 因为降级同样缺前提，跑下去只会白等一轮 LLM 编排却完不成任务。
+//!
+//! ```text
+//!   L1 常态
+//!      │ 失败且为 Precondition → ⏭️ 直接记为失败步骤（带可操作提示）
+//! ```
+//!
+//! **整体成败（产品规则，2026-09-13 定稿）**：函数本身不再"永远返回 Ok"。返回的
+//! `PlanExecution` 携带步骤成败统计，**只要有任意一步失败 → 上层判整体失败**
+//! （`success=false` / `isError=true`）。规则由上层按 `PlanExecution::has_failed_steps()`
+//! 统一执行，引擎只负责如实统计。
+//!
+//! 取严（而非"全败才算失败"）的理由：与框架多专家路径 `all_ok` 同口径、不随 planner
+//! 拆步粒度抖动、失败必须可程序化判别。代价是"部分交付"也会判整体失败（产物仍完整返回）。
+//!
 //! 设计边界（保持引擎纯净）：
 //! - 引擎 `execute_plan_adaptive` 只做"三档调度 + 反馈注入 + 进度 + 汇总"这些纯机制
 //! - 单步执行 `run_step` 与 L3 降级 `StepFallback` 均为**回调/接口注入**，引擎不感知任何业务
@@ -23,10 +40,9 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::orchestrator::planner::PlanStep;
+use crate::orchestrator::planner::{PlanExecution, PlanStep};
 use crate::orchestrator::SkillPlan;
-use crate::runtime::llm::{LLMResponse, Message, Role, ToolInfo, LLM};
-use crate::{Error, Result};
+use crate::Result;
 
 /// 自适应执行策略参数
 #[derive(Debug, Clone, Copy)]
@@ -73,104 +89,6 @@ pub trait ToolExecutor: Send + Sync {
 /// 引擎内部使用的动态 future 别名（`Send`，供异步 trait / async_trait 场景跨线程 await）
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// L3 的 **默认参考实现**：直接复用 LLM 原生的 `chat_with_tools`（function calling）
-/// 做多轮工具编排，直到 LLM 给出最终结果或达到迭代上限。
-///
-/// 这是"引擎内引用工具"的落点：引擎自己不造工具，而是由领域层把已注册的 port
-/// 渲染成 `Vec<ToolInfo>` 并提供 `ToolExecutor`，本结构体只负责 ReAct 式循环。
-pub struct LlmToolFallback {
-    llm: std::sync::Arc<dyn LLM>,
-    tools: Vec<ToolInfo>,
-    executor: std::sync::Arc<dyn ToolExecutor>,
-    expert_desc: String,
-    max_iters: usize,
-}
-
-impl LlmToolFallback {
-    pub fn new(
-        llm: std::sync::Arc<dyn LLM>,
-        tools: Vec<ToolInfo>,
-        executor: std::sync::Arc<dyn ToolExecutor>,
-        expert_desc: &str,
-    ) -> Self {
-        Self {
-            llm,
-            tools,
-            executor,
-            expert_desc: expert_desc.to_string(),
-            max_iters: 0, // 使用方通常在构造后覆盖
-        }
-    }
-
-    pub fn with_max_iters(mut self, max_iters: usize) -> Self {
-        self.max_iters = max_iters;
-        self
-    }
-}
-
-impl StepFallback for LlmToolFallback {
-    fn execute<'a>(
-        &'a self,
-        step: &'a PlanStep,
-        failure_history: &'a [String],
-    ) -> BoxFuture<'a, Result<String>> {
-        Box::pin(async move {
-            let goal = format!(
-                "步骤：{}（skill_id={}），参数：{}",
-                step.description, step.skill_id, step.params
-            );
-            let history = failure_history.join("\n");
-            let system_prompt = format!(
-                "你是 {}，现在你的预定义技能执行失败，请改用给定的工具直接完成任务，不要调用预定义技能。\n\n目标：{}",
-                self.expert_desc, goal
-            );
-            let user_prompt = format!(
-                "历史上预定义技能尝试后的失败信息（按顺序排列）：\n{}\n\n请使用提供的工具完成目标。当完成时，直接用文字输出结果，不要再调用工具。",
-                history
-            );
-
-            let mut messages = vec![
-                Message {
-                    role: Role::System,
-                    content: system_prompt,
-                    tool_call_id: None,
-                },
-                Message {
-                    role: Role::User,
-                    content: user_prompt,
-                    tool_call_id: None,
-                },
-            ];
-
-            let max_iters = if self.max_iters == 0 {
-                3
-            } else {
-                self.max_iters
-            };
-            for _ in 0..max_iters {
-                let resp: LLMResponse = self
-                    .llm
-                    .chat_with_tools(messages.clone(), self.tools.clone())
-                    .await?;
-                if let Some(tc) = resp.tool_call {
-                    let out = self.executor.execute(&tc.name, tc.arguments).await?;
-                    messages.push(Message {
-                        role: Role::Tool,
-                        content: out,
-                        tool_call_id: Some(tc.id),
-                    });
-                    continue;
-                }
-                // 无工具调用 → LLM 已给出最终结果
-                return Ok(resp.content.trim().to_string());
-            }
-            Err(Error::Expert(
-                "L3 降级工具编排达到迭代上限，仍未完成目标".into(),
-            ))
-        })
-    }
-}
-
 /// 按顺序执行计划，并为每个步骤应用 L1 → L2 → L3 自适应策略。
 ///
 /// # 参数
@@ -183,7 +101,8 @@ impl StepFallback for LlmToolFallback {
 ///   - 第 1 次调用传入原始输入；后续重试会在输入末尾追加"上一次失败反馈"
 ///
 /// # 返回
-/// - 汇总后的执行结果 markdown（含降级/重试标记）
+/// - `PlanExecution`：汇总后的执行结果 + 步骤成败统计
+///   （上层据 `has_failed_steps()` 判定「任一步骤失败 → 整体失败」）
 pub async fn execute_plan_adaptive<F, Fut>(
     expert_name: &str,
     plan: &SkillPlan,
@@ -191,7 +110,7 @@ pub async fn execute_plan_adaptive<F, Fut>(
     fallback: &dyn StepFallback,
     mut on_progress: impl FnMut(&str),
     mut run_step: F,
-) -> Result<String>
+) -> Result<PlanExecution>
 where
     F: FnMut(&str, &str, &str) -> Fut,
     Fut: std::future::Future<Output = Result<String>>,
@@ -206,6 +125,7 @@ where
 
     let mut results: Vec<String> = Vec::new();
     let mut prev_output: Option<String> = None;
+    let mut succeeded_steps: usize = 0;
 
     for (idx, step) in plan.steps.iter().enumerate() {
         let step_num = idx + 1;
@@ -220,6 +140,8 @@ where
         let mut failures: Vec<String> = Vec::new();
         let mut final_output: Option<String> = None;
         let mut last_err: Option<String> = None;
+        // 是否因「前置条件未满足」而提前结束重试（用于进度文案）
+        let mut precondition_skipped = false;
 
         for attempt in 0..=options.max_retry {
             let run_input = if failures.is_empty() {
@@ -246,26 +168,45 @@ where
                     break;
                 }
                 Err(e) => {
+                    // 前置条件未满足（如未配置「项目工作目录」）：失败是确定性的，
+                    // 回喂反馈再试多少次都会同样失败 → 立即短路到 L3 降级，
+                    // 省去无意义的重试等待（实测可省下数十秒）。
+                    let precondition = matches!(e, crate::Error::Precondition(_));
                     failures.push(e.to_string());
                     last_err = Some(e.to_string());
+                    if precondition {
+                        precondition_skipped = true;
+                        break;
+                    }
                 }
             }
         }
 
         // ── L2 耗尽 → L3 降级 ──
+        //
+        // 前置条件类失败（缺必需配置 / 端口未注入）是**确定性**的：L3 降级同样缺前提，
+        // 跑下去只是白等一轮 LLM 工具编排（实测约 10s/步）却完不成任务。
+        // 故直接跳过 L3，把可操作的前置提示作为该步失败原因返回。
         if final_output.is_none() && !failures.is_empty() {
-            on_progress(&format!(
-                "⚠️ 步骤 {}/{} 技能执行失败 {} 次，降级为 LLM 按工具临时编排...",
-                step_num,
-                total_steps,
-                failures.len()
-            ));
-            match fallback.execute(step, &failures).await {
-                Ok(out) => {
-                    final_output = Some(out);
-                }
-                Err(e) => {
-                    last_err = Some(e.to_string());
+            if precondition_skipped {
+                on_progress(&format!(
+                    "⏭️ 步骤 {}/{} 前置条件未满足，跳过降级（缺少必需配置，降级同样无法完成）",
+                    step_num, total_steps
+                ));
+            } else {
+                on_progress(&format!(
+                    "⚠️ 步骤 {}/{} 技能执行失败 {} 次，降级为 LLM 按工具临时编排...",
+                    step_num,
+                    total_steps,
+                    failures.len()
+                ));
+                match fallback.execute(step, &failures).await {
+                    Ok(out) => {
+                        final_output = Some(out);
+                    }
+                    Err(e) => {
+                        last_err = Some(e.to_string());
+                    }
                 }
             }
         }
@@ -282,6 +223,7 @@ where
                     step_num, step.description, output
                 ));
                 prev_output = Some(output);
+                succeeded_steps += 1;
             }
             None => {
                 let err = last_err.unwrap_or_else(|| "未知错误".to_string());
@@ -298,12 +240,16 @@ where
         }
     }
 
-    Ok(format!(
-        "# {} 执行结果\n\n{}\n\n---\n共执行 {} 个步骤（自适应模式）",
-        expert_name,
-        results.join("\n\n---\n\n"),
-        total_steps
-    ))
+    Ok(PlanExecution {
+        output: format!(
+            "# {} 执行结果\n\n{}\n\n---\n共执行 {} 个步骤（自适应模式）",
+            expert_name,
+            results.join("\n\n---\n\n"),
+            total_steps
+        ),
+        total_steps,
+        succeeded_steps,
+    })
 }
 
 #[cfg(test)]
@@ -311,6 +257,7 @@ mod tests {
     use super::*;
     use crate::orchestrator::planner::PlanStep;
     use crate::orchestrator::SkillPlan;
+    use crate::Error;
     use std::sync::{Arc, Mutex};
 
     struct FakeFallback {
@@ -368,8 +315,9 @@ mod tests {
         .unwrap();
         assert_eq!(steps, 1);
         assert_eq!(*fallback.called.lock().unwrap(), 0);
-        assert!(result.contains("ok-output"));
-        assert!(!result.contains("降级"));
+        assert!(result.output.contains("ok-output"));
+        assert!(!result.output.contains("降级"));
+        assert!(!result.has_failed_steps());
     }
 
     #[allow(non_snake_case)]
@@ -423,7 +371,9 @@ mod tests {
         // 第二次输入应包含失败反馈
         let ins = inputs.lock().unwrap();
         assert!(ins[1].contains("第一次失败"));
-        assert!(result.contains("retry-ok"));
+        assert!(result.output.contains("retry-ok"));
+        // L2 重试成功 → 该步为成功步，无失败步骤
+        assert!(!result.has_failed_steps());
     }
 
     #[allow(non_snake_case)]
@@ -456,9 +406,12 @@ mod tests {
 
         assert_eq!(state, AdaptiveOptions::default().max_retry + 1);
         assert_eq!(*fallback.called.lock().unwrap(), 1, "应触发一次 L3");
-        assert!(result.contains("fallback-ok"), "降级结果应进入产物");
+        assert!(result.output.contains("fallback-ok"), "降级结果应进入产物");
         // 失败历史条数 = max_retry+1
-        assert!(result.contains("hist=3"));
+        assert!(result.output.contains("hist=3"));
+        // L3 降级成功也算该步成功 → 无失败步骤，不判整体失败
+        assert_eq!(result.succeeded_steps, 1);
+        assert!(!result.has_failed_steps());
     }
 
     #[allow(non_snake_case)]
@@ -503,9 +456,144 @@ mod tests {
 
         // 只有失败的第一个步骤触发降级（且降级也失败）
         assert_eq!(*fallback.called.lock().unwrap(), 1);
-        assert!(result.contains("[失败]"));
-        assert!(result.contains("后续步"));
-        assert!(result.contains("next-ok"), "后续步骤正常执行");
-        assert!(!result.contains("fallback-ok"));
+        assert!(result.output.contains("[失败]"));
+        assert!(result.output.contains("后续步"));
+        assert!(result.output.contains("next-ok"), "后续步骤正常执行");
+        assert!(!result.output.contains("fallback-ok"));
+        // 一败一成 → 严格口径下仍判整体失败（部分交付不改变整体成败）
+        assert_eq!(result.succeeded_steps, 1);
+        assert!(
+            result.has_failed_steps(),
+            "任一步骤失败即判整体失败（严格口径）"
+        );
+    }
+
+    #[allow(non_snake_case)]
+    #[tokio::test]
+    async fn Precondition_跳过L2与L3直接记为失败步骤() {
+        let plan = SkillPlan::new("Pre").add_step(PlanStep {
+            order: 1,
+            skill_id: "needs-config".into(),
+            description: "缺配置".into(),
+            params: "".into(),
+        });
+        let fallback = FakeFallback {
+            should_succeed: true,
+            called: Mutex::new(0),
+        };
+        let mut calls = 0usize;
+        let result = execute_plan_adaptive(
+            "测试",
+            &plan,
+            &AdaptiveOptions::default(), // max_retry=2 → 通常共尝试 3 次
+            &fallback,
+            |_| {},
+            |_, _, _| {
+                calls += 1;
+                async move { Err(Error::Precondition("未配置项目工作目录".into())) }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            calls, 1,
+            "前置条件未满足属确定性失败，应只尝试一次、不做 L2 反馈重试"
+        );
+        assert_eq!(
+            *fallback.called.lock().unwrap(),
+            0,
+            "前置条件类失败应跳过 L3 降级（降级同样缺前提，只会白等一轮 LLM）"
+        );
+        assert!(
+            result.output.contains("[失败]"),
+            "该步应被记为失败步骤: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("未配置项目工作目录"),
+            "失败原因应保留可操作的前置提示: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("fallback-ok"),
+            "不应出现 L3 降级产物: {}",
+            result.output
+        );
+        // 该步失败 → 整体失败（上层据此判 success=false / isError=true）
+        assert!(
+            result.has_failed_steps(),
+            "任一步骤失败必须被判定为整体失败"
+        );
+    }
+
+    #[allow(non_snake_case)]
+    #[tokio::test]
+    async fn 任一步骤失败_即判整体失败() {
+        // 产品规则（2026-09-13 定稿）：**任一步骤失败 → 整体失败**。
+        // 这是 L3 也失败（或前置条件短路）后的终态：产物如实汇总，
+        // 但 has_failed_steps() 必须为真，供上层把 success 判为 false。
+        // 取严的理由：与框架多专家路径 all_ok 同口径，且不随 planner 拆步粒度抖动。
+        let plan = SkillPlan::new("全败")
+            .add_step(PlanStep {
+                order: 1,
+                skill_id: "bad-a".into(),
+                description: "全败一".into(),
+                params: "".into(),
+            })
+            .add_step(PlanStep {
+                order: 2,
+                skill_id: "bad-b".into(),
+                description: "全败二".into(),
+                params: "".into(),
+            });
+        let fallback = FakeFallback {
+            should_succeed: false, // L3 降级同样失败
+            called: Mutex::new(0),
+        };
+        let result = execute_plan_adaptive(
+            "测试",
+            &plan,
+            &AdaptiveOptions::default(),
+            &fallback,
+            |_| {},
+            |_, _, _| async move { Err(Error::Expert("技能失败".into())) },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.total_steps, 2);
+        assert_eq!(result.succeeded_steps, 0);
+        assert_eq!(result.failed_steps(), 2);
+        assert!(
+            result.has_failed_steps(),
+            "所有步骤均失败必须被判定为整体失败: {:?}",
+            result
+        );
+        assert_eq!(*fallback.called.lock().unwrap(), 2, "两步都尝试过 L3 降级");
+    }
+
+    #[allow(non_snake_case)]
+    #[tokio::test]
+    async fn 空计划不算整体失败() {
+        // 0 步计划（planner 判无需执行技能）不算失败——「无事可做」不是「失败」
+        let plan = SkillPlan::new("空计划");
+        let fallback = FakeFallback {
+            should_succeed: false,
+            called: Mutex::new(0),
+        };
+        let result = execute_plan_adaptive(
+            "测试",
+            &plan,
+            &AdaptiveOptions::default(),
+            &fallback,
+            |_| {},
+            |_, _, _| async move { Ok("never".to_string()) },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.total_steps, 0);
+        assert!(!result.has_failed_steps());
     }
 }

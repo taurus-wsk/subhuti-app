@@ -85,33 +85,65 @@ pub fn sutra_db_path() -> String {
         .to_string()
 }
 
+/// 多轮会话库路径：`SUBHUTI_SESSION_SQLITE` > `<data_dir>/sessions.sqlite`
+pub fn session_db_path() -> String {
+    if let Ok(p) = std::env::var("SUBHUTI_SESSION_SQLITE") {
+        let p = p.trim();
+        if !p.is_empty() {
+            return p.to_string();
+        }
+    }
+    data_dir()
+        .join("sessions.sqlite")
+        .to_string_lossy()
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn default_dir_is_under_home() {
-        // 该断言依赖 HOME；极端环境（无 HOME）下退化为 ./data，跳过
-        if std::env::var("HOME").is_ok() {
-            let d = data_dir();
-            assert!(
-                d.ends_with(".subhuti/data"),
-                "默认数据目录应以 .subhuti/data 结尾，实际: {:?}",
-                d
-            );
+        // ⚠️ 这个测试**不能**假设环境变量未设置：开发机/CI 常常为了指向真实库
+        // 而 export SUBHUTI_DATA_DIR（实测一 export 就红）。按文档化的**优先级**
+        // 断言：有环境变量时它必须原样胜出，否则才回落到 ~/.subhuti/data。
+        match std::env::var(ENV_DATA_DIR) {
+            Ok(dir) if !dir.trim().is_empty() => {
+                assert_eq!(
+                    data_dir(),
+                    PathBuf::from(dir.trim()),
+                    "设置 SUBHUTI_DATA_DIR 时它必须优先于默认目录"
+                );
+            }
+            _ => {
+                // 该断言依赖 HOME；极端环境（无 HOME）下退化为 ./data，跳过
+                if std::env::var("HOME").is_ok() {
+                    let d = data_dir();
+                    assert!(
+                        d.ends_with(".subhuti/data"),
+                        "默认数据目录应以 .subhuti/data 结尾，实际: {:?}",
+                        d
+                    );
+                }
+            }
         }
     }
 
     #[test]
     fn derived_paths_are_absolute_and_under_data_dir() {
-        if std::env::var("HOME").is_err() {
+        if std::env::var("HOME").is_err() && std::env::var(ENV_DATA_DIR).is_err() {
             return;
         }
         let dir = data_dir();
         let trace = PathBuf::from(trace_db_path());
         let sutra = PathBuf::from(sutra_db_path());
-        assert!(trace.is_absolute(), "trace 路径应为绝对路径: {:?}", trace);
-        assert!(sutra.is_absolute(), "sutra 路径应为绝对路径: {:?}", sutra);
+        // 文档约定：SUBHUTI_DATA_DIR 是**相对路径**时原样返回，由调用方 canonicalize，
+        // 此时派生路径可能不是绝对路径 —— 只对绝对 data_dir 断言绝对性。
+        if dir.is_absolute() {
+            assert!(trace.is_absolute(), "trace 路径应为绝对路径: {:?}", trace);
+            assert!(sutra.is_absolute(), "sutra 路径应为绝对路径: {:?}", sutra);
+        }
         assert!(trace.starts_with(&dir));
         assert!(sutra.starts_with(&dir));
         assert_ne!(trace, sutra);

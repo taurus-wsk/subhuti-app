@@ -420,6 +420,10 @@ pub trait TraceObserverPort: Send + Sync + 'static {
     /// 记录一条细粒度 span（由 EventBridge 从框架事件转换后调用）
     fn record_span(&self, trace_id: &str, span: SpanData);
 
+    /// 汇总某次请求的真实 token 用量（对所有 LLM 调用 span 的 tokens 求和）。
+    /// 用于成本会计：取代此前硬编码的 0。
+    fn total_tokens(&self, trace_id: &str) -> u64;
+
     /// 记录一条函数调用追踪数据（由 FnTracer 调用）
     fn record_fn_call(&self, trace_id: &str, fn_call: FnCallData);
 

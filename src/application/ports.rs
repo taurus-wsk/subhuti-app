@@ -29,14 +29,15 @@ use crate::domain::dto::{
 pub enum StreamEvent {
     /// 流开始
     Start,
-    /// 思考步骤（路由专家、分析任务等）
-    Thought { message: String },
-    /// 计划步骤（选择图、制定执行计划）
-    Plan { message: String },
-    /// 执行步骤（专家执行、LLM 调用等）
+    /// 执行/阶段步骤（专家执行、LLM 调用、思考、计划、匹配等统一以带 phase 的 Step 透出，
+    /// 前端只认 step 阶段流，不再有独立的 thought/plan 双通道）。
+    /// phase 取值参考：analyze/route/plan/edit/verify/tool/retrieve/think/answer/run/done。
     Step {
         message: String,
-        expert: Option<String>,
+        /// 事件来源：框架级步骤为固定值 "框架"（analyze/run/done 等编排生命周期），
+        /// 专家级步骤为专家名（route/think/plan/edit/verify/tool/retrieve 等）。
+        /// 前端据此只渲染「来源」一列，不再区分 expert 字段。
+        source: String,
         /// 阶段标识（可选）：workflow 阶段（analyze/plan/edit/verify/fix/complete）
         /// 或框架阶段（think/plan/tool/retrieve/edit/verify/answer/done），
         /// 由专家/编排层透传，前端据此做分类渲染（如 WorkBuddy 的 think→plan→exe 阶段流）。
@@ -128,5 +129,6 @@ pub trait SkillPort: Sync + Send + 'static {
         args: &str,
         trace_id: &str,
         session_id: &str,
+        extra: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SkillResponse> + Send>>;
 }

@@ -668,6 +668,35 @@ impl PgStorage {
         Ok(())
     }
 
+    /// 获取全部节点（跨集合，供启动回灌使用）
+    pub async fn list_all_nodes(&self) -> Result<Vec<MemoryNode>> {
+        let rows = sqlx::query_as::<_, MemoryNode>("SELECT * FROM memory_nodes")
+            .fetch_all(&*self.pool)
+            .await?;
+        Ok(rows)
+    }
+
+    /// 获取全部集合（供启动回灌使用）
+    pub async fn list_all_collections(&self) -> Result<Vec<Collection>> {
+        use sqlx::Row;
+        let rows = sqlx::query(
+            "SELECT collection_id, name, domain, description, created_at FROM memory_collections",
+        )
+        .fetch_all(&*self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            out.push(Collection {
+                collection_id: r.try_get("collection_id")?,
+                name: r.try_get("name")?,
+                domain: r.try_get("domain")?,
+                description: r.try_get("description")?,
+                created_at: r.try_get("created_at")?,
+            });
+        }
+        Ok(out)
+    }
+
     // ─── 知识库 CRUD ───────────────────────────────────────────
 
     /// 获取所有知识库
@@ -989,7 +1018,8 @@ impl PgGraphStorage {
 
         for (from, to, kind_str, weight) in edge_rows {
             let kind = match kind_str.as_str() {
-                "Manual" => super::recall::EdgeKind::Manual,
+                // 兼容历史脏数据：早期写入端曾用小写 "manual"
+                "Manual" | "manual" => super::recall::EdgeKind::Manual,
                 _ => super::recall::EdgeKind::Learned,
             };
             adj.entry(from.clone())
@@ -1037,6 +1067,8 @@ impl PgGraphStorage {
 
     /// 写入边
     pub async fn write_edge(&self, from: &str, to: &str, kind: &str, weight: f32) -> Result<()> {
+        // 无向图：端点排序后再落盘，(A,B) 与 (B,A) 共用一行（与 SQLite 后端同口径）
+        let (from, to) = super::persistence::normalize_edge_endpoints(from, to);
         sqlx::query(
             r#"
             INSERT INTO graph_edges (from_entity, to_entity, edge_kind, weight)
@@ -1056,6 +1088,7 @@ impl PgGraphStorage {
 
     /// 删除边
     pub async fn delete_edge(&self, from: &str, to: &str, kind: &str) -> Result<()> {
+        let (from, to) = super::persistence::normalize_edge_endpoints(from, to);
         sqlx::query(
             "DELETE FROM graph_edges WHERE from_entity=$1 AND to_entity=$2 AND edge_kind=$3",
         )

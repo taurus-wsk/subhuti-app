@@ -318,3 +318,40 @@ inventory::submit! {
         register: |r| r.route("/subhuti/api/v1/chunks/:id", delete(delete_chunk_handler)),
     }
 }
+
+// ─── 藏经阁可观测性 ──────────────────────────────────────────
+
+/// GET /subhuti/api/v1/sutra/stats — 藏经阁记忆引擎统计
+///
+/// 把"记忆到底有没有真的沉淀下来"变成可随时查验的数字，
+/// 不需要翻 SQLite。包含节点数、冷热分布、集合数，以及
+/// 检索命中率等反馈指标（供判断闭环是否真的在转）。
+async fn sutra_stats_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let sutra = match state.sutra_library.as_ref() {
+        Some(s) => s,
+        None => return err_response(axum::http::StatusCode::SERVICE_UNAVAILABLE, "藏经阁未装配"),
+    };
+
+    let mut stats = sutra.stats_json();
+    if let Some(obj) = stats.as_object_mut() {
+        obj.insert(
+            "backend".to_string(),
+            serde_json::json!(if state.pg_storage.is_some() {
+                "pg-or-sqlite"
+            } else {
+                "none"
+            }),
+        );
+        obj.insert("text".to_string(), serde_json::json!(sutra.stats()));
+    }
+    ok_response(stats)
+}
+
+inventory::submit! {
+    RouteEntry {
+        path: "/subhuti/api/v1/sutra/stats",
+        method: "GET",
+        trace_enabled: false,
+        register: |r| r.route("/subhuti/api/v1/sutra/stats", get(sutra_stats_handler)),
+    }
+}

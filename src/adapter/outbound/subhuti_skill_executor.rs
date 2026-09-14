@@ -48,12 +48,14 @@ impl SkillExecutionPort for SubhutiSkillExecutor {
         args: &str,
         trace_id: &str,
         session_id: &str,
+        extra: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SkillResponse> + Send>> {
         let subhuti = self.subhuti.clone();
         let skill_id = skill_id.to_string();
         let args = args.to_string();
         let trace_id = trace_id.to_string();
         let session_id = session_id.to_string();
+        let extra = extra.to_string();
 
         Box::pin(async move {
             // 使用新增的门面方法 find_agent_by_skill：一次查找，直接拿到 (expert_id, Arc<Agent>)
@@ -71,6 +73,21 @@ impl SkillExecutionPort for SubhutiSkillExecutor {
                     }
                     if !session_id.is_empty() {
                         ctx.set_metadata("session_id", &session_id);
+                    }
+                    // 摊平 extra（任意扩展参数）进 metadata：workspace_folder 等配置都从这里取，
+                    // 与 orchestrate 主路径统一（domain_expert_adapter 从 metadata 读取 workspace_folder）
+                    if let Ok(extra_val) = serde_json::from_str::<serde_json::Value>(&extra) {
+                        if let Some(obj) = extra_val.as_object() {
+                            for (k, v) in obj {
+                                let val = match v {
+                                    serde_json::Value::String(s) => s.clone(),
+                                    other => other.to_string(),
+                                };
+                                if !val.is_empty() {
+                                    ctx.set_metadata(k, &val);
+                                }
+                            }
+                        }
                     }
 
                     // 使用自定义上下文执行编排（会经过 Orchestrator 找到对应专家并调用 run）

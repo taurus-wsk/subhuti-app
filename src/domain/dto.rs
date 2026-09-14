@@ -16,16 +16,16 @@ pub struct OrchestrateRequest {
     pub user_id: Option<String>,
     pub session_id: Option<String>,
     pub chain: Option<String>,
-    /// 指定要使用的图名称（为空时自动匹配）
-    pub graph: Option<String>,
-    /// 指定要使用的专家 ID（优先级高于 graph，直接路由到该专家）
+    /// 指定要使用的专家 ID（优先级最高，直接路由到该专家）
     pub expert_id: Option<String>,
     /// 追踪 ID（TraceAppService 装饰器生成并注入，一路透传到框架 ctx.metadata）
     pub trace_id: Option<String>,
-    /// 项目工作目录路径（前端聊天设置传入，透传给专家）
-    pub workspace_folder: Option<String>,
     /// 自定义系统提示词（前端聊天设置传入，覆盖专家默认 system prompt）
     pub system_prompt: Option<String>,
+    /// 任意扩展参数（JSON 对象）。workspace_folder 等配置都从这里传入，
+    /// 出站层会把对象内的键值对摊平进框架 ctx.metadata，领域专家按需读取。
+    /// 用 JSON 而非固定字段，是为了以后传什么配置都可以、无需改请求结构。
+    pub extra: Option<serde_json::Value>,
 }
 
 /// 调度响应（领域 DTO）

@@ -41,7 +41,7 @@ const TTL: Duration = Duration::from_secs(60);
 ///
 /// 返回用户的选择文本；超时未回答返回空字符串。
 pub async fn ask_user(
-    progress_tx: &Option<mpsc::Sender<String>>,
+    progress_tx: &Option<crate::domain::traits::ProgressTx>,
     question: &str,
     options: Vec<String>,
 ) -> String {
@@ -50,16 +50,7 @@ pub async fn ask_user(
     map().lock().unwrap().insert(ask_id.clone(), tx);
 
     // 推送 Ask 事件（前端据此渲染提问卡片）
-    let evt = serde_json::json!({
-        "type": "ask",
-        "ask_id": ask_id,
-        "question": question,
-        "options": options,
-    })
-    .to_string();
-    if let Some(sender) = progress_tx {
-        let _ = sender.try_send(evt);
-    }
+    crate::domain::traits::emit_ask(progress_tx, &ask_id, question, &options);
 
     // 阻塞等待回答（带超时）
     let answer = match tokio::time::timeout(TTL, rx.recv()).await {
@@ -95,8 +86,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ask_and_resolve_roundtrip() {
-        let (tx, mut rx) = mpsc::channel::<String>(8);
-        // 注册进去，等待回答
+        let (tx, mut rx) = mpsc::channel::<subhuti_core::progress::ProgressEvent>(8);
         let ask = tokio::spawn(async move {
             ask_user(
                 &Some(tx),
@@ -105,14 +95,20 @@ mod tests {
             )
             .await
         });
-        // 等待 Ask 事件 + 拿 ask_id
-        let evt_json = rx.recv().await.unwrap();
-        let v: serde_json::Value = serde_json::from_str(&evt_json).unwrap();
-        assert_eq!(v["type"], "ask");
-        let ask_id = v["ask_id"].as_str().unwrap();
-        assert_eq!(pending_count(), 1);
-        // 投递回答
-        assert!(resolve(ask_id, "Rust".to_string()));
+        let evt = rx.recv().await.unwrap();
+        match evt {
+            subhuti_core::progress::ProgressEvent::Ask {
+                ask_id,
+                question,
+                options,
+            } => {
+                assert_eq!(question, "选择语言?");
+                assert_eq!(options, vec!["Rust".to_string(), "Go".to_string()]);
+                assert_eq!(pending_count(), 1);
+                assert!(resolve(&ask_id, "Rust".to_string()));
+            }
+            _ => panic!("应为 Ask 事件"),
+        }
         let answer = ask.await.unwrap();
         assert_eq!(answer, "Rust");
         assert_eq!(pending_count(), 0);

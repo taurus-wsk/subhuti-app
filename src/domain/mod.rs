@@ -6,6 +6,8 @@
 //!
 //! - `experts/` - 领域专家（演员），实现 `DomainExpert` trait
 //! - `traits/` - 领域接口定义（`DomainExpert`、`DomainLlm`、`DomainSkill`）
+//! - `session_context.rs` - **框架级会话上下文**（`SessionContext`）：跨专家共享的会话记忆，
+//!   专家执行后记忆回流到此，供编排层、其他专家、查询接口、藏经阁沉淀消费
 //!
 //! ## 与框架核心的关系
 //!
@@ -26,8 +28,13 @@
 //! - **可提取性**：领域代码可整体提取为独立 crate，编译为 WASM 插件
 //!
 pub mod dto;
+pub mod events;
 pub mod experts;
 pub mod pending_ask;
 pub mod ports;
+pub mod session_context;
 pub mod tool_fallback;
 pub mod traits;
+
+/// 可观测性端口/事件：领域层自有的「事件发布」抽象，取代直接依赖框架 EventBus。
+pub use events::{DomainEvent, DomainEventPublisher};

@@ -6,21 +6,18 @@
 use std::sync::Arc;
 
 use crate::event::EventBus;
-use crate::memory::Memory;
 use crate::orchestrator::{
-    Actor, AgentContext, DispatchRule, ExecutionRule, ExpertAgent, ExpertState,
-    FrameworkExpertInfo, OrchestrationResult, Orchestrator, TaskAnalysisRule,
+    Actor, AgentContext, ExpertAgent, ExpertState, FrameworkExpertInfo, OrchestrationResult,
+    Orchestrator, TaskAnalysisRule,
 };
 use crate::runtime::LLM;
 use crate::sutra_library::SutraLibraryPort;
-use crate::vertical::{AssetLibrary, ProjectMemory, ToolRegistry, WorkflowStore};
 
 /// Subhuti 引擎调度器
 ///
 /// 所有字段使用 `Arc<dyn Trait>` 避免具体 infra 依赖。
 /// 构造时由调用方（组合根）注入具体实现。
 pub struct Subhuti {
-    memory: Arc<dyn Memory>,
     event_bus: Arc<EventBus>,
     /// 编排器（**无锁**）
     ///
@@ -31,10 +28,6 @@ pub struct Subhuti {
     /// 细粒度 `RwLock`，读多写少，注册与配置走写锁、编排执行走读锁，
     /// 因此这里不再需要任何外层锁，多个请求可真正并发执行。
     orchestrator: Orchestrator,
-    asset_library: Arc<dyn AssetLibrary>,
-    project_memory: Arc<dyn ProjectMemory>,
-    tool_registry: Arc<dyn ToolRegistry>,
-    workflow_store: Arc<dyn WorkflowStore>,
     llm: Option<Arc<dyn LLM>>,
     sutra_library: std::sync::RwLock<Option<Arc<dyn SutraLibraryPort>>>,
     /// Session 存储：根据 session_id 持久化会话历史
@@ -46,26 +39,13 @@ pub struct Subhuti {
 impl Subhuti {
     /// 创建引擎实例
     ///
-    /// 调用方需提供所有 `Arc<dyn Trait>` 依赖。
-    /// LLM 可后续通过 `set_llm()` 注入。
-    pub fn new(
-        memory: Arc<dyn Memory>,
-        event_bus: Arc<EventBus>,
-        asset_library: Arc<dyn AssetLibrary>,
-        project_memory: Arc<dyn ProjectMemory>,
-        tool_registry: Arc<dyn ToolRegistry>,
-        workflow_store: Arc<dyn WorkflowStore>,
-    ) -> Self {
+    /// 只需注入 `EventBus`；LLM / 藏经阁由 `set_llm()` / `set_sutra_library()` 后续注入。
+    pub fn new(event_bus: Arc<EventBus>) -> Self {
         let mut orchestrator = Orchestrator::new();
         orchestrator = orchestrator.with_event_bus(event_bus.clone());
         Self {
-            memory,
             event_bus,
             orchestrator,
-            asset_library,
-            project_memory,
-            tool_registry,
-            workflow_store,
             llm: None,
             sutra_library: std::sync::RwLock::new(None),
             sessions: std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -153,12 +133,7 @@ impl Subhuti {
 
     /// 构建共享 ExpertState（供图节点等使用）
     pub fn build_expert_state(&self) -> ExpertState {
-        let mut builder = ExpertState::builder(self.memory.clone())
-            .event_bus(self.event_bus.clone())
-            .asset_library(self.asset_library.clone())
-            .project_memory(self.project_memory.clone())
-            .tool_registry(self.tool_registry.clone())
-            .workflow_store(self.workflow_store.clone());
+        let mut builder = ExpertState::builder().event_bus(self.event_bus.clone());
         if let Some(ref llm) = self.llm {
             builder = builder.llm(llm.clone());
         }
@@ -174,67 +149,36 @@ impl Subhuti {
         self.orchestrator.set_analysis_rule(rule);
     }
 
-    pub async fn set_dispatch_rule(&self, rule: Arc<dyn DispatchRule>) {
-        self.orchestrator.set_dispatch_rule(rule);
-    }
-
-    pub async fn set_execution_rule(&self, rule: Arc<dyn ExecutionRule>) {
-        self.orchestrator.set_execution_rule(rule);
-    }
-
     // ─── 任务分析 & 专家匹配 ─────────────────────────────────────
 
-    /// 任务分析
+    /// 任务分析（与 dispatch 同源的标签打分派生，零 LLM）
     pub async fn analyze_task(&self, message: &str) -> serde_json::Value {
-        match self.orchestrator.rule_engine().analyze_task(message) {
-            Ok(profile) => {
-                tracing::info!(
-                    "[Subhuti·analyze_task] domain_tags={:?}, task_type={}",
-                    profile.domain_tags,
-                    profile.task_type
-                );
-                serde_json::to_value(profile)
-                    .unwrap_or_else(|_| serde_json::json!({ "error": "TaskProfile 序列化失败" }))
-            }
-            Err(e) => {
-                tracing::warn!("[Subhuti·analyze_task] 分析失败: {}", e);
-                serde_json::json!({ "error": e.to_string(), "input": message })
-            }
-        }
+        let profile = self.orchestrator.analyze_task(message);
+        tracing::info!(
+            "[Subhuti·analyze_task] domain_tags={:?}, task_type={}",
+            profile.domain_tags,
+            profile.task_type
+        );
+        serde_json::to_value(profile)
+            .unwrap_or_else(|_| serde_json::json!({ "error": "TaskProfile 序列化失败" }))
     }
 
-    /// 专家匹配
+    /// 专家匹配（与 dispatch 主链路同源的标签打分，预览 = 实际路由）
     pub async fn match_expert(&self, input: &str) -> Vec<FrameworkExpertInfo> {
-        let orchestrator = &self.orchestrator;
-        let profile = match orchestrator.rule_engine().analyze_task(input) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("[Subhuti·match_expert] analyze_task 失败: {}", e);
-                return Vec::new();
-            }
-        };
-        let agents = orchestrator.list_experts();
-        let plan = match orchestrator
-            .rule_engine()
-            .decide_strategy(&profile, &agents)
-        {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("[Subhuti·match_expert] decide_strategy 失败: {}", e);
-                return Vec::new();
-            }
-        };
-        let snapshots = orchestrator.list_expert_snapshots();
-        let matched: Vec<FrameworkExpertInfo> = plan
-            .steps
+        let matched_ids: Vec<String> = self
+            .orchestrator
+            .match_experts(input)
             .iter()
-            .filter_map(|step| snapshots.iter().find(|s| s.id == step.agent_id).cloned())
+            .map(|a| a.id().to_string())
+            .collect();
+        let snapshots = self.orchestrator.list_expert_snapshots();
+        let matched: Vec<FrameworkExpertInfo> = matched_ids
+            .iter()
+            .filter_map(|id| snapshots.iter().find(|s| &s.id == id).cloned())
             .collect();
         tracing::info!(
-            "[Subhuti·match_expert] input={:?}, domain_tags={:?}, strategy={:?}, matched={:?}",
+            "[Subhuti·match_expert] input={:?}, matched={:?}",
             input,
-            profile.domain_tags,
-            plan.strategy,
             matched.iter().map(|m| m.id.clone()).collect::<Vec<_>>()
         );
         matched

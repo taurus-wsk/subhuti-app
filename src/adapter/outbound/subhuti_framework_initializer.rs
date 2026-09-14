@@ -13,26 +13,21 @@ use std::sync::Mutex;
 
 use subhuti_core::engine::Subhuti;
 use subhuti_core::event::EventBus;
-use subhuti_core::memory::Memory;
 use subhuti_core::sutra_library::SutraLibraryPort;
-use subhuti_core::vertical::{AssetLibrary, ProjectMemory, ToolRegistry, WorkflowStore};
 use subhuti_core::LLMConfig;
 use subhuti_core::LLMProvider;
 use subhuti_infra::sutra_library::create_sutra_engine;
-use subhuti_infra::vertical::{
-    MemoryAssetLibrary, MemoryProjectMemory, MemoryToolRegistry, MemoryWorkflowStore,
-};
 use subhuti_infra::CachedLLM;
 use subhuti_infra::{
     ContextLimitLLM, DoubaoClient, DoubaoConfig, LimitConfig, MockLLM, OllamaClient, OllamaConfig,
     OpenAIClient, OpenAIConfig, RetryConfig, RetryLLM, ZhipuClient, ZhipuConfig,
 };
 
-use crate::adapter::outbound::rules;
 use crate::adapter::outbound::subhuti_expert_repository::SubhutiExpertRepository;
 use crate::adapter::outbound::subhuti_orchestration_engine::SubhutiOrchestrationEngine;
 use crate::adapter::outbound::subhuti_skill_executor::SubhutiSkillExecutor;
 use crate::application::observer::{record_fn_log, LogLevel, TraceObserverPort};
+use crate::application::session_manager::SessionManager;
 use crate::domain::ports::CommandPort;
 use crate::domain::ports::FileSystemPort;
 use crate::domain::ports::ToolchainPort;
@@ -48,6 +43,14 @@ pub struct AppAdapters {
     pub expert_repository: Arc<dyn ExpertRepositoryPort>,
     pub orchestration_engine: Arc<dyn OrchestrationEnginePort>,
     pub skill_executor: Arc<dyn SkillExecutionPort>,
+    /// 框架事件总线（供 OrchestrationService 在每次请求时 per-request 订阅进度桥）
+    pub event_bus: Option<Arc<EventBus>>,
+    /// 藏经阁记忆引擎（供 OrchestrationService 在会话结束时沉淀记忆）
+    pub sutra_library: Option<Arc<dyn SutraLibraryPort>>,
+    /// LLM（供记忆沉淀时提炼事实；与注入框架的同一实例）
+    pub llm: Option<Arc<dyn subhuti_core::LLM>>,
+    /// 藏经阁引擎具体类型（供取持久化后端）
+    pub sutra_engine: Option<Arc<subhuti_infra::sutra_library::engine::MemoryEnginePort>>,
 }
 
 /// Subhuti 框架初始化器
@@ -58,6 +61,17 @@ pub struct SubhutiFrameworkInitializer {
     subhuti: Arc<Subhuti>,
     app_config: Arc<AppConfig>,
     trace_observer: Mutex<Option<Arc<dyn TraceObserverPort>>>,
+    /// 框架级会话上下文管理者（可选）：装配后领域专家读写的是框架共享上下文
+    /// （历史注入 + 专家记忆回流）
+    session_manager: Mutex<Option<Arc<SessionManager>>>,
+    /// 藏经阁引擎句柄：编排层会话结束沉淀要用，这里留一份引用
+    /// （框架内部也持有同一 Arc，两处是同一个实例）
+    sutra_library: Mutex<Option<Arc<dyn SutraLibraryPort>>>,
+    /// LLM 句柄：沉淀前用 LLM 从对话里提炼值得长期记住的事实
+    llm: Mutex<Option<Arc<dyn subhuti_core::LLM>>>,
+    /// 藏经阁引擎的**具体类型**句柄：知识库 CRUD 等场景要直接拿它的持久化后端，
+    /// trait 对象（`dyn SutraLibraryPort`）拿不到。
+    sutra_engine: Mutex<Option<Arc<subhuti_infra::sutra_library::engine::MemoryEnginePort>>>,
 }
 
 impl SubhutiFrameworkInitializer {
@@ -73,6 +87,13 @@ impl SubhutiFrameworkInitializer {
             _ => (LLMProvider::Zhipu, std::env::var("ZHIPU_API_KEY").ok()),
         };
 
+        // 沉淀链路需要复用同一批句柄，先建好槽位，装配完成后回填
+        let llm_slot: Mutex<Option<Arc<dyn subhuti_core::LLM>>> = Mutex::new(None);
+        let sutra_slot: Mutex<Option<Arc<dyn SutraLibraryPort>>> = Mutex::new(None);
+        let engine_slot: Mutex<
+            Option<Arc<subhuti_infra::sutra_library::engine::MemoryEnginePort>>,
+        > = Mutex::new(None);
+
         // 构建 Subhuti 配置
         let subhuti_llm_config = LLMConfig {
             model: app_config.llm.model.clone(),
@@ -82,21 +103,9 @@ impl SubhutiFrameworkInitializer {
             max_tokens: app_config.llm.max_tokens,
         };
 
-        let memory: Arc<dyn Memory> = Arc::new(subhuti_infra::memory::Memory::new());
         let event_bus = Arc::new(EventBus::new(1024));
-        let asset_library: Arc<dyn AssetLibrary> = MemoryAssetLibrary::arc();
-        let project_memory: Arc<dyn ProjectMemory> = MemoryProjectMemory::arc();
-        let tool_registry: Arc<dyn ToolRegistry> = MemoryToolRegistry::arc();
-        let workflow_store: Arc<dyn WorkflowStore> = MemoryWorkflowStore::arc();
 
-        let mut subhuti = Subhuti::new(
-            memory,
-            event_bus.clone(),
-            asset_library,
-            project_memory,
-            tool_registry,
-            workflow_store,
-        );
+        let mut subhuti = Subhuti::new(event_bus.clone());
 
         // 事件总线内置处理器（日志 / Trace 事件）在 init() 的异步上下文中 await 注册；
         // 此处为同步构造函数，不能 await，故不在此调用（否则 future 被立即丢弃，处理器永不注册）。
@@ -268,17 +277,33 @@ impl SubhutiFrameworkInitializer {
                 llm_client
             };
 
-            subhuti.set_llm(llm_to_inject);
+            subhuti.set_llm(llm_to_inject.clone());
+            // 留一份给编排层（记忆沉淀要复用同一个 LLM 实例）
+            *llm_slot.lock().unwrap() = Some(llm_to_inject);
         }
 
-        // ── 初始化藏经阁引擎（内存版，PG 初始化在 CompositionRoot 中完成） ──
-        let (_sutra_engine, _sutra_skill) = create_sutra_engine(None);
-        subhuti.set_sutra_library(_sutra_engine as Arc<dyn SutraLibraryPort>);
+        // ── 初始化藏经阁引擎（SQLite 降级版；有 PG 时由 CompositionRoot 重建） ──
+        let (sutra_engine, _sutra_skill) = create_sutra_engine(None);
+        *engine_slot.lock().unwrap() = Some(sutra_engine.clone());
+        let sutra_engine = sutra_engine as Arc<dyn SutraLibraryPort>;
+        subhuti.set_sutra_library(sutra_engine.clone());
+        *sutra_slot.lock().unwrap() = Some(sutra_engine);
 
         Self {
             subhuti: Arc::new(subhuti),
             app_config,
             trace_observer: Mutex::new(None),
+            session_manager: Mutex::new(None),
+            sutra_library: sutra_slot,
+            llm: llm_slot,
+            sutra_engine: engine_slot,
+        }
+    }
+
+    /// 装配框架级会话上下文管理者（**必须在注册专家前调用**，否则适配器拿不到）
+    pub fn set_session_manager(&self, manager: Arc<SessionManager>) {
+        if let Ok(mut slot) = self.session_manager.lock() {
+            *slot = Some(manager);
         }
     }
 
@@ -295,8 +320,11 @@ impl SubhutiFrameworkInitializer {
         }
         // 重建带 PG 的引擎
         let (sutra_engine, _sutra_skill) = create_sutra_engine(Some((*pool).clone()));
-        self.subhuti
-            .set_sutra_library(sutra_engine as Arc<dyn SutraLibraryPort>);
+        *self.sutra_engine.lock().unwrap() = Some(sutra_engine.clone());
+        let sutra_engine = sutra_engine as Arc<dyn SutraLibraryPort>;
+        self.subhuti.set_sutra_library(sutra_engine.clone());
+        // 同步更新编排层持有的句柄，否则沉淀仍打到无 PG 的旧引擎上
+        *self.sutra_library.lock().unwrap() = Some(sutra_engine);
     }
 
     /// 设置 trace_observer（用于函数调用链路追踪）
@@ -366,16 +394,24 @@ impl SubhutiFrameworkInitializer {
         let event_bus = self.subhuti.event_bus().clone();
         let adapter: Arc<
             crate::adapter::outbound::domain_expert_adapter::DomainExpertAdapter<dyn DomainExpert>,
-        > = Arc::new(
-            crate::adapter::outbound::domain_expert_adapter::DomainExpertAdapter::new(
+        > = {
+            let base = crate::adapter::outbound::domain_expert_adapter::DomainExpertAdapter::new(
                 expert,
                 repository,
                 toolchain,
                 file_system,
                 command,
                 Some(event_bus),
-            ),
-        );
+            );
+            // 注入框架级会话上下文管理者（若已装配）：专家据此读历史 + 回流记忆
+            match self.session_manager.lock() {
+                Ok(slot) => match slot.as_ref() {
+                    Some(manager) => Arc::new(base.with_session_manager(manager.clone())),
+                    None => Arc::new(base),
+                },
+                Err(_) => Arc::new(base),
+            }
+        };
 
         // 注册到框架的 Orchestrator（作为 ExpertAgent）
         subhuti.register_orchestrator_expert(adapter.clone()).await;
@@ -388,51 +424,6 @@ impl SubhutiFrameworkInitializer {
             "",
             LogLevel::Info,
             format!("注册领域专家: {}", expert_name),
-            None,
-        );
-    }
-
-    /// 设置任务分析规则
-    pub async fn set_analysis_rule(&self) {
-        let subhuti = self.subhuti.clone();
-        let rules = rules::create_all_rules();
-
-        subhuti.set_analysis_rule(rules.analysis_rule).await;
-        record_fn_log(
-            None,
-            "",
-            LogLevel::Info,
-            "注册领域规则: analysis=default",
-            None,
-        );
-    }
-
-    /// 设置调度规则
-    pub async fn set_dispatch_rule(&self) {
-        let subhuti = self.subhuti.clone();
-        let rules = rules::create_all_rules();
-
-        subhuti.set_dispatch_rule(rules.dispatch_rule).await;
-        record_fn_log(
-            None,
-            "",
-            LogLevel::Info,
-            "注册领域规则: dispatch=default",
-            None,
-        );
-    }
-
-    /// 设置执行规则
-    pub async fn set_execution_rule(&self) {
-        let subhuti = self.subhuti.clone();
-        let rules = rules::create_all_rules();
-
-        subhuti.set_execution_rule(rules.execution_rule).await;
-        record_fn_log(
-            None,
-            "",
-            LogLevel::Info,
-            "注册领域规则: execution=default",
             None,
         );
     }
@@ -450,6 +441,10 @@ impl SubhutiFrameworkInitializer {
             expert_repository: Arc::new(SubhutiExpertRepository::new(self.subhuti.clone())),
             orchestration_engine: Arc::new(engine),
             skill_executor: Arc::new(SubhutiSkillExecutor::new(self.subhuti.clone())),
+            event_bus: Some(self.subhuti.event_bus().clone()),
+            sutra_library: self.sutra_library.lock().unwrap().clone(),
+            llm: self.llm.lock().unwrap().clone(),
+            sutra_engine: self.sutra_engine.lock().unwrap().clone(),
         }
     }
 }

@@ -16,7 +16,7 @@ pub mod rule_engine;
 //
 // 为什么不是引擎？
 //   - 引擎（Engine）是执行器，直接做具体工作
-//   - Graph 和 RuleEngine 才是真正的执行引擎
+//   - 具体执行下沉在各专家内部（Workflow 已由专家自选执行路径）
 //
 // 编排者的职责（命运编织者）：
 //   - 接到主题（用户问题）后，决定走哪条命运之路
@@ -52,23 +52,17 @@ use std::sync::{Arc, RwLock};
 
 pub use self::actor::{Actor, ActorRegistry, ExpertAgentActorAdapter};
 pub use self::planner::{
-    execute_plan, generate_expert_plan, generate_plan, parse_plan, parse_plan_or_ask, AskRequest,
-    PlanOrAsk, PlanStep, SkillPlan,
+    execute_plan, generate_expert_plan, generate_plan, is_placeholder_step, parse_plan,
+    parse_plan_or_ask, strip_placeholder_steps, AskRequest, PlanExecution, PlanOrAsk, PlanStep,
+    SkillPlan,
 };
 use crate::event::{AgentEventData, EventBus};
-use crate::memory::Memory;
 use crate::runtime::llm::{Role, LLM};
 use crate::runtime::session::Session;
 use crate::sutra_library::SutraLibraryPort;
-use crate::vertical::{AssetLibrary, ProjectMemory, ToolRegistry, WorkflowStore};
-pub use adaptive::{
-    execute_plan_adaptive, AdaptiveOptions, BoxFuture, LlmToolFallback, StepFallback, ToolExecutor,
-};
-pub use rule_engine::{
-    DefaultDispatchRule, DefaultExecutionRule, DefaultTaskAnalysisRule, DispatchPlan, DispatchRule,
-    DispatchStrategy, ExecutionResult, ExecutionRule, ResultStrategy, RuleConfig, RuleEngine, Step,
-    TaskAnalysisRule, TaskProfile,
-};
+pub use adaptive::{execute_plan_adaptive, AdaptiveOptions, BoxFuture, StepFallback, ToolExecutor};
+use rule_engine::{classify_task_type, extract_spo};
+pub use rule_engine::{TaskAnalysisRule, TaskProfile};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct OrchestrationResult {
@@ -94,6 +88,12 @@ pub struct AgentContext {
     pub ctx_id: String,
     pub session: Session,
     pub metadata: HashMap<String, String>,
+    /// 本请求专属的进度事件通道（per-request，不经过任何全局注册表）。
+    ///
+    /// 由 `OrchestrationEngine`（应用层）在每次编排前注入；`DomainExpertAdapter::run`
+    /// 取出后透传给专家执行上下文。用 `Option` 以便非流式调用（一次性 JSON 编排）可留空。
+    #[serde(skip)]
+    pub progress: Option<tokio::sync::mpsc::Sender<crate::progress::ProgressEvent>>,
 }
 
 impl AgentContext {
@@ -103,6 +103,7 @@ impl AgentContext {
             ctx_id: ctx_id.to_string(),
             session: Session::new(ctx_id),
             metadata: HashMap::new(),
+            progress: None,
         }
     }
 
@@ -113,6 +114,7 @@ impl AgentContext {
             ctx_id: ctx_id.to_string(),
             session,
             metadata: HashMap::new(),
+            progress: None,
         }
     }
 
@@ -167,74 +169,29 @@ pub trait ExpertAgent: Send + Sync {
 #[derive(Clone)]
 pub struct ExpertState {
     llm: Option<Arc<dyn LLM>>,
-    memory: Arc<dyn Memory>,
     event_bus: Option<Arc<EventBus>>,
-    asset_library: Option<Arc<dyn AssetLibrary>>,
-    project_memory: Option<Arc<dyn ProjectMemory>>,
-    tool_registry: Option<Arc<dyn ToolRegistry>>,
-    workflow_store: Option<Arc<dyn WorkflowStore>>,
     sutra_library: Option<Arc<dyn SutraLibraryPort>>,
 }
 
 impl ExpertState {
-    pub fn builder(memory: Arc<dyn Memory>) -> ExpertStateBuilder {
-        ExpertStateBuilder::new(memory)
+    pub fn builder() -> ExpertStateBuilder {
+        ExpertStateBuilder::new()
     }
 
     pub fn llm(&self) -> Option<&Arc<dyn LLM>> {
         self.llm.as_ref()
     }
 
-    pub fn memory(&self) -> &Arc<dyn Memory> {
-        &self.memory
-    }
-
     pub fn event_bus(&self) -> Option<&Arc<EventBus>> {
         self.event_bus.as_ref()
-    }
-
-    pub fn asset_library(&self) -> Option<&Arc<dyn AssetLibrary>> {
-        self.asset_library.as_ref()
-    }
-
-    pub fn project_memory(&self) -> Option<&Arc<dyn ProjectMemory>> {
-        self.project_memory.as_ref()
-    }
-
-    pub fn tool_registry(&self) -> Option<&Arc<dyn ToolRegistry>> {
-        self.tool_registry.as_ref()
-    }
-
-    pub fn workflow_store(&self) -> Option<&Arc<dyn WorkflowStore>> {
-        self.workflow_store.as_ref()
     }
 
     pub fn llm_cloned(&self) -> Option<Arc<dyn LLM>> {
         self.llm.clone()
     }
 
-    pub fn memory_cloned(&self) -> Arc<dyn Memory> {
-        self.memory.clone()
-    }
-
     pub fn event_bus_cloned(&self) -> Option<Arc<EventBus>> {
         self.event_bus.clone()
-    }
-
-    pub fn asset_library_cloned(&self) -> Option<Arc<dyn AssetLibrary>> {
-        self.asset_library.clone()
-    }
-
-    pub fn project_memory_cloned(&self) -> Option<Arc<dyn ProjectMemory>> {
-        self.project_memory.clone()
-    }
-
-    pub fn tool_registry_cloned(&self) -> Option<Arc<dyn ToolRegistry>> {
-        self.tool_registry.clone()
-    }
-
-    pub fn workflow_store_cloned(&self) -> Option<Arc<dyn WorkflowStore>> {
-        self.workflow_store.clone()
     }
 
     pub fn sutra_library(&self) -> Option<&Arc<dyn SutraLibraryPort>> {
@@ -246,29 +203,16 @@ impl ExpertState {
     }
 }
 
+#[derive(Default)]
 pub struct ExpertStateBuilder {
     llm: Option<Arc<dyn LLM>>,
-    memory: Arc<dyn Memory>,
     event_bus: Option<Arc<EventBus>>,
-    asset_library: Option<Arc<dyn AssetLibrary>>,
-    project_memory: Option<Arc<dyn ProjectMemory>>,
-    tool_registry: Option<Arc<dyn ToolRegistry>>,
-    workflow_store: Option<Arc<dyn WorkflowStore>>,
     sutra_library: Option<Arc<dyn SutraLibraryPort>>,
 }
 
 impl ExpertStateBuilder {
-    pub fn new(memory: Arc<dyn Memory>) -> Self {
-        Self {
-            llm: None,
-            memory,
-            event_bus: None,
-            asset_library: None,
-            project_memory: None,
-            tool_registry: None,
-            workflow_store: None,
-            sutra_library: None,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn llm(mut self, llm: Arc<dyn LLM>) -> Self {
@@ -286,26 +230,6 @@ impl ExpertStateBuilder {
         self
     }
 
-    pub fn asset_library(mut self, library: Arc<dyn AssetLibrary>) -> Self {
-        self.asset_library = Some(library);
-        self
-    }
-
-    pub fn project_memory(mut self, pm: Arc<dyn ProjectMemory>) -> Self {
-        self.project_memory = Some(pm);
-        self
-    }
-
-    pub fn tool_registry(mut self, registry: Arc<dyn ToolRegistry>) -> Self {
-        self.tool_registry = Some(registry);
-        self
-    }
-
-    pub fn workflow_store(mut self, store: Arc<dyn WorkflowStore>) -> Self {
-        self.workflow_store = Some(store);
-        self
-    }
-
     pub fn sutra_library(mut self, lib: Arc<dyn SutraLibraryPort>) -> Self {
         self.sutra_library = Some(lib);
         self
@@ -314,12 +238,7 @@ impl ExpertStateBuilder {
     pub fn build(self) -> ExpertState {
         ExpertState {
             llm: self.llm,
-            memory: self.memory,
             event_bus: self.event_bus,
-            asset_library: self.asset_library,
-            project_memory: self.project_memory,
-            tool_registry: self.tool_registry,
-            workflow_store: self.workflow_store,
             sutra_library: self.sutra_library,
         }
     }
@@ -340,14 +259,6 @@ impl<'a> FromState<'a> for Llm {
     }
 }
 
-pub struct MemoryRef<'a>(pub &'a dyn Memory);
-
-impl<'a> FromState<'a> for MemoryRef<'a> {
-    fn from_state(state: &'a ExpertState) -> crate::Result<Self> {
-        Ok(MemoryRef(&**state.memory()))
-    }
-}
-
 pub struct EventBusRef<'a>(pub &'a EventBus);
 
 impl<'a> FromState<'a> for EventBusRef<'a> {
@@ -362,7 +273,8 @@ impl<'a> FromState<'a> for EventBusRef<'a> {
 pub struct Orchestrator {
     agent_registry: AgentRegistry,
     event_bus: Option<Arc<EventBus>>,
-    rule_engine: RuleEngine,
+    /// 任务分析规则插件位（None = 用内置 tags 打分派生画像）
+    analysis_rule: RwLock<Option<Arc<dyn TaskAnalysisRule>>>,
     /// 全局演员池（Actor 竞标制）
     actor_registry: ActorRegistry,
 }
@@ -373,12 +285,73 @@ impl Default for Orchestrator {
     }
 }
 
+/// 「延续信号」标记词——判断一句话是否表现为**对上一轮的承接/追问**。
+///
+/// 只收两类：**承接/追加动词**与**指代词**。二者都是「缺少独立语义、必须依赖上文
+/// 才成立」的表达，这正是会话粘性应有的适用面。
+const CONTINUATION_MARKERS: &[&str] = &[
+    // 承接 / 追加
+    "再",
+    "继续",
+    "接着",
+    "然后",
+    "补充",
+    "还有",
+    "另外",
+    "此外",
+    "追加",
+    "顺便",
+    "修改",
+    "改成",
+    "改一下",
+    "调整",
+    "优化",
+    "换成",
+    "替换",
+    "加上",
+    "去掉",
+    "删除",
+    // 指代
+    "它",
+    "这个",
+    "那个",
+    "上述",
+    "上面",
+    "刚才",
+    "之前",
+    "前面",
+    "这样",
+    "那样",
+    "这部分",
+    "这块",
+    "这行",
+];
+
+/// 判断输入是否表现为「对上一轮的承接/追问」。
+///
+/// **为什么需要它**：零命中其实分两类，行为必须相反——
+///
+/// | 形态 | 例子 | 正确行为 |
+/// |------|------|---------|
+/// | (a) 承接上一轮，自身无独立语义 | 「再加个骨骼」「那它和 Iterator 的关系呢」 | **延续**本会话专家 |
+/// | (b) 完整、独立、与本服务领域无关 | 「今天天气怎么样」「帮我写首诗赞美大海」 | 走**领域边界提示** |
+///
+/// 无门控时 (b) 也会被粘性吞进上一个专家，等于把「零命中不兜底」这条产品规则架空
+/// （只要会话有历史，任何领域外问题都能被任意专家接管）。故只有 (a) 才放行粘性。
+pub(crate) fn looks_like_continuation(input: &str) -> bool {
+    let s = input.trim();
+    if s.is_empty() {
+        return false;
+    }
+    CONTINUATION_MARKERS.iter().any(|m| s.contains(m))
+}
+
 impl Orchestrator {
     pub fn new() -> Self {
         Self {
             agent_registry: AgentRegistry::new(),
             event_bus: None,
-            rule_engine: RuleEngine::with_defaults(),
+            analysis_rule: RwLock::new(None),
             actor_registry: ActorRegistry::new(),
         }
     }
@@ -388,31 +361,56 @@ impl Orchestrator {
         self
     }
 
-    pub fn with_rule_engine(mut self, engine: RuleEngine) -> Self {
-        self.rule_engine = engine;
-        self
-    }
-
-    /// 获取规则引擎引用
-    pub fn rule_engine(&self) -> &RuleEngine {
-        &self.rule_engine
-    }
-
-    /// 运行时替换任务分析规则（Layer 1）
+    /// 运行时注入自定义任务分析规则（插件位）
     ///
     /// 内部走写锁，无需 `&mut self`：编排主链路不会被注册/配置动作阻塞。
+    /// 未注入时 `analyze_task` 用内置「专家 tags × 输入匹配」派生画像。
     pub fn set_analysis_rule(&self, rule: Arc<dyn TaskAnalysisRule>) {
-        self.rule_engine.set_analysis_rule(rule);
+        if let Ok(mut guard) = self.analysis_rule.write() {
+            *guard = Some(rule);
+        }
     }
 
-    /// 运行时替换调度决策规则（Layer 2）
-    pub fn set_dispatch_rule(&self, rule: Arc<dyn DispatchRule>) {
-        self.rule_engine.set_dispatch_rule(rule);
+    /// 按标签相关性返回匹配的专家（与 dispatch 主链路同源，按命中数降序）
+    ///
+    /// `match_expert` 查询端点也走这里——保证「预览 = 实际路由」，杜绝两套真相。
+    pub fn match_experts(&self, input: &str) -> Vec<Arc<dyn Actor>> {
+        self.relevant_actors(input)
     }
 
-    /// 运行时替换执行监控规则（Layer 3）
-    pub fn set_execution_rule(&self, rule: Arc<dyn ExecutionRule>) {
-        self.rule_engine.set_execution_rule(rule);
+    /// 任务画像分析（零 LLM）
+    ///
+    /// 优先使用应用层注入的 [`TaskAnalysisRule`]；未注入时用内置派生：
+    /// `domain_tags` 来自专家 tags 打分（与 dispatch 同源），
+    /// `task_type` / 主谓宾为输入侧关键词粗分类。
+    pub fn analyze_task(&self, input: &str) -> TaskProfile {
+        if let Some(rule) = self.analysis_rule.read().ok().and_then(|g| g.clone()) {
+            match rule.analyze(input) {
+                Ok(p) => return p,
+                Err(e) => tracing::warn!("自定义任务分析规则失败，回退内置派生: {}", e),
+            }
+        }
+        let input_lower = input.to_lowercase();
+        let mut domain_tags: Vec<String> = self
+            .relevant_actors(input)
+            .iter()
+            .flat_map(|a| {
+                a.tags()
+                    .iter()
+                    .filter(|t| !t.is_empty() && input_lower.contains(&t.to_lowercase()))
+                    .cloned()
+            })
+            .collect();
+        domain_tags.sort();
+        domain_tags.dedup();
+        let (subject, predicate, object) = extract_spo(input);
+        TaskProfile {
+            domain_tags,
+            task_type: classify_task_type(&input_lower),
+            subject,
+            predicate,
+            object,
+        }
     }
 
     /// 注册专家（内部写锁，无需 `&mut self`）
@@ -543,8 +541,51 @@ impl Orchestrator {
             return Some(actor.clone());
         }
 
-        // 没有任何标签命中时，回退到第一个可用专家（保持原有兜底行为）
-        actors.first().cloned()
+        // 无任何标签命中：**不再回退到第一个专家**。
+        // 产品定位是「领域深度的多软件工作流」，泛化/领域外问题不应被任意领域专家接管，
+        // 故返回 None，由调用方给出「未匹配到领域」的显式结果。
+        None
+    }
+
+    /// 已注册专家的名称列表（用于「未匹配」提示，明确本服务的领域边界）
+    fn available_expert_names(&self) -> String {
+        let names: Vec<String> = self
+            .actor_registry
+            .list()
+            .iter()
+            .map(|a| a.name().to_string())
+            .collect();
+        if names.is_empty() {
+            "(无已注册专家)".to_string()
+        } else {
+            names.join(" / ")
+        }
+    }
+
+    /// 「未匹配到领域」的**统一出口**：零命中且不适用会话粘性时的唯一结果构造点。
+    ///
+    /// - `hint`：可选的上下文引导。存在上一轮专家时用它给出「若为同一任务的延续，
+    ///   请补充说明」的提示——**只提示、不越权代答**，既保住了会话上下文的价值，
+    ///   又不违反「零命中不兜底」的产品定位。
+    ///
+    /// 之所以抽成方法：`dispatch_direct` 与 `dispatch_without_graph` 的零命中分支
+    /// 此前各写了一份完全相同的长文案，属复制粘贴，容易改一处漏一处。
+    fn unmatched_domain_result(&self, hint: Option<String>) -> OrchestrationResult {
+        let mut output = format!(
+            "未匹配到相关领域专家。本服务仅处理以下领域的任务：{}。请描述与这些领域相关的具体需求。",
+            self.available_expert_names()
+        );
+        if let Some(h) = hint {
+            output.push_str(&h);
+        }
+        OrchestrationResult {
+            strategy: "fallback".to_string(),
+            expert_chain: Vec::new(),
+            output,
+            tokens: TokenUsage::default(),
+            expert_outputs: Vec::new(),
+            success: false,
+        }
     }
 
     /// 跳过图匹配，直接交给最相关的专家处理
@@ -563,14 +604,7 @@ impl Orchestrator {
             }
             None => {
                 tracing::warn!("未匹配到任何可用专家");
-                OrchestrationResult {
-                    strategy: "fallback".to_string(),
-                    expert_chain: Vec::new(),
-                    output: "未匹配到合适的专家，请检查专家注册或输入内容".to_string(),
-                    tokens: TokenUsage::default(),
-                    expert_outputs: Vec::new(),
-                    success: false,
-                }
+                self.unmatched_domain_result(None)
             }
         }
     }
@@ -604,10 +638,12 @@ impl Orchestrator {
     /// 无指定图时的 dispatch 流程：主管编排（Planner/ReAct 主管）。
     ///
     /// 不再做自动图路由（框架已无 Graph，Workflow 下沉为专家内部，由主管 Planner 选专家）。
-    /// 两级决策：
+    /// 三级决策（外加一层**受门控的**会话粘性兜底）：
     ///   1. 单领域命中 → 直接黑盒调该专家（不额外消耗一次 LLM 规划，保留 M1a 速度）
     ///   2. 多领域命中 → 主管用框架 Planner 把请求拆给多个专家串行执行
-    ///   3. 零命中   → 兜底到第一个可用专家（保持原行为）
+    ///   3. 零命中   → **仅当输入表现为对上一轮的承接**（`looks_like_continuation`）时，
+    ///      延续本会话最近路由到的专家；否则返回「未匹配到领域专家」并列出本服务领域
+    ///      边界（不做泛化兜底）
     ///
     /// 专家内部自带 Planner/ReAct（DomainExpert::plan_and_execute），框架只负责
     /// 「选哪些专家、按什么顺序」，专家如何内部执行对框架是黑盒。
@@ -633,22 +669,43 @@ impl Orchestrator {
                 tracing::debug!("多领域命中 {} 个专家，走主管规划路径", n);
                 self.dispatch_with_plan(ctx, state, relevant).await
             }
-            // 零命中：兜底
+            // 零命中：**仅在输入表现为「承接上一轮」时**才启用会话粘性，延续本会话
+            // 最近成功路由到的专家（如「再加个骨骼」「那它和 Iterator 的关系呢」）。
+            // 显式 tag 命中的单域/多域分支始终优先。
+            //
+            // ⚠️ 门控是必需的：零命中还包含「今天天气怎么样」这类**完整且与领域无关**
+            // 的独立需求，若也走粘性，本会话有历史时任何领域外问题都会被上一个专家吞掉，
+            // 「零命中不兜底」的产品规则就被架空了。此类输入一律走领域边界提示。
             _ => {
-                tracing::debug!("无关键词命中，兜底选择");
-                if let Some(actor) = self.select_actor_by_relevance(input) {
-                    self.dispatch_via_actor(ctx, state, actor).await
-                } else {
-                    tracing::warn!("未匹配到任何专家");
-                    OrchestrationResult {
-                        strategy: "fallback".to_string(),
-                        expert_chain: Vec::new(),
-                        output: "未匹配到合适的专家，请检查专家注册或输入内容".to_string(),
-                        tokens: TokenUsage::default(),
-                        expert_outputs: Vec::new(),
-                        success: false,
+                let sticky = ctx
+                    .session
+                    .get_metadata("last_expert_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|id| self.actor_registry.get_by_id(id))
+                    .map(|a| (a.id().to_string(), a.name().to_string()));
+
+                if let Some((id, name)) = sticky {
+                    if looks_like_continuation(input) {
+                        if let Some(actor) = self.actor_registry.get_by_id(&id) {
+                            tracing::debug!(
+                                "零命中且输入为承接表达 → 会话粘性延续专家 {}",
+                                actor.name()
+                            );
+                            return self.dispatch_via_actor(ctx, state, actor).await;
+                        }
                     }
+                    tracing::info!(
+                        "零命中且输入非承接表达 → 不启用粘性（上一轮专家={}），返回领域边界",
+                        name
+                    );
+                    return self.unmatched_domain_result(Some(format!(
+                        "\n（提示：本会话上一轮由「{}」处理。若这是同一任务的延续，请补充说明。）",
+                        name
+                    )));
                 }
+
+                tracing::warn!("无关键词命中，未匹配到领域专家");
+                self.unmatched_domain_result(None)
             }
         }
     }
@@ -710,6 +767,9 @@ impl Orchestrator {
         let mut prev_output: Option<String> = None;
         let mut last_output = String::new();
         let mut all_ok = true;
+        // 已执行但失败的专家名：整体成功后仍要把失败暴露给调用方
+        // （成败口径与专家内部一致：**任一步骤失败 → 整体失败**）
+        let mut failed_experts: Vec<String> = Vec::new();
 
         for (idx, step) in plan.steps.iter().enumerate() {
             let actor = match self.actor_registry.get_by_id(&step.skill_id) {
@@ -732,14 +792,28 @@ impl Orchestrator {
                 )
             };
 
-            let res = self.dispatch_via_actor(&mut sub, state, actor).await;
+            let res = self
+                .dispatch_via_actor(&mut sub, state, actor.clone())
+                .await;
             expert_chain.extend(res.expert_chain);
             if res.success {
                 prev_output = Some(res.output.clone());
             } else {
                 all_ok = false;
+                failed_experts.push(actor.name().to_string());
             }
             last_output = res.output;
+        }
+
+        // 整体失败时，末位专家的输出可能是"成功的"（前面某位专家失败），
+        // 单看文案会与 success=false 自相矛盾 → 显式列出失败专家，让原因可见可判别。
+        if !all_ok && !failed_experts.is_empty() {
+            last_output = format!(
+                "{}\n\n---\n⚠️ 以下专家执行失败（共 {} 个步骤）：{}\n（任一步骤失败即整体判为失败）",
+                last_output,
+                failed_experts.len(),
+                failed_experts.join("、")
+            );
         }
 
         OrchestrationResult {
@@ -763,6 +837,23 @@ impl Orchestrator {
     ) -> OrchestrationResult {
         let actor_name = actor.name().to_string();
         let actor_id = actor.id().to_string();
+
+        // 记录本会话「最近路由到的专家」，供零命中时做**会话粘性**回落。
+        // 场景：本会话先做了 Blender 任务，用户接着追问「再加个骨骼」——
+        // 后者不含任何领域 tag，若只按逐条消息匹配会被判成领域外；
+        // 有了粘性则延续同一专家，保住多软件工作流的会话连续性。
+        // 存进 `ctx.session`（框架级会话状态）→ 随 save_session 持久化。
+        //
+        // ⚠️ 必须写在**路由确定处**（而非执行成功分支）：粘性要保的是「对话连续性」，
+        // 即「用户刚才在跟哪位专家说话」，这个事实在路由命中的那一刻就已成定，
+        // **与本次执行成败无关**。写在成功分支会有一个真实反例（实测暴露）：
+        //   轮 1「用 rust 写个函数」因缺 workspace_folder 前置条件失败 → 未记录；
+        //   轮 2「再补充一下错误处理」被判领域外 → 会话直接断裂。
+        // 从用户视角看，他明明刚跟 Rust 专家说过话，追问理应延续。
+        ctx.session.set_metadata(
+            "last_expert_id",
+            serde_json::Value::String(actor_id.clone()),
+        );
 
         // 发布专家匹配事件（route 阶段）：让 ProgressEventBridge 透传到 SSE，
         // 使前端能渲染「🧭 匹配专家: XXX」的阶段分类
@@ -940,7 +1031,6 @@ impl AgentRegistry {
 #[cfg(test)]
 mod routing_tests {
     use super::*;
-    use crate::memory::{Memory, MemoryItem, SearchResult};
 
     struct MockActor {
         id: String,
@@ -968,22 +1058,31 @@ mod routing_tests {
         }
     }
 
-    /// 测试用空 Memory 实现（ExpertState 构造需要，但本模块不依赖真实持久化）。
-    struct NoopMemory;
-    impl Memory for NoopMemory {
-        fn write_short_term(&self, _c: &str, _t: Vec<String>) {}
-        fn write_long_term(&self, _c: &str, _t: Vec<String>) {}
-        fn read(&self, _id: &str) -> Option<MemoryItem> {
-            None
+    /// 永远执行失败的专家：用于验证「粘性记录不依赖执行成败」。
+    struct FailingActor {
+        id: String,
+        name: String,
+        tags: Vec<String>,
+    }
+
+    #[async_trait]
+    impl actor::Actor for FailingActor {
+        fn id(&self) -> &str {
+            &self.id
         }
-        fn delete(&self, _id: &str) {}
-        fn search(&self, _q: &str, _l: usize) -> Vec<SearchResult> {
-            Vec::new()
+        fn name(&self) -> &str {
+            &self.name
         }
-        fn get_all(&self) -> Vec<MemoryItem> {
-            Vec::new()
+        fn tags(&self) -> &[String] {
+            &self.tags
         }
-        fn clear(&self) {}
+        async fn perform(
+            &self,
+            _ctx: &mut AgentContext,
+            _state: &ExpertState,
+        ) -> crate::Result<String> {
+            Err(crate::Error::Expert("模拟前置条件缺失".into()))
+        }
     }
 
     fn orch_with_two_experts() -> Orchestrator {
@@ -1002,7 +1101,7 @@ mod routing_tests {
     }
 
     fn test_state() -> ExpertState {
-        ExpertState::builder(Arc::new(NoopMemory)).build()
+        ExpertState::builder().build()
     }
 
     #[test]
@@ -1075,5 +1174,156 @@ mod routing_tests {
         }));
         let rel = orch.relevant_actors("今天天气真好");
         assert!(rel.is_empty(), "无关键词命中应返回空");
+    }
+
+    /// 零命中且会话无历史 → 返回领域边界提示（不做泛化兜底）。
+    #[tokio::test]
+    async fn no_hit_without_session_sticky_returns_boundary() {
+        let orch = orch_with_two_experts();
+        let mut ctx = AgentContext::new("今天天气怎么样", "default");
+        let res = orch.dispatch(&mut ctx, &test_state()).await;
+        assert!(!res.success);
+        assert!(res.output.contains("未匹配到相关领域专家"));
+    }
+
+    /// 会话粘性：本会话已成功路由到某专家后，**无 tag 的追问**应延续同一专家，
+    /// 而不是被判成领域外。修复「领域内起头 → 无 tag 追问断链」的体验问题。
+    #[tokio::test]
+    async fn session_sticky_routes_tagless_followup_to_last_expert() {
+        let orch = orch_with_two_experts();
+        let mut ctx = AgentContext::new("教我怎么用Blender做阵列修改器", "sess-sticky");
+
+        // 第 1 轮：含 tag → 路由到 Blender，并记下粘性专家
+        let first = orch.dispatch(&mut ctx, &test_state()).await;
+        assert!(first.success);
+        assert_eq!(first.expert_chain, vec!["Blender 动画专家".to_string()]);
+        assert_eq!(
+            ctx.session
+                .get_metadata("last_expert_id")
+                .and_then(|v| v.as_str()),
+            Some("blender"),
+            "首次成功路由后应把 last_expert_id 写入框架级会话状态"
+        );
+
+        // 第 2 轮：不含任何 tag 的追问 → 应由粘性接住，延续 Blender
+        ctx.input = "它叫什么名字？".to_string();
+        let second = orch.dispatch(&mut ctx, &test_state()).await;
+        assert!(second.success, "无 tag 追问应被会话粘性接住，不再判领域外");
+        assert_eq!(second.expert_chain, vec!["Blender 动画专家".to_string()]);
+    }
+
+    /// 粘性**门控**：完整且与领域无关的独立需求，不得被粘性吞进上一个专家。
+    ///
+    /// 回归用例：曾经「今天天气怎么样」在本会话有过 Blender 历史时会被粘性路由到
+    /// Blender 专家并真的作答，等于把「零命中不兜底」这条产品规则架空。
+    #[tokio::test]
+    async fn sticky_gate_rejects_unrelated_topic_switch() {
+        let orch = orch_with_two_experts();
+        let mut ctx = AgentContext::new("教我怎么用Blender做阵列修改器", "sess-gate");
+        let first = orch.dispatch(&mut ctx, &test_state()).await;
+        assert!(first.success, "第 1 轮应正常路由");
+
+        for input in ["今天天气怎么样", "帮我写首诗赞美大海", "推荐几部电影"]
+        {
+            ctx.input = input.to_string();
+            let res = orch.dispatch(&mut ctx, &test_state()).await;
+            assert!(!res.success, "{input} 属于领域外独立需求，不应被粘性接管");
+            assert!(
+                res.output.contains("未匹配到相关领域专家"),
+                "{input} 应返回领域边界提示，实际: {}",
+                res.output
+            );
+            // 边界提示保留上下文引导（只提示、不代答）
+            assert!(
+                res.output.contains("Blender 动画专家"),
+                "{input} 的边界提示应带上「上一轮专家」的引导: {}",
+                res.output
+            );
+            assert!(
+                res.expert_chain.is_empty(),
+                "{input} 不应产生专家链（未真正调专家）"
+            );
+        }
+    }
+
+    /// 粘性记录**不依赖执行成败**：轮 1 路由命中了专家但执行失败，
+    /// 轮 2 的承接追问仍应延续同一专家，而不是被判成领域外。
+    ///
+    /// 回归用例（实测暴露）：此前 `last_expert_id` 只在**成功分支**写入，
+    /// 于是「轮 1 因缺 workspace_folder 失败 → 轮 2『再补充一下错误处理』」
+    /// 会被判领域外，会话直接断裂——用户视角是「我刚跟 Rust 专家说过话」。
+    #[tokio::test]
+    async fn sticky_is_recorded_even_when_expert_execution_fails() {
+        let orch = Orchestrator::new();
+        orch.register_actor(Arc::new(FailingActor {
+            id: "rust".into(),
+            name: "Rust 编程专家".into(),
+            tags: vec!["rust".into(), "code".into()],
+        }));
+
+        let mut ctx = AgentContext::new("用 rust 写一个函数", "sess-fail-sticky");
+        let first = orch.dispatch(&mut ctx, &test_state()).await;
+        assert!(!first.success, "该轮执行应失败（模拟缺前置条件）");
+        assert_eq!(
+            ctx.session
+                .get_metadata("last_expert_id")
+                .and_then(|v| v.as_str()),
+            Some("rust"),
+            "只要路由命中就应记录粘性专家，与执行成败无关"
+        );
+
+        ctx.input = "再补充一下错误处理".to_string();
+        let second = orch.dispatch(&mut ctx, &test_state()).await;
+        assert_eq!(
+            second.expert_chain,
+            vec!["Rust 编程专家".to_string()],
+            "承接追问应延续 Rust，而不是被粘性门控拦成领域外"
+        );
+        assert!(
+            !second.output.contains("未匹配到相关领域专家"),
+            "不应返回领域边界提示: {}",
+            second.output
+        );
+    }
+
+    /// 粘性门控的纯函数判定：承接表达放行、独立需求拒绝。
+    #[test]
+    fn continuation_gate_classification() {
+        for s in [
+            "再加个骨骼",
+            "继续",
+            "那它和 Iterator 的关系呢",
+            "补充一下错误处理",
+            "这个怎么改",
+            "然后呢",
+        ] {
+            assert!(super::looks_like_continuation(s), "{s:?} 应判定为承接表达");
+        }
+        for s in [
+            "今天天气怎么样",
+            "帮我写首诗赞美大海",
+            "推荐几部电影",
+            "量子纠缠是什么",
+            "介绍一下图论",
+            "",
+            "   ",
+        ] {
+            assert!(
+                !super::looks_like_continuation(s),
+                "{s:?} 不应判定为承接表达"
+            );
+        }
+    }
+
+    /// 显式 tag 始终优先于粘性：会话粘在 Blender 时，显式问 Rust 仍应切到 Rust。
+    #[tokio::test]
+    async fn explicit_tag_beats_session_sticky() {
+        let orch = orch_with_two_experts();
+        let mut ctx = AgentContext::new("教我怎么用Blender做阵列修改器", "sess-switch");
+        let _ = orch.dispatch(&mut ctx, &test_state()).await;
+
+        ctx.input = "改用 rust 写一个 CLI".to_string();
+        let res = orch.dispatch(&mut ctx, &test_state()).await;
+        assert_eq!(res.expert_chain, vec!["Rust 编程专家".to_string()]);
     }
 }

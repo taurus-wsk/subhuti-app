@@ -125,7 +125,7 @@ Accept: text/event-stream
 ```
 data: {"type": "start", "session_id": "..."}
 
-data: {"type": "thought", "message": "指定专家: rust-expert", "session_id": "..."}
+data: {"type": "step", "phase": "analyze", "message": "指定专家: rust-expert", "session_id": "..."}
 
 data: {"type": "data", "content": "秋", "session_id": "..."}
 

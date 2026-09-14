@@ -10,10 +10,11 @@
 use std::process::Command;
 use std::sync::Arc;
 
-use subhuti_core::event::{AgentEventData, EventBus};
+use crate::domain::events::DomainEvent;
 
 use crate::domain::dto::ToolchainResult;
 use crate::domain::ports::ToolchainPort;
+use crate::domain::traits::TraceContext;
 
 /// Rust 工具链适配器
 ///
@@ -107,27 +108,15 @@ impl ToolchainPort for RustToolchainAdapter {
 ///
 /// 之所以用包裹层而非给 `RustToolchainAdapter` 单例加 trace_id：单例的 trace_id
 /// 在并发请求之间会互相覆盖；这里每次请求新建一个包裹层，携带本请求的
-/// trace_id / session_id，与第二步里 `SubhutiLlmAdapter` 的模式一致。
+/// `TraceContext`，与 `TracedEngineLlm` 的模式一致。
 pub struct TracedToolchainAdapter {
     inner: Arc<dyn ToolchainPort>,
-    event_bus: Option<Arc<EventBus>>,
-    trace_id: Option<String>,
-    session_id: Option<String>,
+    trace: TraceContext,
 }
 
 impl TracedToolchainAdapter {
-    pub fn new(
-        inner: Arc<dyn ToolchainPort>,
-        event_bus: Option<Arc<EventBus>>,
-        trace_id: Option<String>,
-        session_id: Option<String>,
-    ) -> Self {
-        Self {
-            inner,
-            event_bus,
-            trace_id,
-            session_id,
-        }
+    pub fn new(inner: Arc<dyn ToolchainPort>, trace: TraceContext) -> Self {
+        Self { inner, trace }
     }
 }
 
@@ -137,44 +126,28 @@ impl ToolchainPort for TracedToolchainAdapter {
         project_path: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolchainResult> + Send>> {
         let inner = self.inner.clone();
-        let bus = self.event_bus.clone();
-        let tid = self.trace_id.clone();
-        let sid = self.session_id.clone();
+        let trace = self.trace.clone();
         let path = project_path.to_string();
         Box::pin(async move {
-            if let (Some(bus), Some(tid)) = (&bus, &tid) {
-                if !tid.is_empty() {
-                    bus.emit_with_trace(
-                        AgentEventData::ToolCalling {
-                            tool_name: "cargo check".to_string(),
-                            args: serde_json::Value::Null,
-                        },
-                        tid.clone(),
-                        sid.clone(),
-                    )
-                    .await;
-                }
-            }
+            trace
+                .emit(DomainEvent::ToolCalling {
+                    tool_name: "cargo check".to_string(),
+                    args: serde_json::Value::Null,
+                })
+                .await;
             let result = inner.check(&path).await;
-            if let (Some(bus), Some(tid)) = (&bus, &tid) {
-                if !tid.is_empty() {
-                    bus.emit_with_trace(
-                        AgentEventData::ToolResponded {
-                            tool_name: "cargo check".to_string(),
-                            result: if result.success {
-                                "ok".to_string()
-                            } else {
-                                "fail".to_string()
-                            },
-                            success: result.success,
-                            duration_ms: 0,
-                        },
-                        tid.clone(),
-                        sid.clone(),
-                    )
-                    .await;
-                }
-            }
+            trace
+                .emit(DomainEvent::ToolResponded {
+                    tool_name: "cargo check".to_string(),
+                    result: if result.success {
+                        "ok".to_string()
+                    } else {
+                        "fail".to_string()
+                    },
+                    success: result.success,
+                    duration_ms: 0,
+                })
+                .await;
             result
         })
     }
@@ -184,44 +157,28 @@ impl ToolchainPort for TracedToolchainAdapter {
         project_path: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolchainResult> + Send>> {
         let inner = self.inner.clone();
-        let bus = self.event_bus.clone();
-        let tid = self.trace_id.clone();
-        let sid = self.session_id.clone();
+        let trace = self.trace.clone();
         let path = project_path.to_string();
         Box::pin(async move {
-            if let (Some(bus), Some(tid)) = (&bus, &tid) {
-                if !tid.is_empty() {
-                    bus.emit_with_trace(
-                        AgentEventData::ToolCalling {
-                            tool_name: "cargo clippy".to_string(),
-                            args: serde_json::Value::Null,
-                        },
-                        tid.clone(),
-                        sid.clone(),
-                    )
-                    .await;
-                }
-            }
+            trace
+                .emit(DomainEvent::ToolCalling {
+                    tool_name: "cargo clippy".to_string(),
+                    args: serde_json::Value::Null,
+                })
+                .await;
             let result = inner.clippy(&path).await;
-            if let (Some(bus), Some(tid)) = (&bus, &tid) {
-                if !tid.is_empty() {
-                    bus.emit_with_trace(
-                        AgentEventData::ToolResponded {
-                            tool_name: "cargo clippy".to_string(),
-                            result: if result.success {
-                                "ok".to_string()
-                            } else {
-                                "fail".to_string()
-                            },
-                            success: result.success,
-                            duration_ms: 0,
-                        },
-                        tid.clone(),
-                        sid.clone(),
-                    )
-                    .await;
-                }
-            }
+            trace
+                .emit(DomainEvent::ToolResponded {
+                    tool_name: "cargo clippy".to_string(),
+                    result: if result.success {
+                        "ok".to_string()
+                    } else {
+                        "fail".to_string()
+                    },
+                    success: result.success,
+                    duration_ms: 0,
+                })
+                .await;
             result
         })
     }

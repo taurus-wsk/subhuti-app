@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use crate::domain::dto::{ExpertInfo, OrchestrateResponse, SkillInfo, SkillResponse};
+use crate::domain::session_context::ContextMessage;
 use crate::domain::traits::{DomainExpert, DomainRepository};
 
 /// 专家仓库端口（出站端口）
@@ -57,12 +58,16 @@ pub trait OrchestrationEnginePort: Send + Sync + 'static {
         message: &str,
         user_id: &str,
         chain: &str,
-        graph: &str,
         expert_id: &str,
         trace_id: &str,
         session_id: &str,
-        workspace_folder: &str,
         system_prompt: &str,
+        // 任意扩展参数（JSON 对象）。workspace_folder 等配置从这里面取，
+        // 出站层把它摊平进框架 ctx.metadata，领域专家按需读取。
+        extra: &serde_json::Value,
+        // 可选结构化进度事件发送端：orchestrate_stream 创建后注入框架 AgentContext.progress，
+        // 专家与框架动作事件统一汇聚为单条 ProgressEvent 流（取代旧版全局注册表）。
+        progress_tx: Option<crate::domain::traits::ProgressTx>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = OrchestrateResponse> + Send>>;
 
     /// 分析任务
@@ -125,6 +130,7 @@ pub trait SkillExecutionPort: Send + Sync + 'static {
         args: &str,
         trace_id: &str,
         session_id: &str,
+        extra: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SkillResponse> + Send>>;
 }
 
@@ -176,6 +182,26 @@ pub trait FileSystemPort: Send + Sync + 'static {
         &self,
         path: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
+}
+
+/// 会话上下文持久化端口（出站端口）
+///
+/// 承载**框架级**会话上下文的读写。领域层只认这个接口，不关心背后是
+/// SQLite、Redis 还是内存——当前由出站适配层的 SQLite 实现。
+///
+/// ⚠️ 方法为**同步签名**：底层存储走「独立 OS 线程 + current_thread runtime」
+/// 的同步桥（见 `subhuti-infra::session_store`），在宿主 tokio runtime 内
+/// 不可用 `block_on`。同步方法由调用方在 async 上下文中直接调用即可，
+/// 每轮仅 1~2 次，阻塞可忽略。
+pub trait SessionContextPort: Send + Sync + 'static {
+    /// 读取某会话最近 `limit` 条历史（按时间正序，越新越靠后）
+    fn load(&self, session_id: &str, limit: usize) -> Vec<ContextMessage>;
+
+    /// 追加一条上下文消息
+    fn append(&self, session_id: &str, message: &ContextMessage);
+
+    /// 清空某会话上下文
+    fn clear(&self, session_id: &str);
 }
 
 /// 命令执行结果

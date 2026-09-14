@@ -4,7 +4,6 @@
 //! 具体实现由 infra 层的 `MemoryEnginePort` + `MemorySkill` 提供。
 
 use async_trait::async_trait;
-use std::sync::Arc;
 
 /// 藏经阁记忆引擎端口
 ///
@@ -52,6 +51,24 @@ pub trait SutraLibraryPort: Send + Sync {
     /// 沉淀会话到持久记忆
     fn precipitate(&self, session_id: &str, collection_id: &str, domain: &str) -> String;
 
+    /// 一键自动沉淀（P0 主链路）
+    ///
+    /// 自动建/复用领域集合，把提炼好的事实写入会话记忆并**等待落库完成**。
+    /// 返回实际落库的节点数（0 表示无有效事实或不可持久化）。
+    ///
+    /// 与 `precipitate` 的区别：后者是同步 fire-and-forget，MCP stdio 这类
+    /// "请求结束即退出进程"的场景下可能写不完；本方法 await 到底。
+    async fn auto_precipitate(&self, session_id: &str, domain: &str, facts: &[String]) -> usize;
+
+    /// 冷启动灌入领域静态知识（P1）
+    ///
+    /// `entries` 为 (标题, 正文) 列表；已存在内容自动跳过。返回新写入节点数。
+    async fn seed_knowledge(&self, domain: &str, entries: &[(String, String)]) -> usize;
+
+    /// 结构化统计（P2 可观测），返回 JSON：
+    /// `{total_nodes, hot_nodes, cold_nodes, collections, edges, snapshots, tantivy_docs}`
+    fn stats_json(&self) -> serde_json::Value;
+
     /// 正反馈
     fn like(&self, node_id: &str) -> String;
 
@@ -73,6 +90,8 @@ pub trait SutraLibraryPort: Send + Sync {
     /// - `graph`: 对话图谱 ID
     /// - `domain`: 领域
     /// - `session_id`: 会话 ID（可选）
+    /// - `final_answer`: 本轮最终回答。用于判定哪些召回切片**真的被用上了**——
+    ///   没有它 `used_chunk_ids` 只能恒为空，命中率永远 0%，反馈信号毫无信息量。
     fn record_execution(
         &self,
         query: &str,
@@ -80,6 +99,7 @@ pub trait SutraLibraryPort: Send + Sync {
         graph: &str,
         domain: &str,
         session_id: Option<String>,
+        final_answer: &str,
     ) -> String;
 
     // ─── 知识库 CRUD ────────────────────────────────────────────
@@ -104,103 +124,4 @@ pub trait SutraLibraryPort: Send + Sync {
     ///
     /// 返回 JSON 格式的知识库列表
     async fn get_knowledge_base_by_expert(&self, expert_id: &str) -> String;
-}
-
-/// 空实现（未配置藏经阁时使用）
-pub struct EmptySutraLibrary;
-
-impl EmptySutraLibrary {
-    pub fn new() -> Self {
-        Self
-    }
-
-    pub fn arc() -> Arc<Self> {
-        Arc::new(Self::new())
-    }
-}
-
-impl Default for EmptySutraLibrary {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl SutraLibraryPort for EmptySutraLibrary {
-    fn create_collection(&self, _name: &str, _domain: &str, _description: &str) -> String {
-        "⚠️ 藏经阁引擎未配置，无法创建集合".to_string()
-    }
-
-    fn list_collections(&self) -> String {
-        "⚠️ 藏经阁引擎未配置".to_string()
-    }
-
-    fn write(
-        &self,
-        _collection_id: &str,
-        _content: &str,
-        _domain: &str,
-        _parent_id: Option<&str>,
-    ) -> String {
-        "⚠️ 藏经阁引擎未配置，无法写入记忆".to_string()
-    }
-
-    fn read(&self, _node_id: &str) -> String {
-        "⚠️ 藏经阁引擎未配置".to_string()
-    }
-
-    async fn search(&self, _text: &str, _collection_id: Option<&str>, _limit: usize) -> String {
-        "⚠️ 藏经阁引擎未配置".to_string()
-    }
-
-    async fn library_retrieve(&self, _query: &str, _top_k: usize) -> String {
-        "⚠️ 藏经阁引擎未配置".to_string()
-    }
-
-    fn delete(&self, _node_id: &str) -> String {
-        "⚠️ 藏经阁引擎未配置".to_string()
-    }
-
-    fn add_session(&self, _session_id: &str, _content: &str, _domain: &str) -> String {
-        "⚠️ 藏经阁引擎未配置".to_string()
-    }
-
-    fn precipitate(&self, _session_id: &str, _collection_id: &str, _domain: &str) -> String {
-        "⚠️ 藏经阁引擎未配置".to_string()
-    }
-
-    fn like(&self, _node_id: &str) -> String {
-        "⚠️ 藏经阁引擎未配置".to_string()
-    }
-
-    fn dislike(&self, _node_id: &str) -> String {
-        "⚠️ 藏经阁引擎未配置".to_string()
-    }
-
-    fn stats(&self) -> String {
-        "⚠️ 藏经阁引擎未配置".to_string()
-    }
-
-    fn record_execution(
-        &self,
-        _query: &str,
-        _task_success: bool,
-        _graph: &str,
-        _domain: &str,
-        _session_id: Option<String>,
-    ) -> String {
-        "⚠️ 藏经阁引擎未配置".to_string()
-    }
-
-    async fn list_knowledge_bases(&self) -> String {
-        "⚠️ 藏经阁引擎未配置，无法查询知识库".to_string()
-    }
-
-    async fn list_chunks(&self, _kb_id: &str) -> String {
-        "⚠️ 藏经阁引擎未配置，无法查询知识库切片".to_string()
-    }
-
-    async fn get_knowledge_base_by_expert(&self, _expert_id: &str) -> String {
-        "⚠️ 藏经阁引擎未配置，无法查询专家知识库".to_string()
-    }
 }

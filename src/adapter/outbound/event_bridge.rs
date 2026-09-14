@@ -9,14 +9,16 @@
 //! - 依赖：框架层 subhuti_core::event::EventHandler、应用层 TraceObserverPort/SpanData
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use subhuti_core::event::{AgentEventData, Event, EventFilter, EventHandler};
 
 use crate::application::observer::{SpanData, TraceObserverPort};
-use crate::application::ports::StreamEvent;
-use crate::application::stream_registry;
+use subhuti_core::progress::ProgressEvent;
+use tokio::sync::mpsc::Sender;
+use tokio::sync::Mutex;
 
 /// Trace 事件桥接处理器
 pub struct TraceEventBridge {
@@ -416,36 +418,67 @@ impl EventHandler for TraceEventBridge {
     }
 }
 
-/// # 进度事件桥（EventBus → SSE）
+/// # 进度事件桥（EventBus → ProgressEvent，per-request 订阅）
 ///
-/// 订阅框架 EventBus，把携带 trace_id 的「框架动作事件」翻译成协议中立的
-/// `StreamEvent::Step`（带 phase），按 `trace_id` 路由到对应请求的 SSE 通道。
+/// **每次 `/orchestrate` 请求开始时**构造一个实例、订阅到框架 EventBus，
+/// 把携带本请求 `trace_id` 的「框架动作事件」翻译成 `ProgressEvent::Step`（带 phase），
+/// 直接 `try_send` 到本次请求专属的 `Sender<ProgressEvent>` 通道。
+/// 该通道与专家经 `AgentContext.progress` 发出的 `ProgressEvent` 是同一条，
+/// 由 `orchestrate_stream` 统一映射为前端 `StreamEvent`（取代旧版全局 stream_registry）。
 ///
-/// 这一步把原本只对 trace 观察者可见的细粒度动作（专家匹配、LLM 推理、工具调用、
-/// 记忆检索）也透传到流式输出，使前端能渲染出 WorkBuddy 式的阶段流
-/// （route → think → tool → retrieve → … → done）。
+/// 与早期实现的区别：不再依赖全局 `stream_registry`（trace_id → tx / agent 的
+/// `OnceLock<Mutex<HashMap>>`）。每个请求自己持有 `tx` 与已匹配到的专家名，
+/// 无全局可变状态、无手动 register/unregister、无跨请求泄漏/误投风险。
 ///
 /// 与 `TraceEventBridge` 的区别：
 /// - `TraceEventBridge`：事件 → `SpanData` → trace 观察者（事后查询链路树）
-/// - `ProgressEventBridge`：事件 → `StreamEvent::Step` → SSE（实时进度）
-pub struct ProgressEventBridge;
+/// - `ProgressEventBridge`：事件 → `ProgressEvent::Step` → 统一进度流（仅本请求实时进度）
+pub struct ProgressEventBridge {
+    /// 本请求独有的 trace_id，用于从共享 EventBus 中挑出属于自己的事件
+    trace_id: String,
+    /// 本请求专属的进度发送端（与专家共用同一条 ProgressEvent 流）
+    tx: Sender<ProgressEvent>,
+    /// route 阶段（AgentMatched）记下的专家名，供后续 think/tool/retrieve 阶段回填 source
+    agent: Mutex<Option<String>>,
+    /// 本请求累计 token 用量（LLMResponded.tokens_used 求和），由调用方在 Done.meta 读出
+    token_counter: Arc<AtomicU64>,
+    /// 本请求 LLM 调用次数
+    llm_calls: Arc<AtomicU64>,
+}
 
 impl ProgressEventBridge {
-    pub fn new() -> Self {
-        Self
+    pub fn new(
+        trace_id: String,
+        tx: Sender<ProgressEvent>,
+        token_counter: Arc<AtomicU64>,
+        llm_calls: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            trace_id,
+            tx,
+            agent: Mutex::new(None),
+            token_counter,
+            llm_calls,
+        }
     }
 
-    /// 把框架事件翻译成流式 Step 事件（无对应 phase 的事件返回 None）
-    fn to_step(data: &AgentEventData) -> Option<StreamEvent> {
+    /// 把框架事件翻译成 ProgressEvent::Step（无对应 phase 的事件返回 None）
+    ///
+    /// `agent` 为已匹配到的专家名（route 阶段记录），用于给 think/tool/retrieve
+    /// 阶段补全 source；查不到则回落为「框架」。
+    fn to_step(agent: Option<&str>, data: &AgentEventData) -> Option<ProgressEvent> {
         use AgentEventData::*;
-        let (phase, message, expert) = match data {
+        let source = || agent.unwrap_or("框架").to_string();
+        let (phase, message, source) = match data {
             AgentMatched { agent_name, .. } => (
                 "route",
                 format!("🧭 匹配专家: {agent_name}"),
-                Some(agent_name.clone()),
+                agent_name.clone(),
             ),
-            LLMCalling { .. } => ("think", "🤔 模型推理中…".to_string(), None),
-            ToolCalling { tool_name, .. } => ("tool", format!("🔧 调用工具: {tool_name}"), None),
+            LLMCalling { .. } => ("think", "🤔 模型推理中…".to_string(), source()),
+            ToolCalling { tool_name, .. } => {
+                ("tool", format!("🔧 调用工具: {tool_name}"), source())
+            }
             ToolResponded {
                 tool_name, success, ..
             } => (
@@ -455,7 +488,7 @@ impl ProgressEventBridge {
                     tool_name,
                     if *success { "成功" } else { "失败" }
                 ),
-                None,
+                source(),
             ),
             MemoryRetrieved {
                 query,
@@ -463,17 +496,19 @@ impl ProgressEventBridge {
             } => (
                 "retrieve",
                 format!("📚 检索记忆: {query} ({results_count} 条)"),
-                None,
+                source(),
             ),
             // 其余事件（AgentStarted/Completed、LLMResponded 等）不在此桥渲染，
             // 避免与编排层自身发出的 run/done 阶段重复
             _ => return None,
         };
-        Some(StreamEvent::Step {
+        Some(ProgressEvent::Step {
             message,
-            expert,
+            source,
             phase: Some(phase.to_string()),
             todo_state: None,
+            done: None,
+            total: None,
         })
     }
 }
@@ -488,6 +523,7 @@ impl EventHandler for ProgressEventBridge {
         EventFilter::Types(vec![
             "agent_matched",
             "llm_calling",
+            "llm_responded",
             "tool_calling",
             "tool_responded",
             "memory_retrieved",
@@ -500,13 +536,31 @@ impl EventHandler for ProgressEventBridge {
             Some(t) if !t.is_empty() => t,
             _ => return,
         };
-        let tx = match stream_registry::get_stream_tx(trace_id) {
-            Some(tx) => tx,
-            None => return, // 该 trace 没有活跃流式会话（如 MCP 调用、离线 trace）
-        };
-        if let Some(step) = Self::to_step(&event.data) {
+        // 只处理本请求自己的事件：多个 per-request 桥共存时互不干扰
+        if trace_id != &self.trace_id {
+            return;
+        }
+
+        // LLMResponded 不渲染成步骤（避免与编排层 done 阶段重复），
+        // 但要把 token 用量累加进本请求计数器，供 Done.meta 透出
+        if let AgentEventData::LLMResponded { tokens_used, .. } = &event.data {
+            self.token_counter
+                .fetch_add(*tokens_used, Ordering::Relaxed);
+            self.llm_calls.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        // route 阶段：记下专家名，供后续 think/tool/retrieve 阶段回填 source
+        let mut agent_guard = self.agent.lock().await;
+        if let AgentEventData::AgentMatched { agent_name, .. } = &event.data {
+            *agent_guard = Some(agent_name.clone());
+        }
+        let agent = agent_guard.take();
+        drop(agent_guard);
+
+        if let Some(step) = Self::to_step(agent.as_deref(), &event.data) {
             // 非阻塞投递：通道满或已关闭则丢弃，绝不反向阻塞 EventBus
-            let _ = tx.try_send(step);
+            let _ = self.tx.try_send(step);
         }
     }
 }
@@ -523,33 +577,36 @@ mod progress_tests {
             match_score: 1.0,
             candidates: vec![],
         };
-        let (phase, expert, message) =
-            match ProgressEventBridge::to_step(&e).expect("应映射为 Step") {
-                StreamEvent::Step {
+        let (phase, source, message) =
+            match ProgressEventBridge::to_step(None, &e).expect("应映射为 Step") {
+                ProgressEvent::Step {
                     phase,
-                    expert,
+                    source,
                     message,
                     ..
-                } => (phase, expert, message),
+                } => (phase, source, message),
                 _ => panic!("应为 Step 变体"),
             };
         assert_eq!(phase.as_deref(), Some("route"));
-        assert_eq!(expert.as_deref(), Some("Rust 编程专家"));
+        assert_eq!(source, "Rust 编程专家");
         assert!(message.contains("Rust 编程专家"));
     }
 
     #[test]
     fn test_to_step_llm_calling_is_think() {
+        // 已记录专家名，验证 think 阶段能回填 source
         let e = AgentEventData::LLMCalling {
             messages_count: 3,
             model: Some("zhipu".into()),
         };
-        let (phase, expert) = match ProgressEventBridge::to_step(&e).expect("应映射为 Step") {
-            StreamEvent::Step { phase, expert, .. } => (phase, expert),
+        let (phase, source) = match ProgressEventBridge::to_step(Some("Rust 编程专家"), &e)
+            .expect("应映射为 Step")
+        {
+            ProgressEvent::Step { phase, source, .. } => (phase, source),
             _ => panic!("应为 Step 变体"),
         };
         assert_eq!(phase.as_deref(), Some("think"));
-        assert_eq!(expert, None);
+        assert_eq!(source, "Rust 编程专家");
     }
 
     #[test]
@@ -560,7 +617,7 @@ mod progress_tests {
             output: "ok".into(),
             duration_ms: 1,
         };
-        assert!(ProgressEventBridge::to_step(&e).is_none());
+        assert!(ProgressEventBridge::to_step(None, &e).is_none());
     }
 }
 

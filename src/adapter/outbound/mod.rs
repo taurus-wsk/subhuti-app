@@ -37,6 +37,7 @@ pub(crate) fn framework_to_app_expert(framework: FrameworkExpertInfo) -> ExpertI
 }
 
 pub mod domain_expert_adapter;
+pub mod event_publisher_adapter;
 pub mod subhuti_expert_repository;
 pub mod subhuti_orchestration_engine;
 pub mod subhuti_skill_executor;
@@ -46,6 +47,6 @@ pub mod event_bridge;
 pub mod file_system_adapter;
 pub mod observer_adapters;
 pub mod postgres_repository;
-pub mod rules;
 pub mod rust_toolchain_adapter;
+pub mod session_context_adapter;
 pub mod subhuti_framework_initializer;

@@ -15,6 +15,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tracing_subscriber::prelude::*;
 
 use crate::application::composition_root::Composition;
@@ -54,7 +55,7 @@ pub async fn run(
         limit, PROTOCOL_VERSION
     );
     eprintln!(
-        "   可用工具: subhuti_chat / subhuti_list_experts / subhuti_match_expert / subhuti_skill_list / subhuti_skill_run"
+        "   可用工具: subhuti_chat / subhuti_list_experts / subhuti_match_expert / subhuti_memory"
     );
 
     let stdin = tokio::io::stdin();
@@ -81,11 +82,13 @@ pub async fn run(
         }
     });
 
+    let mut tasks: JoinSet<()> = JoinSet::new();
+
     loop {
         let mut line = String::new();
         let n = reader.read_line(&mut line).await?;
         if n == 0 {
-            break; // EOF：客户端断开
+            break; // EOF：客户端断开，等 spawned task 完成
         }
         let line = line.trim();
         if line.is_empty() {
@@ -104,13 +107,21 @@ pub async fn run(
         let sem = sem.clone();
         let stdout_tx = stdout_tx.clone();
         // 并发处理（受 Semaphore 限流），每个请求独立 spawn
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let _permit = sem.acquire().await.ok();
             if let Some(resp) = handle(req, &comp).await {
                 // 交给专用写线程；通道关闭（进程退出）时静默丢弃
                 let _ = stdout_tx.send(resp);
             }
         });
+    }
+
+    // EOF 后等待所有 spawned 请求完成（最多 30 秒）
+    tokio::select! {
+        _ = async { while tasks.join_next().await.is_some() {} } => {}
+        _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+            eprintln!("⚠️ 部分请求超时未完成，放弃等待");
+        }
     }
 
     Ok(())
@@ -204,16 +215,15 @@ fn list_tools_result() -> Value {
         "tools": [
             {
                 "name": "subhuti_chat",
-                "description": "向 Subhuti 智能体提问，触发编排（专家路由 + 技能执行 + 藏经阁 RAG）。返回最终输出及所用专家链。",
+                "description": "向 Subhuti 智能体提问，触发编排（专家路由 + 藏经阁 RAG）。返回最终输出及所用专家链。",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "message": { "type": "string", "description": "用户问题 / 任务" },
                         "expert_id": { "type": "string", "description": "强制路由到指定专家 ID（可选）" },
-                        "graph": { "type": "string", "description": "指定图编排名称（可选）" },
-                        "workspace_folder": { "type": "string", "description": "项目工作目录（可选）" },
                         "system_prompt": { "type": "string", "description": "覆盖默认系统提示词（可选）" },
-                        "session_id": { "type": "string", "description": "会话 ID，用于多轮上下文（可选）" }
+                        "workspace_folder": { "type": "string", "description": "项目工作目录（可选）" },
+                        "session_id": { "type": "string", "description": "**多轮会话必传**。同一对话的所有调用必须复用同一个 session_id，才能保持上下文连续。首轮不传会自动生成并返回。" }
                     },
                     "required": ["message"]
                 }
@@ -235,20 +245,22 @@ fn list_tools_result() -> Value {
                 }
             },
             {
-                "name": "subhuti_skill_list",
-                "description": "列出所有专家暴露的可用技能。",
-                "inputSchema": { "type": "object", "properties": {} }
-            },
-            {
-                "name": "subhuti_skill_run",
-                "description": "按 ID 执行某个技能，args 作为技能输入。",
+                "name": "subhuti_memory",
+                "description": "读写藏经阁长期记忆。action=recall 检索；write 写入（自动抽取+持久化）；stats 统计；collections 集合列表。**每个会话开始时至少调一次 recall**。",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "skill_id": { "type": "string", "description": "技能 ID" },
-                        "args": { "type": "string", "description": "传给技能的参数 / 输入" }
+                        "action": {
+                            "type": "string",
+                            "enum": ["recall", "write", "stats", "collections"],
+                            "description": "recall=检索, write=写入, stats=统计, collections=集合"
+                        },
+                        "query": { "type": "string", "description": "recall 的检索词" },
+                        "content": { "type": "string", "description": "write 的记忆正文" },
+                        "domain": { "type": "string", "description": "领域（rust/blender/general），默认 general" },
+                        "top_k": { "type": "integer", "description": "recall 返回条数，默认 5" }
                     },
-                    "required": ["skill_id"]
+                    "required": ["action"]
                 }
             }
         ]
@@ -268,22 +280,41 @@ async fn call_tool(name: &str, args: Value, comp: &Composition) -> anyhow::Resul
             let req = OrchestrateRequest {
                 message: message.to_string(),
                 user_id: Some("mcp".to_string()),
-                session_id: Some(uuid::Uuid::new_v4().to_string()),
+                session_id: args
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .or_else(|| Some(uuid::Uuid::new_v4().to_string())),
                 chain: None,
-                graph: args.get("graph").and_then(|v| v.as_str()).map(String::from),
                 expert_id: args
                     .get("expert_id")
                     .and_then(|v| v.as_str())
                     .map(String::from),
                 trace_id: None,
-                workspace_folder: args
-                    .get("workspace_folder")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
                 system_prompt: args
                     .get("system_prompt")
                     .and_then(|v| v.as_str())
                     .map(String::from),
+                // 合并 workspace_folder + extra 到 DTO.extra
+                extra: {
+                    let mut extra_obj = serde_json::Map::new();
+                    if let Some(ws) = args.get("workspace_folder").and_then(|v| v.as_str()) {
+                        extra_obj.insert(
+                            "workspace_folder".into(),
+                            serde_json::Value::String(ws.to_string()),
+                        );
+                    }
+                    if let Some(extra_val) = args.get("extra").and_then(|v| v.as_object()) {
+                        for (k, v) in extra_val {
+                            extra_obj.insert(k.clone(), v.clone());
+                        }
+                    }
+                    if extra_obj.is_empty() {
+                        None
+                    } else {
+                        Some(serde_json::Value::Object(extra_obj))
+                    }
+                },
             };
 
             let resp = comp.chat_port.orchestrate(req).await;
@@ -328,38 +359,55 @@ async fn call_tool(name: &str, args: Value, comp: &Composition) -> anyhow::Resul
                 Ok(s)
             }
         }
-        "subhuti_skill_list" => {
-            let skills = comp.skill_port.skill_list().await;
-            if skills.is_empty() {
-                Ok("(无可用技能)".to_string())
-            } else {
-                let mut s = String::from("可用技能:\n");
-                for sk in skills {
-                    s.push_str(&format!(
-                        "- {} (id={}): {}\n",
-                        sk.name, sk.id, sk.description
-                    ));
-                }
-                Ok(s)
-            }
-        }
-        "subhuti_skill_run" => {
-            let skill_id = args
-                .get("skill_id")
+        "subhuti_memory" => {
+            use crate::application::memory_consolidation::MemoryConsolidator;
+            let action = args
+                .get("action")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("缺少必填参数 'skill_id'"))?;
-            let args_str = args.get("args").and_then(|v| v.as_str()).unwrap_or("");
-            let resp = comp
-                .skill_port
-                .execute_skill(skill_id, args_str, "", "")
-                .await;
-            if resp.success {
-                Ok(resp.output)
-            } else {
-                Ok(format!(
-                    "❌ 技能执行失败: {}",
-                    resp.error.unwrap_or_default()
-                ))
+                .ok_or_else(|| anyhow::anyhow!("缺少必填参数 'action'"))?;
+            let sutra = comp
+                .sutra_library
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("藏经阁未初始化"))?;
+            match action {
+                "recall" => {
+                    let q = args
+                        .get("query")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("recall 需要 'query' 参数"))?;
+                    let top_k = args.get("top_k").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+                    Ok(sutra.library_retrieve(q, top_k).await)
+                }
+                "write" => {
+                    let content = args
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("write 需要 'content' 参数"))?;
+                    if content.trim().is_empty() {
+                        return Err(anyhow::anyhow!("content 不能为空"));
+                    }
+                    let domain = args
+                        .get("domain")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("general");
+                    // 从内容提取标题（第一句或前24字）
+                    let title = content.lines().next().unwrap_or("").trim().to_string();
+                    let title = if title.chars().count() > 24 {
+                        title.chars().take(24).collect()
+                    } else {
+                        title
+                    };
+                    let entries = vec![(title, content.to_string())];
+                    let n = sutra.seed_knowledge(domain, &entries).await;
+                    Ok(format!("✅ 已写入 {} 条新记忆到 {} 领域", n, domain))
+                }
+                "stats" => {
+                    let json = sutra.stats_json();
+                    Ok(serde_json::to_string_pretty(&json)
+                        .unwrap_or_else(|_| "统计数据解析失败".into()))
+                }
+                "collections" => Ok(sutra.list_collections()),
+                other => Err(anyhow::anyhow!("未知 action: {}", other)),
             }
         }
         other => Err(anyhow::anyhow!("未知工具: {}", other)),

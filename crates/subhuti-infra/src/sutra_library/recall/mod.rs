@@ -22,7 +22,7 @@ pub mod tantivy_index;
 pub use base_search::BaseSearch;
 pub use config::LibraryRetrieveConfig;
 pub use entity_extractor::EntityExtractor;
-pub use graph::{EdgeKind, EntityGraph, GraphPassageStrategy};
+pub use graph::{EdgeKind, EntityGraph, GraphPassageStrategy, GraphPersistence};
 pub use pipeline::library_retrieve;
 pub use query::QueryAnalyzer;
 pub use scoring::NormalizeStrategy;

@@ -36,8 +36,13 @@ pub struct AppState {
     pub trace_observer: Arc<dyn TraceObserverPort>,
     /// 出站端口：会话观察者（记录会话信息）
     pub session_observer: Arc<dyn SessionObserverPort>,
-    /// 知识库存储（可选，PG 降级模式下为 None）
-    pub pg_storage: Option<Arc<subhuti_infra::sutra_library::storage::PgStorage>>,
+    /// 藏经阁引擎（供 /sutra/stats 可观测接口）
+    pub sutra_library: Option<Arc<dyn subhuti_core::SutraLibraryPort>>,
+    /// 知识库存储（PG 优先，无 PG 时降级为 SQLite；两者同实现 PersistencePort）
+    ///
+    /// 曾固定为 `PgStorage`，无 PG 时直接 503 "数据库未连接"，
+    /// 导致单机部署下知识库接口完全不可用。
+    pub pg_storage: Option<Arc<dyn subhuti_infra::sutra_library::PersistencePort>>,
 }
 
 // ─── FromRef<()> for AppState ──────────────────────────────────

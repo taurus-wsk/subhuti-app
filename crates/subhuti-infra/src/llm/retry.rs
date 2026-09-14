@@ -265,6 +265,62 @@ impl LLM for RetryLLM {
         }
     }
 
+    /// 带用量的对话：与 `chat` 同一套重试/超时/退避语义，只是返回值多带 token 用量。
+    ///
+    /// 说明：这里刻意照抄 `chat` 的循环而不抽公共 helper —— 泛型闭包返回借用 future
+    /// 会引入 HRTB 复杂度，而本文件既有风格就是每方法一份循环。若后续再新增
+    /// chat 系方法，建议统一收敛为一个 `retry_chat<T>` 骨架。
+    async fn chat_counted(
+        &self,
+        messages: Vec<Message>,
+    ) -> subhuti_core::Result<(String, Option<u64>)> {
+        if !self.cfg.enabled || self.cfg.max_attempts <= 1 {
+            return with_timeout(self.inner.chat_counted(messages), self.cfg.timeout(), "").await;
+        }
+
+        let mut attempt = 1u32;
+        loop {
+            let res = with_timeout(
+                self.inner.chat_counted(messages.clone()),
+                self.cfg.timeout(),
+                "",
+            )
+            .await;
+
+            match res {
+                Ok(v) => {
+                    if attempt > 1 {
+                        info!("[RetryLLM] chat_counted 第 {} 次尝试成功", attempt);
+                    }
+                    return Ok(v);
+                }
+                Err(e) => {
+                    let decision = decide(&e);
+                    if matches!(decision, RetryDecision::Stop) || attempt >= self.cfg.max_attempts {
+                        if attempt > 1 {
+                            warn!(
+                                "[RetryLLM] chat_counted 重试 {} 次后仍失败：{}",
+                                attempt - 1,
+                                e
+                            );
+                        }
+                        return Err(e);
+                    }
+                    let delay = self.backoff(attempt, &e);
+                    warn!(
+                        "[RetryLLM] chat_counted 第 {} 次失败（{}ms 后重试，共 {} 次）：{}",
+                        attempt,
+                        delay.as_millis(),
+                        self.cfg.max_attempts,
+                        e
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
     async fn chat_with_tools(
         &self,
         messages: Vec<Message>,
@@ -349,6 +405,63 @@ impl LLM for RetryLLM {
 
             match res {
                 Ok(()) => return Ok(()),
+                Err(e) => {
+                    if emitted.load(Ordering::SeqCst) {
+                        warn!("[RetryLLM] 流式已输出部分内容，不再重试：{}", e);
+                        return Err(e);
+                    }
+                    let decision = decide(&e);
+                    if matches!(decision, RetryDecision::Stop) || attempt >= self.cfg.max_attempts {
+                        return Err(e);
+                    }
+                    let delay = self.backoff(attempt, &e);
+                    warn!(
+                        "[RetryLLM] 流式第 {} 次失败（尚未输出内容，{}ms 后重试）：{}",
+                        attempt,
+                        delay.as_millis(),
+                        e
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    /// 带用量的流式：与 `chat_streaming` 共用同一份"已发出内容则不再重试"的语义，
+    /// 区别只在成功路径把 `Some(total_tokens)` 透出；只要某次成功，整次记为该 provider 用量。
+    async fn chat_streaming_counted(
+        &self,
+        messages: Vec<Message>,
+        callback: Box<dyn Fn(String) + Send>,
+    ) -> subhuti_core::Result<Option<u64>> {
+        if !self.cfg.enabled || self.cfg.max_attempts <= 1 {
+            return self.inner.chat_streaming_counted(messages, callback).await;
+        }
+
+        let emitted = Arc::new(AtomicBool::new(false));
+        let holder: Arc<Mutex<Box<dyn Fn(String) + Send>>> = Arc::new(Mutex::new(callback));
+
+        let mut attempt = 1u32;
+        loop {
+            let emitted_this = emitted.clone();
+            let holder = holder.clone();
+            let cb: Box<dyn Fn(String) + Send> = Box::new(move |delta: String| {
+                emitted_this.store(true, Ordering::SeqCst);
+                if let Ok(f) = holder.lock() {
+                    f(delta);
+                }
+            });
+
+            let res = with_timeout(
+                self.inner.chat_streaming_counted(messages.clone(), cb),
+                self.cfg.timeout(),
+                "流式 ",
+            )
+            .await;
+
+            match res {
+                Ok(tokens) => return Ok(tokens),
                 Err(e) => {
                     if emitted.load(Ordering::SeqCst) {
                         warn!("[RetryLLM] 流式已输出部分内容，不再重试：{}", e);
@@ -539,6 +652,16 @@ mod tests {
             }
             Ok("ok".to_string())
         }
+        async fn chat_counted(
+            &self,
+            _messages: Vec<Message>,
+        ) -> subhuti_core::Result<(String, Option<u64>)> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_times {
+                return Err(self.e());
+            }
+            Ok(("ok".to_string(), Some(123)))
+        }
         async fn chat_with_tools(
             &self,
             _messages: Vec<Message>,
@@ -572,6 +695,21 @@ mod tests {
             callback("完整内容".to_string());
             Ok(())
         }
+        async fn chat_streaming_counted(
+            &self,
+            _messages: Vec<Message>,
+            callback: Box<dyn Fn(String) + Send>,
+        ) -> subhuti_core::Result<Option<u64>> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.emit_before_fail && n < self.fail_times {
+                callback("部分内容".to_string());
+            }
+            if n < self.fail_times {
+                return Err(self.e());
+            }
+            callback("完整内容".to_string());
+            Ok(Some(456))
+        }
         async fn health_check(&self) -> subhuti_core::Result<bool> {
             Ok(true)
         }
@@ -584,6 +722,65 @@ mod tests {
         let out = llm.chat(vec![Message::user("hi")]).await.unwrap();
         assert_eq!(out, "ok");
         assert_eq!(calls.load(Ordering::SeqCst), 3, "应重试到第 3 次成功");
+    }
+
+    #[tokio::test]
+    async fn chat_counted_retries_transient_then_succeeds() {
+        let (inner, calls) = FlakyLLM::new(2, true);
+        let llm = RetryLLM::wrap(inner, fast_cfg());
+        let (out, tokens) = llm.chat_counted(vec![Message::user("hi")]).await.unwrap();
+        assert_eq!(out, "ok");
+        assert_eq!(tokens, Some(123), "用量必须穿过重试层原样透出");
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "应重试到第 3 次成功");
+    }
+
+    #[tokio::test]
+    async fn chat_counted_does_not_retry_client_error() {
+        let (inner, calls) = FlakyLLM::new(2, false);
+        let llm = RetryLLM::wrap(inner, fast_cfg());
+        assert!(llm.chat_counted(vec![Message::user("hi")]).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "4xx 不应重试");
+    }
+
+    /// 流式带用量的关键回归：必须重试到成功、且用量穿过重试层原样透出。
+    /// 漏这一项会让流式调用全部 0 费用、与 chat_counted 不一致。
+    #[tokio::test]
+    async fn chat_streaming_counted_retries_transient_then_succeeds() {
+        let (inner, calls) = FlakyLLM::new(2, true);
+        let llm = RetryLLM::wrap(inner.clone(), fast_cfg());
+        let chunks = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = chunks.clone();
+        let cb: Box<dyn Fn(String) + Send> =
+            Box::new(move |s: String| sink.lock().unwrap().push(s));
+        let tokens = llm
+            .chat_streaming_counted(vec![Message::user("hi")], cb)
+            .await
+            .unwrap();
+        eprintln!(
+            "DEBUG calls={} tokens={:?}",
+            calls.load(Ordering::SeqCst),
+            tokens
+        );
+        assert_eq!(tokens, Some(456), "末条分片 usage 必须透传");
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "应重试到第 3 次成功");
+        // 流式文本应完整地穿过整个重试链路
+        let collected: Vec<String> = chunks.lock().unwrap().clone();
+        assert_eq!(collected.join("|"), "完整内容", "只应回调一次最终结果");
+    }
+
+    #[tokio::test]
+    async fn chat_streaming_counted_does_not_retry_client_error() {
+        let (inner, calls) = FlakyLLM::new(2, false);
+        let llm = RetryLLM::wrap(inner, fast_cfg());
+        let chunks = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = chunks.clone();
+        let cb: Box<dyn Fn(String) + Send> =
+            Box::new(move |s: String| sink.lock().unwrap().push(s));
+        assert!(llm
+            .chat_streaming_counted(vec![Message::user("hi")], cb)
+            .await
+            .is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "4xx 不应重试");
     }
 
     #[tokio::test]

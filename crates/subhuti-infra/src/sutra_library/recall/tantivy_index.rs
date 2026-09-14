@@ -176,6 +176,55 @@ impl TantivyIndex {
         Ok(Self::init_index(index, fields))
     }
 
+    /// 打开（或首次创建）磁盘索引 —— 落盘持久化的推荐入口
+    ///
+    /// 与 `new_in_dir` 的区别：目录已有索引时**复用**而不是报错重建，
+    /// 因此进程重启后已沉淀的记忆仍可被检索到。
+    ///
+    /// 任何异常（权限不足、schema 不兼容、索引损坏）都会降级为内存索引并告警，
+    /// 保证记忆引擎不会因为索引问题整体不可用。
+    pub fn open_or_create_in_dir<P: AsRef<std::path::Path>>(dir_path: P) -> Self {
+        let dir = dir_path.as_ref();
+        if let Ok(index) = Index::open_in_dir(dir) {
+            if let Some(fields) = Self::fields_from_schema(&index.schema()) {
+                return Self::init_index(index, fields);
+            }
+            tracing::warn!(
+                "TantivyIndex: 磁盘索引 schema 不兼容，重建索引目录 {:?}",
+                dir
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!("TantivyIndex: 无法创建索引目录 {:?}: {}", dir, e);
+            return Self::new_in_ram();
+        }
+        match Self::new_in_dir(dir) {
+            Ok(idx) => idx,
+            Err(e) => {
+                tracing::warn!("TantivyIndex: 磁盘索引创建失败，降级内存: {}", e);
+                Self::new_in_ram()
+            }
+        }
+    }
+
+    /// 从已打开的 schema 中取回字段句柄；任一字段缺失返回 None（表示 schema 不兼容）
+    fn fields_from_schema(schema: &Schema) -> Option<TantivyFields> {
+        let get = |name: &str| schema.get_field(name).ok();
+        Some(TantivyFields {
+            node_id: get("node_id")?,
+            title: get("title")?,
+            content: get("content")?,
+            summary: get("summary")?,
+            collection_id: get("collection_id")?,
+            domain: get("domain")?,
+            node_type: get("node_type")?,
+            space_path_id: get("space_path_id")?,
+            knowledge_node_ids: get("knowledge_node_ids")?,
+            entity_ids: get("entity_ids")?,
+        })
+    }
+
     /// 构建 Schema
     fn build_schema() -> (Schema, TantivyFields) {
         let mut builder = Schema::builder();
@@ -385,6 +434,23 @@ impl TantivyIndex {
         let _ = writer.commit();
     }
 
+    /// 清空全部文档（用于与持久化层全量对齐后的索引重建）
+    ///
+    /// 为什么需要：节点被删除后（清理脏数据、或数据目录被手工改动），磁盘索引
+    /// 里仍留着已删节点的文档。检索会命中这些"幽灵文档"——`read_node` 读不到，
+    /// 却照样占掉 top_k 名额，表现为"库里明明有数据却检索不到"
+    /// （实测 top_k=1 时直接返回"未找到匹配的记忆"）。
+    pub fn clear(&self) {
+        let mut writer = self.writer.write().unwrap();
+        if let Err(e) = writer.delete_all_documents() {
+            tracing::warn!("TantivyIndex: 清空索引失败: {}", e);
+            return;
+        }
+        if let Err(e) = writer.commit() {
+            tracing::warn!("TantivyIndex: 清空索引后提交失败: {}", e);
+        }
+    }
+
     // ─── 检索查询 ───────────────────────────────────────────────
 
     /// 全文检索，返回 BM25 得分降序的 BaseHit 列表
@@ -416,13 +482,15 @@ impl TantivyIndex {
         let searcher = reader.searcher();
 
         // 构建全文查询
-        let query_parser = tantivy::query::QueryParser::for_index(
-            &self.index,
-            vec![self.title, self.content, self.summary],
-        );
-        let parsed_query = query_parser
-            .parse_query(query)
-            .unwrap_or_else(|_| Box::new(tantivy::query::AllQuery));
+        //
+        // ⚠️ 不能直接用 `QueryParser::parse_query(整个句子)`：实测它会把整句当成一个
+        // 近似精确匹配的查询，长问句（"我刚才说的渲染器和采样值是多少？"）
+        // 几乎只能匹配到"用户当前这句话本身"，历史记忆一条都召回不到——
+        // 表现就是"沉淀成功却依旧失忆"。
+        //
+        // 改为：jieba 分词 → 去停用词 → 各词在 title/content/summary 上做 OR（Should）。
+        // 分词器与索引侧一致，保证 token 对得上；OR 语义让长句里的关键实体也能命中。
+        let parsed_query = self.build_fulltext_query(query);
 
         // 构建过滤条件
         let mut subqueries: Vec<(Occur, Box<dyn tantivy::query::Query>)> = Vec::new();
@@ -514,6 +582,115 @@ impl TantivyIndex {
     }
 
     // ─── 工具方法 ───────────────────────────────────────────────
+
+    /// 用 jieba 分词构造 OR 全文查询（与索引侧分词器一致）
+    fn build_fulltext_query(&self, query: &str) -> Box<dyn tantivy::query::Query> {
+        let jieba = Jieba::new();
+        let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = Vec::new();
+
+        // 与索引侧 `JiebaTokenizer` 保持一致：Search 模式 + hmm。
+        // 分词模式不一致会导致 token 对不上（实测查 "采样值" 召回不到
+        // 含 "采样值设为 128" 的节点）。
+        let tokens = jieba.tokenize(query, jieba_rs::TokenizeMode::Search, true);
+        let mut words: Vec<String> = Vec::new();
+        for tk in &tokens {
+            let w = &query[tk.byte_start..tk.byte_end];
+            words.push(w.to_string());
+            // 索引侧不做大小写归一，这里补一个小写变体，
+            // 让 "Cycles" / "cycles" 两种写法都能命中（纯 ASCII 词才有意义）
+            let lower = w.to_lowercase();
+            if lower != w && w.chars().all(|c| c.is_ascii_alphanumeric()) {
+                words.push(lower);
+            }
+        }
+
+        for raw in words {
+            let t = raw.trim();
+            if Self::is_stop_word(t) {
+                continue;
+            }
+            // 单字（"的""了"）噪音太大；但纯 ASCII 数字/英文单词保留（如 128、PNG）
+            let is_ascii = t.chars().all(|c| c.is_ascii_alphanumeric());
+            if t.chars().count() < 2 && !is_ascii {
+                continue;
+            }
+            for field in [self.title, self.content, self.summary] {
+                let term = tantivy::Term::from_field_text(field, &t);
+                clauses.push((
+                    Occur::Should,
+                    Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+                ));
+            }
+        }
+
+        if clauses.is_empty() {
+            // 全是停用词（如"你好吗"）：退化为全匹配，交由上层排序
+            return Box::new(tantivy::query::AllQuery);
+        }
+        Box::new(BooleanQuery::new(clauses))
+    }
+
+    /// 查询侧停用词：疑问词、代词、助词等在记忆检索里没有区分度
+    pub fn is_stop_word(t: &str) -> bool {
+        const STOP: &[&str] = &[
+            "我",
+            "我们",
+            "你",
+            "你们",
+            "他",
+            "她",
+            "它",
+            "的",
+            "了",
+            "是",
+            "在",
+            "有",
+            "和",
+            "就",
+            "不",
+            "也",
+            "都",
+            "要",
+            "会",
+            "着",
+            "过",
+            "吗",
+            "呢",
+            "吧",
+            "啊",
+            "什么",
+            "怎么",
+            "怎样",
+            "如何",
+            "多少",
+            "哪个",
+            "哪些",
+            "为什么",
+            "请问",
+            "刚",
+            "刚才",
+            "说",
+            "问",
+            "告诉",
+            "一下",
+            "这个",
+            "那个",
+            "可以",
+            "能否",
+            "能不能",
+            "之前",
+            "现在",
+            "然后",
+            "就是",
+            "没有",
+            "还是",
+            "一个",
+            "一下",
+            "知道",
+            "需要",
+        ];
+        STOP.contains(&t)
+    }
 
     /// 从 MemoryNode 收集知识节点 ID（目前从 metadata 中提取）
     fn collect_knowledge_node_ids(node: &MemoryNode) -> String {
@@ -692,5 +869,79 @@ mod tests {
         let index = TantivyIndex::new_in_ram();
         let hits = index.search("", 10);
         assert!(hits.is_empty(), "空查询应该返回空结果");
+    }
+}
+
+/// 磁盘索引回归测试
+///
+/// 锁两件事：
+/// 1. 落盘索引重启后仍在（记忆不会随进程退出而蒸发）
+/// 2. **长问句也能召回历史记忆** —— 曾经因为整句精确匹配，
+///    长问句只命中"用户当前这句话本身"，历史记忆一条都召不回。
+#[cfg(test)]
+mod disk_roundtrip {
+    use super::*;
+    use crate::sutra_library::models::MemoryNode;
+
+    fn node(id: &str, content: &str) -> MemoryNode {
+        MemoryNode {
+            node_id: id.to_string(),
+            collection_id: "c1".to_string(),
+            domain: "blender".to_string(),
+            node_type: "session_message".to_string(),
+            content_hash: format!("h{}", id),
+            parent_id: None,
+            path: "/p".to_string(),
+            depth: 0,
+            sort_order: 0,
+            title: content.chars().take(20).collect(),
+            summary: String::new(),
+            content: content.to_string(),
+            metadata: serde_json::json!({}),
+            refs_out: Vec::new(),
+            refs_in: Vec::new(),
+            version_tag: "current".to_string(),
+            snapshot_id: None,
+            base_activation: 0.7,
+            importance: 1,
+            access_count: 0,
+            feedback_score: 0.0,
+            last_accessed_at: 0,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn disk_index_survives_restart_and_recalls_by_long_question() {
+        let dir = std::env::temp_dir().join(format!("tantivy_diag_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let idx = TantivyIndex::open_or_create_in_dir(&dir);
+            idx.index_node(&node("n1", "用户项目固定使用 Cycles 渲染器"));
+            idx.index_node(&node("n2", "采样值设为 128"));
+            idx.commit();
+            assert_eq!(idx.num_docs(), 2, "提交后应能读到 2 篇文档");
+            let hits = idx.search("渲染器", 5);
+            assert!(!hits.is_empty(), "磁盘索引应能检索到");
+        }
+        // 重新打开（模拟进程重启）
+        {
+            let idx = TantivyIndex::open_or_create_in_dir(&dir);
+            assert_eq!(idx.num_docs(), 2, "重开后文档应仍在");
+            for q in ["渲染器", "采样值", "Cycles", "128"] {
+                assert!(!idx.search(q, 5).is_empty(), "重开后应能检索到 {:?}", q);
+            }
+            // 关键回归：完整问句（含代词/疑问词）必须能召回历史记忆
+            let long_q = "我刚才说的渲染器和采样值是多少？";
+            let hits = idx.search(long_q, 5);
+            let ids: Vec<&str> = hits.iter().map(|h| h.chunk_id.as_str()).collect();
+            assert!(
+                ids.contains(&"n1") && ids.contains(&"n2"),
+                "长问句必须召回两条历史记忆，实际: {:?}",
+                ids
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

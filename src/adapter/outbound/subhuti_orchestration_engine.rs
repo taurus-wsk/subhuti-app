@@ -41,23 +41,22 @@ impl OrchestrationEnginePort for SubhutiOrchestrationEngine {
         message: &str,
         user_id: &str,
         chain: &str,
-        graph: &str,
         expert_id: &str,
         trace_id: &str,
         session_id: &str,
-        workspace_folder: &str,
         system_prompt: &str,
+        extra: &serde_json::Value,
+        progress_tx: Option<crate::domain::traits::ProgressTx>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = OrchestrateResponse> + Send>> {
         let subhuti = self.subhuti.clone();
         let message = message.to_string();
         let user_id = user_id.to_string();
         let chain = chain.to_string();
-        let graph = graph.to_string();
         let expert_id = expert_id.to_string();
         let trace_id = trace_id.to_string();
         let session_id = session_id.to_string();
-        let workspace_folder = workspace_folder.to_string();
         let system_prompt = system_prompt.to_string();
+        let extra = extra.clone();
         let trace_observer = self.trace_observer.clone();
 
         // 序列化输入用于 FnTracer
@@ -65,11 +64,10 @@ impl OrchestrationEnginePort for SubhutiOrchestrationEngine {
             "message": &message,
             "user_id": &user_id,
             "chain": &chain,
-            "graph": &graph,
             "trace_id": &trace_id,
             "session_id": &session_id,
-            "workspace_folder": &workspace_folder,
             "system_prompt": &system_prompt,
+            "extra": &extra,
         })
         .to_string();
 
@@ -110,17 +108,6 @@ impl OrchestrationEnginePort for SubhutiOrchestrationEngine {
                 ctx.set_metadata("skill_id", &chain);
             }
 
-            // 如果指定了图名称，设置图信息（dispatch 时优先使用指定图）
-            //
-            // 过去这里写的是 `graph != "default"`，把 "default" 当作「前端未选择」
-            // 静默忽略，副作用是调用方无法明确表达「别猜图」，只能听任关键词
-            // 路由误判（实测把 Blender 问题判进了 rust_edit，跑了 4 分钟）。
-            // 现在显式指定的图一律生效；"default" 由 Orchestrator 解释为
-            // 「跳过关键词匹配，直接交给最相关的专家」。
-            if !graph.is_empty() {
-                ctx.set_metadata("graph_name", &graph);
-            }
-
             // 如果指定了专家 ID，设置专家信息（dispatch 时直接路由到该专家）
             if !expert_id.is_empty() {
                 ctx.set_metadata("expert_id", &expert_id);
@@ -134,13 +121,28 @@ impl OrchestrationEnginePort for SubhutiOrchestrationEngine {
                 ctx.set_metadata("session_id", &session_id);
             }
 
-            // 注入 workspace_folder / system_prompt（前端聊天设置传入，透传给专家）
-            if !workspace_folder.is_empty() {
-                ctx.set_metadata("workspace_folder", &workspace_folder);
-            }
+            // 注入 system_prompt（前端聊天设置传入，覆盖专家默认 system prompt）
             if !system_prompt.is_empty() {
                 ctx.set_metadata("system_prompt", &system_prompt);
             }
+
+            // 摊平 extra（任意扩展参数）进 ctx.metadata：未来传什么配置都行。
+            // 例如 {"workspace_folder": "/path"} 会被展开为 metadata["workspace_folder"]，
+            // 领域专家（如 Rust 专家）照常从 metadata 读取，无需改领域代码。
+            if let Some(obj) = extra.as_object() {
+                for (k, v) in obj {
+                    let v_str = match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    ctx.set_metadata(k, &v_str);
+                }
+            }
+
+            // 注入 per-request 结构化进度事件通道（取代旧版全局注册表）。
+            // orchestrate_stream 创建 (p_tx, p_rx) 并把 p_tx 经这里注入 AgentContext.progress，
+            // 专家与框架动作事件统一汇聚为单条 ProgressEvent 流。
+            ctx.progress = progress_tx;
 
             if let Some(ref obs) = trace_observer {
                 record_fn_log(

@@ -545,6 +545,43 @@ impl LLM for OpenAIClient {
         messages: Vec<Message>,
         callback: Box<dyn Fn(String) + Send>,
     ) -> subhuti_core::Result<()> {
+        // OpenAI 兼容协议（OpenAI / Zhipu / Doubao）共用同一份 SSE 解析逻辑。
+        // 调用方不需要用量时拿不到、用量挂件由 `chat_streaming_counted` 提供。
+        self.stream_completion(messages, callback).await.map(|_| ())
+    }
+
+    async fn chat_streaming_counted(
+        &self,
+        messages: Vec<Message>,
+        callback: Box<dyn Fn(String) + Send>,
+    ) -> subhuti_core::Result<Option<u64>> {
+        self.stream_completion(messages, callback).await
+    }
+
+    async fn health_check(&self) -> subhuti_core::Result<bool> {
+        let url = format!("{}/models", self.config.api_url);
+        let response = self
+            .http_client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .send()
+            .await
+            .map_err(map_reqwest_error)?;
+        Ok(response.status().is_success())
+    }
+}
+
+impl OpenAIClient {
+    /// OpenAI 兼容协议的共用 SSE 解析：每个分片走 `OpenAIStreamEvent`，
+    /// 把 delta.content 透给 callback 并**收集**末条分片的 `usage.total_tokens`。
+    ///
+    /// 末条分片特征：`choices` 为空、只含 `usage`（OpenAI/智谱都这样下发），
+    /// 所以事件结构上 `choices` 是 `#[serde(default)]` 的。
+    async fn stream_completion(
+        &self,
+        messages: Vec<Message>,
+        callback: Box<dyn Fn(String) + Send>,
+    ) -> subhuti_core::Result<Option<u64>> {
         let url = format!("{}/chat/completions", self.config.api_url);
         let request_body = OpenAICompletionRequest {
             model: self.config.model.clone(),
@@ -577,36 +614,37 @@ impl LLM for OpenAIClient {
             .await
             .map_err(map_reqwest_error)?;
 
+        let last_usage_slot: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let slot_for_cb = Arc::clone(&last_usage_slot);
         let cb = callback;
         drain_stream_lines(&mut response, move |line| {
-            if let Some(data) = line.strip_prefix("data: ") {
-                if data == "[DONE]" {
-                    return true;
+            // SSE：`data: {...}` 行，也可能空行/心跳
+            let Some(data) = line.strip_prefix("data: ") else {
+                return false;
+            };
+            if data == "[DONE]" {
+                return true;
+            }
+            let Ok(event) = serde_json::from_str::<OpenAIStreamEvent>(data) else {
+                return false;
+            };
+            // 文本增量：choices.first() 安全（已 #[serde(default)]）
+            if let Some(choice) = event.choices.first() {
+                if let Some(content) = choice.delta.content.clone() {
+                    cb(content);
                 }
-                if let Ok(event) = serde_json::from_str::<OpenAIStreamEvent>(data) {
-                    // 部分分片 choices 为空（如仅含 role/usage），用 first() 避免越界 panic
-                    if let Some(choice) = event.choices.first() {
-                        if let Some(content) = choice.delta.content.clone() {
-                            cb(content);
-                        }
-                    }
+            }
+            // 用量分片：choices 为空但 usage 有值 → 记下来返回
+            if let Some(usage) = event.usage {
+                if let Ok(mut guard) = slot_for_cb.lock() {
+                    *guard = Some(usage.total_tokens as u64);
                 }
             }
             false
         })
-        .await
-    }
-
-    async fn health_check(&self) -> subhuti_core::Result<bool> {
-        let url = format!("{}/models", self.config.api_url);
-        let response = self
-            .http_client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .send()
-            .await
-            .map_err(map_reqwest_error)?;
-        Ok(response.status().is_success())
+        .await?;
+        // poison 中毒也无所谓（说明别的线程已经拿走了数据）——这里只是兜底取最后写入的值
+        Ok(last_usage_slot.lock().ok().and_then(|g| *g))
     }
 }
 
@@ -674,7 +712,12 @@ struct OpenAIUsage {
 
 #[derive(Debug, Deserialize)]
 struct OpenAIStreamEvent {
+    /// 末条分片可能**不含** choices（只带 usage），故加 default 保证解析不失败
+    #[serde(default)]
     choices: Vec<OpenAIStreamChoice>,
+    /// 用量分片：`choices` 为空、仅含 usage。命中即计入成本。
+    #[serde(default)]
+    usage: Option<OpenAIUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -853,6 +896,19 @@ impl LLM for OllamaClient {
         .await
     }
 
+    async fn chat_streaming_counted(
+        &self,
+        messages: Vec<Message>,
+        callback: Box<dyn Fn(String) + Send>,
+    ) -> subhuti_core::Result<Option<u64>> {
+        // Ollama 的流式协议不在末条分片携带统一 usage 字段；
+        // 它的 done=true 分片里有 prompt_eval_count / eval_count，
+        // 但与 OpenAI/智谱的 total_tokens 语义不同，且本地模型没有"账单"概念。
+        // 这里走默认实现：调用 chat_streaming 并返回 Ok(None)，保持口径一致。
+        self.chat_streaming(messages, callback).await?;
+        Ok(None)
+    }
+
     async fn health_check(&self) -> subhuti_core::Result<bool> {
         let url = format!("{}/tags", self.config.api_url);
         let response = self
@@ -1019,6 +1075,37 @@ impl LLM for DoubaoClient {
         messages: Vec<Message>,
         callback: Box<dyn Fn(String) + Send>,
     ) -> subhuti_core::Result<()> {
+        self.stream_completion(messages, callback).await.map(|_| ())
+    }
+
+    async fn chat_streaming_counted(
+        &self,
+        messages: Vec<Message>,
+        callback: Box<dyn Fn(String) + Send>,
+    ) -> subhuti_core::Result<Option<u64>> {
+        self.stream_completion(messages, callback).await
+    }
+
+    async fn health_check(&self) -> subhuti_core::Result<bool> {
+        let url = format!("{}/health", self.config.api_url);
+        let response = self
+            .http_client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .send()
+            .await
+            .map_err(map_reqwest_error)?;
+        Ok(response.status().is_success())
+    }
+}
+
+impl DoubaoClient {
+    /// 火山方舟（豆包）流式：每行一个 JSON 对象，`is_finish=true` 收尾，末条分片带 usage。
+    async fn stream_completion(
+        &self,
+        messages: Vec<Message>,
+        callback: Box<dyn Fn(String) + Send>,
+    ) -> subhuti_core::Result<Option<u64>> {
         let url = &self.config.api_url;
         let request_body = DoubaoChatRequest {
             model: self.config.model.clone(),
@@ -1049,32 +1136,29 @@ impl LLM for DoubaoClient {
             .await
             .map_err(map_reqwest_error)?;
 
+        let last_usage_slot: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let slot_for_cb = Arc::clone(&last_usage_slot);
         let cb = callback;
         drain_stream_lines(&mut response, move |line| {
             if line.trim().is_empty() {
                 return false;
             }
-            if let Ok(event) = serde_json::from_str::<DoubaoStreamEvent>(line) {
-                cb(event.content);
-                if event.is_finish {
-                    return true;
+            let Ok(event) = serde_json::from_str::<DoubaoStreamEvent>(line) else {
+                return false;
+            };
+            cb(event.content);
+            if let Some(usage) = event.usage {
+                if let Ok(mut guard) = slot_for_cb.lock() {
+                    *guard = Some(usage.total_tokens as u64);
                 }
+            }
+            if event.is_finish {
+                return true;
             }
             false
         })
-        .await
-    }
-
-    async fn health_check(&self) -> subhuti_core::Result<bool> {
-        let url = format!("{}/health", self.config.api_url);
-        let response = self
-            .http_client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .send()
-            .await
-            .map_err(map_reqwest_error)?;
-        Ok(response.status().is_success())
+        .await?;
+        Ok(last_usage_slot.lock().ok().and_then(|g| *g))
     }
 }
 
@@ -1106,6 +1190,17 @@ struct DoubaoResult {
 struct DoubaoStreamEvent {
     content: String,
     is_finish: bool,
+    /// 火山方舟流式末条分片携带 usage；非流式响应体也共用同一形状。
+    #[serde(default)]
+    usage: Option<DoubaoUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct DoubaoUsage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_tokens: u32,
 }
 
 // ============================================================
@@ -1177,6 +1272,51 @@ impl ZhipuClient {
         }
         Self::new(cfg)
     }
+
+    /// 共享的「发一次非流式补全请求并解析」。
+    ///
+    /// `chat` / `chat_counted` / `chat_with_tools` 三个入口复用它，
+    /// 关键是**请求体的 `tools` 字段语义完全不变**（chat 路径仍是 `None`），
+    /// 但 `usage` 一定被解析出来——此前 `chat()` 自己发请求并把 usage 丢掉了。
+    async fn send_completion(
+        &self,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolInfo>>,
+    ) -> subhuti_core::Result<ZhipuCompletionResponse> {
+        let url = format!("{}/chat/completions", self.config.api_url);
+        let request_body = ZhipuCompletionRequest {
+            model: self.config.model.clone(),
+            messages: messages
+                .into_iter()
+                .map(|m| ZhipuMessage {
+                    role: match m.role {
+                        Role::System => "system",
+                        Role::User => "user",
+                        Role::Assistant => "assistant",
+                        Role::Tool => "tool",
+                    }
+                    .to_string(),
+                    content: m.content,
+                })
+                .collect(),
+            temperature: self.config.temperature,
+            max_tokens: self.config.max_tokens,
+            stream: false,
+            tools,
+        };
+
+        let response = self
+            .http_client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(map_reqwest_error)?;
+
+        parse_zhipu_json(response).await
+    }
 }
 
 #[async_trait]
@@ -1190,39 +1330,7 @@ impl LLM for ZhipuClient {
     }
 
     async fn chat(&self, messages: Vec<Message>) -> subhuti_core::Result<String> {
-        let url = format!("{}/chat/completions", self.config.api_url);
-        let request_body = ZhipuCompletionRequest {
-            model: self.config.model.clone(),
-            messages: messages
-                .into_iter()
-                .map(|m| ZhipuMessage {
-                    role: match m.role {
-                        Role::System => "system",
-                        Role::User => "user",
-                        Role::Assistant => "assistant",
-                        Role::Tool => "tool",
-                    }
-                    .to_string(),
-                    content: m.content,
-                })
-                .collect(),
-            temperature: self.config.temperature,
-            max_tokens: self.config.max_tokens,
-            stream: false,
-            tools: None,
-        };
-
-        let response = self
-            .http_client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .header("Content-Type", "application/json")
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(map_reqwest_error)?;
-
-        let result: ZhipuCompletionResponse = parse_zhipu_json(response).await?;
+        let result = self.send_completion(messages, None).await?;
         Ok(result.choices[0]
             .message
             .content
@@ -1230,44 +1338,27 @@ impl LLM for ZhipuClient {
             .unwrap_or_default())
     }
 
+    /// 带用量的对话：与 `chat` 完全同一条请求路径，额外把 `usage.total_tokens` 透出。
+    async fn chat_counted(
+        &self,
+        messages: Vec<Message>,
+    ) -> subhuti_core::Result<(String, Option<u64>)> {
+        let result = self.send_completion(messages, None).await?;
+        let content = result.choices[0]
+            .message
+            .content
+            .clone()
+            .unwrap_or_default();
+        let tokens = result.usage.as_ref().map(|u| u.total_tokens as u64);
+        Ok((content, tokens))
+    }
+
     async fn chat_with_tools(
         &self,
         messages: Vec<Message>,
         tools: Vec<ToolInfo>,
     ) -> subhuti_core::Result<LLMResponse> {
-        let url = format!("{}/chat/completions", self.config.api_url);
-        let request_body = ZhipuCompletionRequest {
-            model: self.config.model.clone(),
-            messages: messages
-                .into_iter()
-                .map(|m| ZhipuMessage {
-                    role: match m.role {
-                        Role::System => "system",
-                        Role::User => "user",
-                        Role::Assistant => "assistant",
-                        Role::Tool => "tool",
-                    }
-                    .to_string(),
-                    content: m.content,
-                })
-                .collect(),
-            temperature: self.config.temperature,
-            max_tokens: self.config.max_tokens,
-            stream: false,
-            tools: Some(tools),
-        };
-
-        let response = self
-            .http_client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .header("Content-Type", "application/json")
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(map_reqwest_error)?;
-
-        let result: ZhipuCompletionResponse = parse_zhipu_json(response).await?;
+        let result = self.send_completion(messages, Some(tools)).await?;
         let message = &result.choices[0].message;
 
         Ok(LLMResponse {
@@ -1291,6 +1382,47 @@ impl LLM for ZhipuClient {
         messages: Vec<Message>,
         callback: Box<dyn Fn(String) + Send>,
     ) -> subhuti_core::Result<()> {
+        self.stream_completion(messages, callback).await.map(|_| ())
+    }
+
+    async fn chat_streaming_counted(
+        &self,
+        messages: Vec<Message>,
+        callback: Box<dyn Fn(String) + Send>,
+    ) -> subhuti_core::Result<Option<u64>> {
+        self.stream_completion(messages, callback).await
+    }
+
+    async fn health_check(&self) -> subhuti_core::Result<bool> {
+        // 注意：智谱对 `/models` 接口权限控制较严（会返回 401），改用一次最小 chat 请求做健康检查
+        let url = format!("{}/chat/completions", self.config.api_url);
+        let ping_body = serde_json::json!({
+            "model": self.config.model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1,
+            "temperature": 0.0,
+        });
+        let response = self
+            .http_client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .header("Content-Type", "application/json")
+            .json(&ping_body)
+            .send()
+            .await
+            .map_err(map_reqwest_error)?;
+        Ok(response.status().is_success())
+    }
+}
+
+impl ZhipuClient {
+    /// 智谱（OpenAI 兼容协议）共用 SSE 解析：文本透传给 callback，末条分片抓 `usage.total_tokens`。
+    /// 智谱 401/429/余额错误是非流式友好的错误体，这里保留非 2xx 即报错。
+    async fn stream_completion(
+        &self,
+        messages: Vec<Message>,
+        callback: Box<dyn Fn(String) + Send>,
+    ) -> subhuti_core::Result<Option<u64>> {
         let url = format!("{}/chat/completions", self.config.api_url);
         let request_body = ZhipuCompletionRequest {
             model: self.config.model.clone(),
@@ -1336,45 +1468,33 @@ impl LLM for ZhipuClient {
             )));
         }
 
+        let last_usage_slot: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let slot_for_cb = Arc::clone(&last_usage_slot);
         let cb = callback;
         drain_stream_lines(&mut response, move |line| {
-            if let Some(data) = line.strip_prefix("data: ") {
-                if data == "[DONE]" {
-                    return true;
+            let Some(data) = line.strip_prefix("data: ") else {
+                return false;
+            };
+            if data == "[DONE]" {
+                return true;
+            }
+            let Ok(event) = serde_json::from_str::<ZhipuStreamEvent>(data) else {
+                return false;
+            };
+            if let Some(choice) = event.choices.first() {
+                if let Some(content) = choice.delta.content.clone() {
+                    cb(content);
                 }
-                if let Ok(event) = serde_json::from_str::<ZhipuStreamEvent>(data) {
-                    // 部分分片 choices 为空（如仅含 role/usage），用 first() 避免越界 panic
-                    if let Some(choice) = event.choices.first() {
-                        if let Some(content) = choice.delta.content.clone() {
-                            cb(content);
-                        }
-                    }
+            }
+            if let Some(usage) = event.usage {
+                if let Ok(mut guard) = slot_for_cb.lock() {
+                    *guard = Some(usage.total_tokens as u64);
                 }
             }
             false
         })
-        .await
-    }
-
-    async fn health_check(&self) -> subhuti_core::Result<bool> {
-        // 注意：智谱对 `/models` 接口权限控制较严（会返回 401），改用一次最小 chat 请求做健康检查
-        let url = format!("{}/chat/completions", self.config.api_url);
-        let ping_body = serde_json::json!({
-            "model": self.config.model,
-            "messages": [{"role": "user", "content": "ping"}],
-            "max_tokens": 1,
-            "temperature": 0.0,
-        });
-        let response = self
-            .http_client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .header("Content-Type", "application/json")
-            .json(&ping_body)
-            .send()
-            .await
-            .map_err(map_reqwest_error)?;
-        Ok(response.status().is_success())
+        .await?;
+        Ok(last_usage_slot.lock().ok().and_then(|g| *g))
     }
 }
 
@@ -1442,7 +1562,12 @@ struct ZhipuUsage {
 
 #[derive(Debug, Deserialize)]
 struct ZhipuStreamEvent {
+    /// 末条分片可能不含 choices（只带 usage），故 default 保证解析不失败
+    #[serde(default)]
     choices: Vec<ZhipuStreamChoice>,
+    /// 用量分片：choices 为空、仅含 usage。命中即计入成本。
+    #[serde(default)]
+    usage: Option<ZhipuUsage>,
 }
 
 #[derive(Debug, Deserialize)]

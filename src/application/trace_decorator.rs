@@ -81,6 +81,8 @@ fn finalize_trace(
         trace.complete_failed(error.unwrap_or_default().to_string(), duration_ms);
     }
     let trace_id = trace.trace_id.clone();
+    // 真实 token 成本：汇总本次请求所有 LLM 调用 span 的 tokens（取代硬编码 0）
+    let total_tokens = trace_observer.total_tokens(&trace_id);
     trace_observer.store_trace(trace);
 
     session_observer.record_request(SessionRecordParams {
@@ -97,7 +99,7 @@ fn finalize_trace(
         },
         duration_ms: Some(duration_ms),
         matched_skill: None,
-        token_usage: Some(r#"{"total_tokens": 0}"#.to_string()),
+        token_usage: Some(format!(r#"{{"total_tokens": {}}}"#, total_tokens)),
         status: if success {
             "Success".to_string()
         } else {
@@ -249,6 +251,7 @@ impl SkillPort for TraceAppService {
         args: &str,
         _trace_id: &str,
         _session_id: &str,
+        extra: &str,
     ) -> Pin<Box<dyn Future<Output = SkillResponse> + Send>> {
         let inner = self.inner.clone();
         let trace_observer = self.trace_observer.clone();
@@ -258,6 +261,7 @@ impl SkillPort for TraceAppService {
         let user_id = "anonymous".to_string();
         let session_id = gen_session_id();
         let message = format!("skill={}, args={}", skill_id, args);
+        let extra = extra.to_string();
 
         Box::pin(async move {
             let trace = trace_observer.create_trace(&user_id, &session_id, &message);
@@ -265,7 +269,7 @@ impl SkillPort for TraceAppService {
             let decorator_trace_id = trace.trace_id.clone();
             let start = Instant::now();
             let resp = inner
-                .execute_skill(&skill_id, &args, &decorator_trace_id, &session_id)
+                .execute_skill(&skill_id, &args, &decorator_trace_id, &session_id, &extra)
                 .await;
             let duration_ms = start.elapsed().as_millis() as u64;
 

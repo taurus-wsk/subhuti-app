@@ -19,13 +19,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::mpsc;
 
+use crate::domain::events::DomainEvent;
 use crate::domain::traits::{
     chat_stream_to_progress, DomainContext, DomainError, DomainExecutionContext, DomainExpert,
     DomainMessage, DomainResult, DomainRole, DomainSkill,
 };
-use subhuti_core::event::AgentEventData;
 
 /// Rust 编程专家
 ///
@@ -267,9 +266,52 @@ impl RustExpert {
             }
         }
 
+        // 知识库为空时，退一步走藏经阁**记忆召回**。
+        //
+        // 这一步之前完全没有：Rust 专家只认知识库切片，既读不到会话沉淀的记忆，
+        // 也导致 `last_retrieve_cache` 永远没有 Rust 领域的记录 → 反馈分析器
+        // 统计出来的命中率恒为 0.00%，指标彻底失去意义。
+        if let Some(sutra) = &exec_ctx.sutra_library {
+            let recalled = sutra.library_retrieve(&exec_ctx.ctx.input, 3).await;
+            if !recalled.contains("未找到")
+                && !recalled.contains("⚠️")
+                && !recalled.trim().is_empty()
+            {
+                tracing::info!(
+                    "从藏经阁召回记忆: {} 字节（知识库无切片，改用记忆通路）",
+                    recalled.len()
+                );
+                return format!(
+                    "{}\n\n以下是藏经阁中与当前问题相关的历史记忆，请优先参考：\n{}",
+                    self.build_system_prompt(),
+                    recalled
+                );
+            }
+        }
+
         // fallback: 使用静态知识库
-        tracing::info!("藏经阁不可用，使用静态知识库");
+        tracing::info!("藏经阁无可用记忆/知识，使用静态知识库");
         self.build_system_prompt()
+    }
+
+    /// 把四层静态知识导出为 (标题, 正文) 条目，供藏经阁冷启动灌入
+    ///
+    /// 这些知识原本只在 `build_system_prompt()` 里硬编码、每次请求原样拼进提示词，
+    /// 既不能被检索（藏经阁里查不到），也不能被反馈/命中率度量。
+    /// 导出来灌进藏经阁后，它们和会话沉淀的记忆走同一套检索与打分。
+    pub fn static_knowledge_entries(&self) -> Vec<(String, String)> {
+        vec![
+            (
+                "Rust 基础知识与最佳实践".to_string(),
+                self.layer1_rust_basics(),
+            ),
+            ("Rust 设计模式".to_string(), self.layer2_design_patterns()),
+            (
+                "个人编码约定".to_string(),
+                self.layer3_personal_conventions(),
+            ),
+            ("项目上下文".to_string(), self.layer4_project_context()),
+        ]
     }
 
     /// 获取技能列表信息（用于注入到系统提示词中）
@@ -515,8 +557,10 @@ src/
             .workspace_folder
             .as_ref()
             .ok_or_else(|| {
-                DomainError::ExecutionError(
-                    "未配置项目工作目录。请在聊天设置中填写「项目工作目录」路径。".to_string(),
+                // 前置条件类失败：未配置工作目录时重试必然同样失败，
+                // 标为 Precondition 让自适应链跳过 L2 直接降级（省去数十秒空转）。
+                DomainError::Precondition(
+                    "未配置项目工作目录。请在聊天设置中填写「项目工作目录」路径，或通过 extra.workspace_folder 传入。".to_string(),
                 )
             })?
             .clone();
@@ -524,12 +568,12 @@ src/
         let fs = exec_ctx
             .file_system
             .as_ref()
-            .ok_or_else(|| DomainError::ExecutionError("文件系统端口未注入".to_string()))?
+            .ok_or_else(|| DomainError::Precondition("文件系统端口未注入".to_string()))?
             .clone();
         let cmd = exec_ctx
             .command
             .as_ref()
-            .ok_or_else(|| DomainError::ExecutionError("命令执行端口未注入".to_string()))?
+            .ok_or_else(|| DomainError::Precondition("命令执行端口未注入".to_string()))?
             .clone();
         let llm = exec_ctx.llm.clone();
         let toolchain = exec_ctx.toolchain.clone();
@@ -537,32 +581,24 @@ src/
         let mut output = String::new();
         let progress_tx = exec_ctx.progress_tx.clone();
 
-        // 辅助函数：推送进度到 SSE 流（非阻塞，通道满则丢弃）
-        let send_progress = |tx: &Option<mpsc::Sender<String>>, msg: String| {
-            if let Some(sender) = tx {
-                let _ = sender.try_send(msg);
-            }
-        };
         // 真实专家名（让编排层不必硬编码 "rust-expert"）
         let expert_name = self.name().to_string();
-        // 阶段进度推送：结构化 step 事件，附 phase 字段标识当前 Workflow 阶段
-        let push_phase = |tx: &Option<mpsc::Sender<String>>,
+        // 阶段进度推送：直接发类型化 ProgressEvent，由应用层统一映射为前端 StreamEvent
+        let push_phase = |tx: &Option<crate::domain::traits::ProgressTx>,
                           out: &String,
                           phase: &str,
                           step_msg: &str,
                           done: usize,
                           total: usize| {
-            let progress_json = serde_json::json!({
-                "type": "step",
-                "phase": phase,
-                "expert": expert_name,
-                "message": step_msg,
-                "todo_state": out,
-                "done_count": done,
-                "total_count": total,
-            })
-            .to_string();
-            send_progress(tx, progress_json);
+            crate::domain::traits::emit_step(
+                tx,
+                &expert_name,
+                Some(phase),
+                step_msg,
+                Some(out.as_str()),
+                done,
+                total,
+            );
         };
 
         // ── 阶段 1: ANALYZE 项目状态勘察 ───────────────────────
@@ -614,12 +650,16 @@ src/
         output.push_str("\n\n---\n\n## ⚡ 执行过程\n\n");
 
         // 推送计划到前端（让用户在执行前看到待办列表）
-        let plan_json = serde_json::json!({
-            "type": "plan",
-            "message": plan,
-        })
-        .to_string();
-        send_progress(&progress_tx, plan_json);
+        // 语义等同 traits::send_struct_progress("plan", ...)：phase="plan"，todo_state 承载 markdown 清单
+        crate::domain::traits::emit_step(
+            &progress_tx,
+            &expert_name,
+            Some("plan"),
+            "已生成执行计划 (1 步)",
+            Some(plan.as_str()),
+            0,
+            1,
+        );
 
         // 解析计划中的 - [ ] 项，用于后续更新状态
         let plan_items: Vec<String> = plan
@@ -682,14 +722,6 @@ src/
 
         // 3.2 LLM 生成代码
         mark_done(&mut output, &mut next_item, Some(1), &plan_items);
-        push_phase(
-            &progress_tx,
-            &output,
-            "edit",
-            "🤖 LLM 生成代码...",
-            next_item,
-            plan_total.max(1),
-        );
         let sys_prompt = format!(
             "你是一个 Rust 编程专家，正在项目目录 `{}` 中工作。\n\
              \n当前项目状态：\n\
@@ -722,6 +754,16 @@ src/
         let llm_response = llm
             .chat(self.build_messages(&sys_prompt, &user_prompt))
             .await?;
+
+        // 3.2.1 模型已生成代码（think 之后进入 edit，阶段顺序更自然）
+        push_phase(
+            &progress_tx,
+            &output,
+            "edit",
+            "🤖 模型已生成代码",
+            next_item,
+            plan_total.max(1),
+        );
 
         // 3.3 写入文件
         mark_done(&mut output, &mut next_item, Some(1), &plan_items);
@@ -1028,20 +1070,14 @@ src/
             // 根据主题从藏经阁召回知识库内容
             if let Some(sutra) = &exec_ctx.sutra_library {
                 // 1. 先尝试使用 library_retrieve 进行语义召回
-                // 发射 MemoryRetrieved（retrieve 阶段）：仅在带 trace_id 且接入了 EventBus 时
-                if let (Some(bus), Some(tid)) = (&exec_ctx.event_bus, &exec_ctx.ctx.trace_id) {
-                    if !tid.is_empty() {
-                        bus.emit_with_trace(
-                            AgentEventData::MemoryRetrieved {
-                                query: topic.to_string(),
-                                results_count: 0,
-                            },
-                            tid.clone(),
-                            exec_ctx.ctx.session_id.clone(),
-                        )
-                        .await;
-                    }
-                }
+                // 发射 MemoryRetrieved（retrieve 阶段）：由 TraceContext 统一判断是否激活
+                exec_ctx
+                    .trace_context()
+                    .emit(DomainEvent::MemoryRetrieved {
+                        query: topic.to_string(),
+                        results_count: 0,
+                    })
+                    .await;
                 let retrieve_result = sutra.library_retrieve(topic, 5).await;
                 if !retrieve_result.contains("⚠️") && !retrieve_result.contains("未找到") {
                     tracing::info!("[skill_knowledge_query] 藏经阁召回成功");
@@ -1337,34 +1373,27 @@ src/
         let mut current_req = instruction.to_string();
         // 阶段进度推送（与 skill_coding 共用 phase 词汇表：edit/verify/fix）
         let expert_name = self.name().to_string();
-        let push_phase = |tx: &Option<mpsc::Sender<String>>, phase: &str, step_msg: &str| {
-            let progress_json = serde_json::json!({
-                "type": "step",
-                "phase": phase,
-                "expert": expert_name,
-                "message": step_msg,
-                "done_count": 0,
-                "total_count": 0,
-            })
-            .to_string();
-            if let Some(sender) = tx {
-                let _ = sender.try_send(progress_json);
-            }
+        let push_phase = |tx: &Option<crate::domain::traits::ProgressTx>,
+                          phase: &str,
+                          step_msg: &str| {
+            crate::domain::traits::emit_step(tx, &expert_name, Some(phase), step_msg, None, 0, 0);
         };
 
         for retry in 0..=max_retries {
-            // 1. 调用 LLM 生成代码
-            push_phase(
-                &exec_ctx.progress_tx,
-                "edit",
-                &format!("✏️ {} 正在生成代码...", expert_name),
-            );
+            // 1. 调用 LLM 生成代码（think 阶段由 LLM 适配器在调用中自动发出：模型推理中…）
             let response = exec_ctx
                 .llm
                 .chat(self.build_messages(sys, &current_req))
                 .await?;
 
-            // 2. 如果没有工具链，直接返回
+            // 2. 代码已生成（think 之后才进入 edit，阶段顺序更自然）
+            push_phase(
+                &exec_ctx.progress_tx,
+                "edit",
+                &format!("✏️ {} 已生成代码", expert_name),
+            );
+
+            // 3. 如果没有工具链，直接返回
             push_phase(&exec_ctx.progress_tx, "verify", "🔍 正在验证编译...");
             let toolchain = match &exec_ctx.toolchain {
                 Some(t) => t.clone(),

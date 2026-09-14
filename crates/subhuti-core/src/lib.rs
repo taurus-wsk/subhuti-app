@@ -8,17 +8,14 @@
 //! - **infra**: 具体实现，对接第三方服务（LLM API、数据库、工具等）
 //! - **应用层**: 业务实现，使用 core 接口和 infra 实现（注：框架已无 Graph 编排，Workflow 下沉至专家内部）
 
-pub mod common;
 pub mod engine;
 pub mod event;
-pub mod memory;
 pub mod observe;
 pub mod orchestrator;
+pub mod progress;
 pub mod runtime;
 pub mod sutra_library;
-pub mod vertical;
 
-pub use common::types::CtxId;
 pub use engine::Subhuti;
 pub use event::{
     bus::EventBus,
@@ -26,7 +23,6 @@ pub use event::{
     recorder::EventRecorder,
     types::{AgentEventData, ArcEvent, Event, EventMetadata},
 };
-pub use memory::Memory;
 pub use observe::{
     record_fn_log, FnCallData, FnTracer, LogEntry, LogLevel, SpanData, TraceHandle,
     TraceObserverPort, TraceStatus,
@@ -34,22 +30,15 @@ pub use observe::{
 pub use orchestrator::{
     execute_plan, execute_plan_adaptive, generate_plan, parse_plan, parse_plan_or_ask, Actor,
     ActorRegistry, AdaptiveOptions, AgentContext, AgentRegistry, AskRequest, BoxFuture,
-    DefaultDispatchRule, DefaultExecutionRule, DefaultTaskAnalysisRule, DispatchPlan, DispatchRule,
-    DispatchStrategy, EventBusRef, ExecutionResult, ExecutionRule, ExpertAgent,
-    ExpertAgentActorAdapter, ExpertState, FrameworkExpertInfo, FromState, Llm, LlmToolFallback,
-    MemoryRef, OrchestrationResult, Orchestrator, PlanOrAsk, PlanStep, ResultStrategy, RuleConfig,
-    RuleEngine, SkillPlan, Step, StepFallback, TaskAnalysisRule, TaskProfile, TokenUsage,
-    ToolExecutor,
+    EventBusRef, ExpertAgent, ExpertAgentActorAdapter, ExpertState, FrameworkExpertInfo, FromState,
+    Llm, OrchestrationResult, Orchestrator, PlanExecution, PlanOrAsk, PlanStep, SkillPlan,
+    StepFallback, TaskAnalysisRule, TaskProfile, TokenUsage, ToolExecutor,
 };
 pub use runtime::{
     LLMConfig, LLMProvider, LLMResponse, Message, Role, Session, Tool, ToolCall, ToolCallResult,
     ToolInfo, ToolResponse, ToolResult, LLM,
 };
-pub use sutra_library::{EmptySutraLibrary, SutraLibraryPort};
-pub use vertical::{
-    Asset, AssetLibrary, ProjectInfo, ProjectMemory, ProjectNote, ToolCommand, ToolCommandInfo,
-    ToolIntegration, ToolRegistry, Workflow, WorkflowStore,
-};
+pub use sutra_library::SutraLibraryPort;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -79,7 +68,11 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("Serde: {0}")]
     Serde(#[from] serde_json::Error),
-    #[error("Any: {0}")]
+    /// 不透明透传（来自适配器层的 anyhow 错误）。
+    ///
+    /// Display 不加 `Any: ` 前缀：这个变体本身没有语义，前缀只会把内部变体名
+    /// 泄漏进用户可见的失败文案（如 MCP 的 `❌ 工具执行失败: Any: …`）。
+    #[error("{0}")]
     Any(#[from] anyhow::Error),
     /// LLM 调用错误（结构化，便于上层决定是否重试）
     ///
@@ -95,6 +88,13 @@ pub enum Error {
         /// 面向人的错误描述
         message: String,
     },
+    /// 前置条件未满足（必需配置缺失、必要端口未注入等）。
+    ///
+    /// 与 `Llm { retryable: false }` 同属「重试无意义」类：执行链据此
+    /// **跳过 L2 反馈重试**，直接进入 L3 降级——避免确定性失败被白重试多次。
+    /// 例：Rust 专家在未配置「项目工作目录」时执行 `rust-coding`。
+    #[error("前置条件未满足: {0}")]
+    Precondition(String),
 }
 
 impl Error {
@@ -153,6 +153,8 @@ impl ClassifiableError for Error {
             Error::Io(_) => ErrorKind::Retryable,
             Error::Serde(_) => ErrorKind::Fixable,
             Error::Any(_) => ErrorKind::Fatal,
+            // 前置条件未满足：重试必然同样失败，归为 Fatal（不重试）
+            Error::Precondition(_) => ErrorKind::Fatal,
             Error::Llm { retryable, .. } => {
                 if *retryable {
                     ErrorKind::Retryable

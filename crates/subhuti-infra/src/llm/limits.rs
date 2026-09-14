@@ -296,6 +296,14 @@ impl LLM for ContextLimitLLM {
         self.inner.chat(self.apply(messages)).await
     }
 
+    /// 转发带用量的对话（漏了这一步 token 采集就会在装饰器链上被默认实现截断）
+    async fn chat_counted(
+        &self,
+        messages: Vec<Message>,
+    ) -> subhuti_core::Result<(String, Option<u64>)> {
+        self.inner.chat_counted(self.apply(messages)).await
+    }
+
     async fn chat_with_tools(
         &self,
         messages: Vec<Message>,
@@ -313,6 +321,17 @@ impl LLM for ContextLimitLLM {
     ) -> subhuti_core::Result<()> {
         self.inner
             .chat_streaming(self.apply(messages), callback)
+            .await
+    }
+
+    /// 转发带用量的流式对话（漏了这一步 token 采集就会在装饰器链上被默认实现截断）
+    async fn chat_streaming_counted(
+        &self,
+        messages: Vec<Message>,
+        callback: Box<dyn Fn(String) + Send>,
+    ) -> subhuti_core::Result<Option<u64>> {
+        self.inner
+            .chat_streaming_counted(self.apply(messages), callback)
             .await
     }
 
@@ -492,5 +511,94 @@ mod tests {
         assert!(!oc.changed());
         let oc2 = TrimOutcome { truncated: 1, ..oc };
         assert!(oc2.changed());
+    }
+
+    /// 记录「实际收到的消息条数」的替身，用于验证裁剪确实发生在内层之前。
+    struct CountingLLM {
+        config: LLMConfig,
+        seen: std::sync::Mutex<usize>,
+    }
+
+    impl CountingLLM {
+        fn new() -> Self {
+            Self {
+                config: LLMConfig::default(),
+                seen: std::sync::Mutex::new(0),
+            }
+        }
+        fn seen(&self) -> usize {
+            *self.seen.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl LLM for CountingLLM {
+        fn provider(&self) -> LLMProvider {
+            LLMProvider::Custom
+        }
+        fn config(&self) -> &LLMConfig {
+            &self.config
+        }
+        async fn chat(&self, messages: Vec<Message>) -> subhuti_core::Result<String> {
+            *self.seen.lock().unwrap() = messages.len();
+            Ok("raw".to_string())
+        }
+        async fn chat_counted(
+            &self,
+            messages: Vec<Message>,
+        ) -> subhuti_core::Result<(String, Option<u64>)> {
+            *self.seen.lock().unwrap() = messages.len();
+            Ok(("raw".to_string(), Some(7)))
+        }
+        async fn chat_with_tools(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Vec<ToolInfo>,
+        ) -> subhuti_core::Result<LLMResponse> {
+            unreachable!("本用例不走 tools 路径")
+        }
+        async fn chat_streaming(
+            &self,
+            _messages: Vec<Message>,
+            _callback: Box<dyn Fn(String) + Send>,
+        ) -> subhuti_core::Result<()> {
+            unreachable!("本用例不走流式路径")
+        }
+        async fn chat_streaming_counted(
+            &self,
+            _messages: Vec<Message>,
+            callback: Box<dyn Fn(String) + Send>,
+        ) -> subhuti_core::Result<Option<u64>> {
+            // 模拟：转发 callback 一次 + 返回真实用量
+            callback("delta".to_string());
+            Ok(Some(42))
+        }
+        async fn health_check(&self) -> subhuti_core::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    /// 关键回归：装饰器必须**转发** `chat_counted`。
+    ///
+    /// 若不转发，trait 默认实现会退化成 `chat()` 并返回 `None`，
+    /// token 用量就在装饰器链上被静默吞掉——这正是「成本恒为 0」的成因类别。
+    #[tokio::test]
+    async fn forwards_chat_counted_and_still_trims() {
+        let inner = Arc::new(CountingLLM::new());
+        let llm = ContextLimitLLM::wrap(inner.clone(), cfg(3, 32_000));
+
+        let mut msgs = vec![Message::system("你是助手")];
+        for i in 0..10 {
+            msgs.push(Message::user(format!("问{i}")));
+        }
+        let (out, tokens) = llm.chat_counted(msgs).await.unwrap();
+
+        assert_eq!(out, "raw");
+        assert_eq!(tokens, Some(7), "用量必须被透传，不能被装饰器吞掉");
+        assert!(
+            inner.seen() < 11,
+            "裁剪必须生效：内层实收 {} 条，期望少于 11 条",
+            inner.seen()
+        );
     }
 }

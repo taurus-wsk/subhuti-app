@@ -16,9 +16,24 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 
 use crate::sutra_library::models::*;
-use crate::sutra_library::recall::EdgeKind;
+use crate::sutra_library::recall::{EdgeKind, GraphPersistence};
 use crate::sutra_library::storage::PgStorage;
 use crate::sutra_library::{KbChunk, KnowledgeBase};
+
+/// 无向边端点归一化：按字典序排列，保证 (A,B) 与 (B,A) 落到同一行。
+///
+/// `graph_edges` 的主键是 `(from_entity, to_entity, edge_kind)`，天然带方向；
+/// 但 `EntityGraph` 是**无向图**——同一对实体若以相反顺序写入就会存成两行。
+/// 后果有二：回灌时双向展开让内存边数成倍虚高；`delete_edge` 也删不干净另一半。
+/// 因此统一在存储层做端点排序，让"无向"成为表结构层面的事实约束。
+#[inline]
+pub(crate) fn normalize_edge_endpoints<'a>(from: &'a str, to: &'a str) -> (&'a str, &'a str) {
+    if from <= to {
+        (from, to)
+    } else {
+        (to, from)
+    }
+}
 
 /// 藏经阁持久化端口
 ///
@@ -41,6 +56,18 @@ pub trait PersistencePort: Send + Sync {
     async fn find_by_path(&self, path: &str) -> Result<Option<MemoryNode>>;
     async fn find_children(&self, parent_id: &str) -> Result<Vec<MemoryNode>>;
     async fn list_nodes(&self, collection_id: &str) -> Result<Vec<MemoryNode>>;
+
+    /// 列出**全部**节点（跨集合）。启动回灌（hydrate）时使用。
+    ///
+    /// 默认返回空，未覆盖此方法的后端视为"不提供全量回灌"。
+    async fn list_all_nodes(&self) -> Result<Vec<MemoryNode>> {
+        Ok(Vec::new())
+    }
+
+    /// 列出全部集合。启动回灌（hydrate）时使用。
+    async fn list_all_collections(&self) -> Result<Vec<Collection>> {
+        Ok(Vec::new())
+    }
     async fn delete_node(&self, node_id: &str) -> Result<()>;
     async fn list_knowledge_bases(&self) -> Result<Vec<KnowledgeBase>>;
     async fn create_knowledge_base(
@@ -117,6 +144,12 @@ impl PersistencePort for PgStorage {
     }
     async fn list_nodes(&self, collection_id: &str) -> Result<Vec<MemoryNode>> {
         PgStorage::list_nodes(self, collection_id).await
+    }
+    async fn list_all_nodes(&self) -> Result<Vec<MemoryNode>> {
+        PgStorage::list_all_nodes(self).await
+    }
+    async fn list_all_collections(&self) -> Result<Vec<Collection>> {
+        PgStorage::list_all_collections(self).await
     }
     async fn delete_node(&self, node_id: &str) -> Result<()> {
         PgStorage::delete_node(self, node_id).await
@@ -452,6 +485,40 @@ impl PersistencePort for SqliteStorage {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_sq_graph_edges_to ON graph_edges(to_entity)")
             .execute(&self.pool)
             .await?;
+
+        // 同名同域的集合只应存在一条。历史版本每次注册都用新 UUID 重新落库，
+        // 已在库里堆出大量重复行（实测 `blender_knowledge` 重复 45 次）。
+        // 这里做一次幂等收敛：每组 (name, domain) 只保留 rowid 最大的一条，
+        // 且**绝不删除仍被 memory_nodes 引用的行**（宁可留重复，也不能孤儿化节点）。
+        sqlx::query(
+            r#"
+            DELETE FROM memory_collections
+            WHERE rowid NOT IN (
+                SELECT MAX(rowid) FROM memory_collections GROUP BY name, domain
+            )
+              AND collection_id NOT IN (
+                SELECT DISTINCT collection_id FROM memory_nodes
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // 唯一索引是兜底闸门。若上面的引用保护仍留下重复行，建索引会失败——
+        // 此时只告警、不阻断启动（真正的防重复闸门在 engine 层复用逻辑）。
+        if let Err(e) = sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sq_collections_name_domain
+             ON memory_collections(name, domain)",
+        )
+        .execute(&self.pool)
+        .await
+        {
+            tracing::warn!(
+                "SutraLibrary: 集合唯一索引未建立（存在被引用的重复集合，已跳过）：{}",
+                e
+            );
+        }
+
         tracing::info!("SutraLibrary: SQLite tables initialized");
         Ok(())
     }
@@ -504,11 +571,19 @@ impl PersistencePort for SqliteStorage {
         Ok(())
     }
 
+    /// 写入集合（按 `(name, domain)` 幂等）。
+    ///
+    /// 不再只按 `collection_id` upsert——那样每次新 UUID 都会新增一行
+    /// （实测把 `blender_knowledge` 堆了 45 份）。现在同名同域已存在就跳过；
+    /// 集合 ID 以库中已有的那条为准，避免同一份知识挂在两个 ID 下被重复召回。
     async fn write_collection(&self, collection: &Collection) -> Result<()> {
         sqlx::query(
             r#"
             INSERT INTO memory_collections (collection_id, name, domain, description, created_at)
-            VALUES (?,?,?,?,?)
+            SELECT ?,?,?,?,?
+            WHERE NOT EXISTS (
+                SELECT 1 FROM memory_collections WHERE name = ? AND domain = ?
+            )
             ON CONFLICT(collection_id) DO UPDATE SET
                 name = excluded.name,
                 domain = excluded.domain,
@@ -520,6 +595,8 @@ impl PersistencePort for SqliteStorage {
         .bind(&collection.domain)
         .bind(&collection.description)
         .bind(collection.created_at)
+        .bind(&collection.name)
+        .bind(&collection.domain)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -594,6 +671,37 @@ impl PersistencePort for SqliteStorage {
         Ok(rows
             .iter()
             .map(row_to_memory_node)
+            .collect::<Result<Vec<_>>>()?)
+    }
+
+    async fn list_all_nodes(&self) -> Result<Vec<MemoryNode>> {
+        let rows = sqlx::query("SELECT * FROM memory_nodes")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .iter()
+            .map(row_to_memory_node)
+            .collect::<Result<Vec<_>>>()?)
+    }
+
+    async fn list_all_collections(&self) -> Result<Vec<Collection>> {
+        use sqlx::Row;
+        let rows = sqlx::query(
+            "SELECT collection_id, name, domain, description, created_at FROM memory_collections",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                Ok(Collection {
+                    collection_id: r.try_get("collection_id")?,
+                    name: r.try_get("name")?,
+                    domain: r.try_get("domain")?,
+                    description: r.try_get("description")?,
+                    created_at: r.try_get("created_at")?,
+                })
+            })
             .collect::<Result<Vec<_>>>()?)
     }
 
@@ -803,7 +911,9 @@ impl PersistencePort for SqliteStorage {
             let kind_str: String = row.try_get("edge_kind")?;
             let weight: f32 = row.try_get("weight")?;
             let kind = match kind_str.as_str() {
-                "Manual" => EdgeKind::Manual,
+                // 兼容历史脏数据：早期写入端曾用小写 "manual"，
+                // 不识别会被 fallback 分支误判为可衰减的 Learned 边。
+                "Manual" | "manual" => EdgeKind::Manual,
                 _ => EdgeKind::Learned,
             };
             adj.entry(from.clone())
@@ -846,6 +956,8 @@ impl PersistencePort for SqliteStorage {
     }
 
     async fn write_edge(&self, from: &str, to: &str, kind: &str, weight: f32) -> Result<()> {
+        // 无向图：端点排序后再落盘，(A,B) 与 (B,A) 共用一行
+        let (from, to) = normalize_edge_endpoints(from, to);
         sqlx::query(
             r#"
             INSERT INTO graph_edges (from_entity, to_entity, edge_kind, weight)
@@ -863,6 +975,7 @@ impl PersistencePort for SqliteStorage {
     }
 
     async fn delete_edge(&self, from: &str, to: &str, kind: &str) -> Result<()> {
+        let (from, to) = normalize_edge_endpoints(from, to);
         sqlx::query(
             "DELETE FROM graph_edges WHERE from_entity=?1 AND to_entity=?2 AND edge_kind=?3",
         )
@@ -907,6 +1020,52 @@ impl PersistencePort for SqliteStorage {
             }
         }
         Ok(())
+    }
+}
+
+// ─── SQLite 图谱持久化端口 ────────────────────────────────────────
+//
+// `EntityGraph` 依赖的是窄接口 `GraphPersistence`。SQLite 后端的图谱能力
+// 已在 `PersistencePort` 实现里齐备，这里逐一转发，避免 SQL 重复。
+// 有此后端，无 PG 降级模式下运行时双写（实体-切片 / 建边 / 反馈）同样落盘。
+
+#[async_trait]
+impl GraphPersistence for SqliteStorage {
+    async fn load_all(
+        &self,
+        adjacency: &HashMap<String, Vec<(String, EdgeKind, f32)>>,
+        entity_to_chunks: &HashMap<String, Vec<String>>,
+        chunk_to_entities: &HashMap<String, Vec<String>>,
+        entity_feedback: &HashMap<String, f32>,
+    ) -> Result<(
+        HashMap<String, Vec<(String, EdgeKind, f32)>>,
+        HashMap<String, Vec<String>>,
+        HashMap<String, Vec<String>>,
+        HashMap<String, f32>,
+    )> {
+        <SqliteStorage as PersistencePort>::load_all(
+            self,
+            adjacency,
+            entity_to_chunks,
+            chunk_to_entities,
+            entity_feedback,
+        )
+        .await
+    }
+    async fn write_edge(&self, from: &str, to: &str, kind: &str, weight: f32) -> Result<()> {
+        <SqliteStorage as PersistencePort>::write_edge(self, from, to, kind, weight).await
+    }
+    async fn delete_edge(&self, from: &str, to: &str, kind: &str) -> Result<()> {
+        <SqliteStorage as PersistencePort>::delete_edge(self, from, to, kind).await
+    }
+    async fn write_entity_chunk(&self, entity_id: &str, chunk_id: &str) -> Result<()> {
+        <SqliteStorage as PersistencePort>::write_entity_chunk(self, entity_id, chunk_id).await
+    }
+    async fn write_entity_feedback(&self, entity_id: &str, score: f32) -> Result<()> {
+        <SqliteStorage as PersistencePort>::write_entity_feedback(self, entity_id, score).await
+    }
+    async fn batch_delete_edges(&self, edges: &[(String, String, String)]) -> Result<()> {
+        <SqliteStorage as PersistencePort>::batch_delete_edges(self, edges).await
     }
 }
 
@@ -998,5 +1157,249 @@ mod tests {
         storage.delete_chunk(&chunk.id).await.unwrap();
         storage.delete_knowledge_base(&kb.id).await.unwrap();
         assert_eq!(storage.list_knowledge_bases().await.unwrap().len(), 0);
+    }
+
+    /// 图谱持久化（SQLite 后端）：运行时双写落盘 → `load_all` 可回灌。
+    ///
+    /// 锁定 `GraphPersistence for SqliteStorage` 的转发链路。
+    /// 回归背景：此前 SQLite 降级模式下 `EntityGraph` 无持久化后端，
+    /// 实体-切片 / 边 / 反馈分只写内存，图谱三张表恒 0。
+    #[tokio::test]
+    async fn sqlite_graph_persistence_roundtrip() {
+        let storage = SqliteStorage::open_in_memory().unwrap();
+        storage.ensure_tables().await.unwrap();
+
+        // 运行时双写：实体-切片映射 / 边 / 反馈分
+        GraphPersistence::write_entity_chunk(&storage, "entity:A", "chunk:1")
+            .await
+            .unwrap();
+        GraphPersistence::write_entity_chunk(&storage, "entity:B", "chunk:1")
+            .await
+            .unwrap();
+        GraphPersistence::write_edge(&storage, "entity:A", "entity:B", "Learned", 0.5)
+            .await
+            .unwrap();
+        GraphPersistence::write_entity_feedback(&storage, "entity:A", 0.7)
+            .await
+            .unwrap();
+
+        let (adj, e2c, c2e, ef) = GraphPersistence::load_all(
+            &storage,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(adj.contains_key("entity:A"), "邻接表应含 entity:A");
+        assert!(
+            e2c.get("entity:A")
+                .map(|v| v.contains(&"chunk:1".to_string()))
+                .unwrap_or(false),
+            "实体→切片索引应含 entity:A → chunk:1"
+        );
+        assert_eq!(
+            c2e.get("chunk:1").map(|v| v.len()).unwrap_or(0),
+            2,
+            "切片→实体索引应含 2 个实体"
+        );
+        assert!(
+            (ef.get("entity:A").copied().unwrap_or(0.0) - 0.7).abs() < 1e-6,
+            "反馈分应回灌为 0.7"
+        );
+    }
+
+    /// `EntityGraph` 接入 SQLite 后端后，运行时双写能落盘（端到端接线验证）。
+    ///
+    /// 契约：`load_persisted_data(Arc<SqliteStorage>)` 后调用图操作，
+    /// 变更应异步写入 SQLite。回归背景：SQLite 模式下 `graph_store` 恒为
+    /// `None`，双写分支永不进入，图谱表恒 0（只有启动回灌、无运行时增量）。
+    #[tokio::test]
+    async fn entity_graph_persists_to_sqlite() {
+        use crate::sutra_library::recall::EntityGraph;
+        use std::sync::Arc;
+
+        let db_path = std::env::temp_dir().join(format!(
+            "subhuti_graph_persist_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db_path);
+
+        let storage = Arc::new(SqliteStorage::open(db_path.to_str().unwrap()).unwrap());
+        storage.ensure_tables().await.unwrap();
+
+        let graph = EntityGraph::new();
+        graph.load_persisted_data(storage.clone()).await;
+
+        // 手动边不依赖实体抽取正则，直击"双写是否接线"这一点
+        graph.add_manual_edge(&"entity:A".to_string(), &"entity:B".to_string(), 0.5);
+
+        // 双写由 tokio::spawn 异步执行，让渡一次调度等它落盘
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let (adj, _, _, _) = GraphPersistence::load_all(
+            &*storage,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            adj.contains_key("entity:A"),
+            "SQLite 应落盘 entity:A→entity:B 的边，实际为空（运行时双写未接线）"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// 回灌后：边由「实体索引 + 当前建边规则」**派生**，而不是照搬库里的邻接表。
+    ///
+    /// 契约变更（09-14）：边不再从 `graph_edges` 回灌。库里那份邻接表可能是旧
+    /// 规则（含大量 2 字碎片共现）生成的，照搬进来等于把历史噪声固化，所以
+    /// 改为以 `graph_entity_chunks` 为唯一真相重建。本测试同时锁住两点：
+    /// 1. 内存边数 = 由实体索引按共现规则派生的边数（不会因双向展开而虚高）；
+    /// 2. 库里那些与实体索引不符的边**不会**进内存。
+    #[tokio::test]
+    async fn hydrate_derives_edges_from_entity_index() {
+        use crate::sutra_library::recall::{EntityGraph, GraphPersistence};
+
+        let path = "/tmp/subhuti_graph_hydrate_count_test.sqlite";
+        let _ = std::fs::remove_file(path);
+        let storage = std::sync::Arc::new(SqliteStorage::open(path).unwrap());
+        storage.ensure_tables().await.unwrap();
+
+        // 库里故意放 3 条边（模拟旧规则的产物）
+        for (a, b) in [
+            ("entity:AAA", "entity:BBB"),
+            ("entity:BBB", "entity:CCC"),
+            ("entity:CCC", "entity:AAA"),
+        ] {
+            GraphPersistence::write_edge(&*storage, a, b, "Manual", 0.5)
+                .await
+                .unwrap();
+        }
+        // 实体索引里只有两个实体挂在同一切片 → 按共现规则只应派生 1 条边
+        for e in ["entity:AAA", "entity:BBB"] {
+            GraphPersistence::write_entity_chunk(&*storage, e, "chunk:1")
+                .await
+                .unwrap();
+        }
+
+        let graph = EntityGraph::new();
+        graph.load_persisted_data(storage.clone()).await;
+        assert_eq!(
+            graph.edge_count(),
+            1,
+            "边应由实体索引派生（2 个共现实体 → 1 条），而不是照搬库里的 3 条"
+        );
+        assert_eq!(
+            graph.entity_chunk_pairs(),
+            2,
+            "实体-切片索引回灌后不应翻倍（基线用当前内存会让 load_all 叠加）"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// 无向语义：端点顺序不同不应产生两行，反向删除也应生效。
+    ///
+    /// `graph_edges` 主键带方向，而 `EntityGraph` 是无向图——不做端点归一化的话，
+    /// 同一对实体会存成 (A,B) 和 (B,A) 两行，回灌时双向展开使边数成倍虚高，
+    /// `delete_edge` 也只删得掉一半，重启后"复活"。
+    #[tokio::test]
+    async fn undirected_edge_is_stored_once_regardless_of_order() {
+        let path = "/tmp/subhuti_graph_undirected_test.sqlite";
+        let _ = std::fs::remove_file(path);
+        let storage = SqliteStorage::open(path).unwrap();
+        storage.ensure_tables().await.unwrap();
+
+        // 同一对实体、相反顺序各写一次（后写的权重更高）
+        GraphPersistence::write_edge(&storage, "entity:A", "entity:B", "Manual", 0.5)
+            .await
+            .unwrap();
+        GraphPersistence::write_edge(&storage, "entity:B", "entity:A", "Manual", 0.9)
+            .await
+            .unwrap();
+
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM graph_edges")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "无向边应只落一行（端点未归一化会让同一对实体存两行）");
+
+        let (w,): (f32,) = sqlx::query_as("SELECT weight FROM graph_edges LIMIT 1")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+        assert!(
+            (w - 0.9).abs() < 1e-6,
+            "反向写入应更新同一行的权重，实际 {}",
+            w
+        );
+
+        // 反向删除必须能删掉它
+        GraphPersistence::delete_edge(&storage, "entity:B", "entity:A", "Manual")
+            .await
+            .unwrap();
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM graph_edges")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "反向 delete_edge 应能删除归一化后的边");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// 历史脏数据兼容：小写 "manual" 必须读回 `Manual`，而不是 fallback 的 `Learned`。
+    ///
+    /// 早期写入端用过小写（见 `EntityGraph::upsert_edge` 的双写调用）。
+    /// 若被误判成 Learned，这些静态/共现边会被衰减任务当作可淘汰的学习边清掉。
+    #[tokio::test]
+    async fn legacy_lowercase_manual_kind_reads_back_as_manual() {
+        let path = "/tmp/subhuti_graph_legacy_kind_test.sqlite";
+        let _ = std::fs::remove_file(path);
+        let storage = SqliteStorage::open(path).unwrap();
+        storage.ensure_tables().await.unwrap();
+
+        // 直接注入一行旧版格式（小写 kind）
+        sqlx::query(
+            "INSERT INTO graph_edges (from_entity, to_entity, edge_kind, weight) VALUES (?,?,?,?)",
+        )
+        .bind("entity:X")
+        .bind("entity:Y")
+        .bind("manual")
+        .bind(0.4f32)
+        .execute(&storage.pool)
+        .await
+        .unwrap();
+
+        let (adj, _, _, _) = GraphPersistence::load_all(
+            &storage,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        let kinds: Vec<EdgeKind> = adj
+            .get("entity:X")
+            .expect("entity:X 应有邻接项")
+            .iter()
+            .map(|(_, k, _)| *k)
+            .collect();
+        assert!(
+            kinds.iter().any(|k| matches!(k, EdgeKind::Manual)),
+            "小写 manual 应被识别为 Manual，实际: {:?}",
+            kinds
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 }

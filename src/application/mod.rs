@@ -24,10 +24,11 @@
 //! - 编排：框架层由 Planner 驱动（无 Graph）；专家内部 Workflow 由专家自持
 
 pub mod composition_root;
+pub mod memory_consolidation;
 pub mod observer;
 pub mod orchestration_service;
 pub mod ports;
-pub mod stream_registry;
+pub mod session_manager;
 pub mod trace_decorator;
 
 pub use composition_root::CompositionRoot;
@@ -37,4 +38,5 @@ pub use observer::{
 };
 pub use orchestration_service::OrchestrationService;
 pub use ports::{ChatPort, ExpertQueryPort, SkillPort, StreamEvent};
+pub use session_manager::SessionManager;
 pub use trace_decorator::TraceAppService;

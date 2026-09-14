@@ -101,6 +101,18 @@ pub trait LLM: Send + Sync {
     fn provider(&self) -> LLMProvider;
     fn config(&self) -> &LLMConfig;
     async fn chat(&self, messages: Vec<Message>) -> crate::Result<String>;
+
+    /// 带 token 用量的对话（可选能力，用于成本核算）。
+    ///
+    /// 默认实现退化为 [`LLM::chat`] 并返回 `None`，因此**不实现本方法也不会改变任何行为**；
+    /// 供应商客户端应实现它以把 `usage.total_tokens` 透出来。
+    ///
+    /// 注意：装饰器（ContextLimit / Retry / Cached）必须显式转发本方法，
+    /// 否则调用会被默认实现截断，用量重新丢失。
+    async fn chat_counted(&self, messages: Vec<Message>) -> crate::Result<(String, Option<u64>)> {
+        Ok((self.chat(messages).await?, None))
+    }
+
     async fn chat_with_tools(
         &self,
         messages: Vec<Message>,
@@ -111,6 +123,28 @@ pub trait LLM: Send + Sync {
         messages: Vec<Message>,
         callback: Box<dyn Fn(String) + Send>,
     ) -> crate::Result<()>;
+
+    /// 带 token 用量的流式对话（可选能力，用于成本核算）。
+    ///
+    /// 流式路径的用量由 SSE 的**末条分片**携带（该分片 `choices` 为空、只含 `usage`），
+    /// 而 [`LLM::chat_streaming`] 的签名是 `Result<()>`——**结构上没有返回用量的通道**，
+    /// 所以此前流式调用一律被记成 0，导致成本口径严重偏低（实测覆盖率仅约 37%，
+    /// 而流式恰恰是更贵的那条路径）。本方法即为补上这个通道。
+    ///
+    /// 默认实现退化为 [`LLM::chat_streaming`] 并返回 `None`，因此**不实现本方法也不会改变
+    /// 任何行为**；供应商客户端应实现它，从末条分片里取 `usage.total_tokens`。
+    ///
+    /// 注意：装饰器（ContextLimit / Retry / Cached）必须显式转发本方法，
+    /// 否则调用会被默认实现截断，流式用量重新丢失。
+    async fn chat_streaming_counted(
+        &self,
+        messages: Vec<Message>,
+        callback: Box<dyn Fn(String) + Send>,
+    ) -> crate::Result<Option<u64>> {
+        self.chat_streaming(messages, callback).await?;
+        Ok(None)
+    }
+
     async fn health_check(&self) -> crate::Result<bool>;
 }
 

@@ -72,6 +72,14 @@ impl TraceObserverPort for InMemoryTraceObserverAdapter {
         guard.entry(trace_id.to_string()).or_default().push(span);
     }
 
+    fn total_tokens(&self, trace_id: &str) -> u64 {
+        let guard = self.spans.lock().expect("span mutex poisoned");
+        guard
+            .get(trace_id)
+            .map(|spans| spans.iter().map(|s| s.tokens.unwrap_or(0)).sum())
+            .unwrap_or(0)
+    }
+
     fn record_fn_call(&self, trace_id: &str, fn_call: FnCallData) {
         let mut guard = self.fn_calls.lock().expect("fn_call mutex poisoned");
         guard.entry(trace_id.to_string()).or_default().push(fn_call);
@@ -191,6 +199,11 @@ impl TraceObserverPort for SqliteTraceObserverAdapter {
     fn record_span(&self, trace_id: &str, span: SpanData) {
         self.store
             .write_span_fire_and_forget(trace_id.to_string(), span);
+    }
+
+    fn total_tokens(&self, trace_id: &str) -> u64 {
+        let spans = self.store.read_spans_sync(trace_id);
+        spans.iter().map(|s| s.tokens.unwrap_or(0)).sum()
     }
 
     fn record_fn_call(&self, trace_id: &str, fn_call: FnCallData) {
