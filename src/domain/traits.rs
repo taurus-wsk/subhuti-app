@@ -95,6 +95,11 @@ pub struct DomainExecutionContext {
     /// 使后续专家、查询接口、藏经阁沉淀都能看到这位专家说过什么。
     /// 与 `ctx.history`（专家私有、内存态）不同，这是框架共享资产。
     pub session_context: Option<Arc<SessionContext>>,
+    /// **框架事件总线**（可选）：注入了真实 `EventBus` 后，技能经
+    /// [`crate::domain::flow_exec::run_react_flow`] 执行时交给 core `FlowRunner`，
+    /// 由其发射 `FlowStarted/FlowStepExecuted/FlowCompleted/ToolCalling/ToolResponded`
+    /// 框架事件（经 `ProgressEventBridge` 落为前端 SSE 阶段流）。无总线时静默。
+    pub event_bus: Option<Arc<subhuti_core::event::EventBus>>,
 }
 
 impl Clone for DomainExecutionContext {
@@ -113,6 +118,7 @@ impl Clone for DomainExecutionContext {
             progress_tx: self.progress_tx.clone(),
             event_publisher: self.event_publisher.clone(),
             session_context: self.session_context.clone(),
+            event_bus: self.event_bus.clone(),
         }
     }
 }
@@ -129,6 +135,7 @@ impl std::fmt::Debug for DomainExecutionContext {
             .field("has_progress_tx", &self.progress_tx.is_some())
             .field("has_event_publisher", &self.event_publisher.is_some())
             .field("has_session_context", &self.session_context.is_some())
+            .field("has_event_bus", &self.event_bus.is_some())
             .finish()
     }
 }
@@ -178,6 +185,27 @@ impl DomainExecutionContext {
             trace_id: self.ctx.trace_id.clone(),
             session_id: self.ctx.session_id.clone(),
         }
+    }
+
+    /// 硬前置：文件系统端口必须已注入，缺失即报 Precondition。
+    pub fn require_file_system(&self) -> DomainResult<&Arc<dyn FileSystemPort>> {
+        self.file_system
+            .as_ref()
+            .ok_or_else(|| DomainError::Precondition("文件系统端口未注入".to_string()))
+    }
+
+    /// 硬前置：命令执行端口必须已注入，缺失即报 Precondition。
+    pub fn require_command(&self) -> DomainResult<&Arc<dyn CommandPort>> {
+        self.command
+            .as_ref()
+            .ok_or_else(|| DomainError::Precondition("命令执行端口未注入".to_string()))
+    }
+
+    /// 硬前置：Rust 工具链端口必须已注入，缺失即报 Precondition。
+    pub fn require_toolchain(&self) -> DomainResult<&Arc<dyn ToolchainPort>> {
+        self.toolchain
+            .as_ref()
+            .ok_or_else(|| DomainError::Precondition("工具链端口未注入".to_string()))
     }
 }
 

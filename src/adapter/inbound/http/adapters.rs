@@ -137,6 +137,11 @@ pub struct OrchestrateRequest {
     pub chain: Option<String>,
     /// 指定要使用的专家 ID（优先级最高，直接路由到该专家）
     pub expert_id: Option<String>,
+    /// 指定该专家下的技能 ID：直接执行该技能、跳过内部 LLM 技能规划（可选）。
+    /// 有效值由领域层 `execute_skill` 消费；无效值由领域层兜底回退到内部规划。
+    pub skill_id: Option<String>,
+    /// 技能参数（与 `skill_id` 配套，可选）。缺省时回退到 `message`。
+    pub skill_params: Option<String>,
     /// 自定义系统提示词（前端聊天设置传入，覆盖专家默认 system prompt）
     pub system_prompt: Option<String>,
     /// 任意扩展参数（JSON 对象）。workspace_folder 等配置都从这里传入，
@@ -148,6 +153,37 @@ pub struct OrchestrateRequest {
 
 fn uuid_v4() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// 把顶层 `skill_id` / `skill_params` 并入 `extra`，与 MCP 侧 `build_extra`
+/// 口径一致：出站引擎会把 extra 摊平进 ctx.metadata，领域专家读 metadata.skill_id
+/// 走 `execute_skill` 直达。保持 GET/POST/SSE 三态能力对齐。
+fn merge_skill_into_extra(req: &OrchestrateRequest) -> Option<serde_json::Value> {
+    let mut obj = serde_json::Map::new();
+    if let Some(v) = &req.extra {
+        if let Some(o) = v.as_object() {
+            for (k, val) in o {
+                obj.insert(k.clone(), val.clone());
+            }
+        }
+    }
+    if let Some(sid) = &req.skill_id {
+        obj.insert(
+            "skill_id".to_string(),
+            serde_json::Value::String(sid.clone()),
+        );
+    }
+    if let Some(sp) = &req.skill_params {
+        obj.insert(
+            "skill_params".to_string(),
+            serde_json::Value::String(sp.clone()),
+        );
+    }
+    if obj.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(obj))
+    }
 }
 
 // ─── 流式事件转 SSE（适配器职责：协议格式 + 分块策略）────────────
@@ -283,7 +319,7 @@ async fn orchestrate_json(state: AppState, req: OrchestrateRequest) -> Response 
             expert_id: req.expert_id.clone(),
             trace_id: None,
             system_prompt: req.system_prompt.clone(),
-            extra: req.extra.clone(),
+            extra: merge_skill_into_extra(&req),
         })
         .await;
 
@@ -355,7 +391,7 @@ fn orchestrate_sse(state: AppState, req: OrchestrateRequest) -> Response {
         expert_id: req.expert_id.clone(),
         trace_id: None,
         system_prompt: req.system_prompt.clone(),
-        extra: req.extra.clone(),
+        extra: merge_skill_into_extra(&req),
     });
 
     Sse::new(stream_to_sse(receiver, session_id)).into_response()

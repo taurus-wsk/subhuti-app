@@ -27,9 +27,14 @@
 //! - **可测试性**：可 mock `DomainLlm` 独立测试领域逻辑
 //! - **可提取性**：领域代码可整体提取为独立 crate，编译为 WASM 插件
 //!
+// 技能注册表收敛宏（`skill_catalog!`），须在 `experts` 之前声明使其对专家可见
+#[macro_use]
+mod skill_catalog;
+
 pub mod dto;
 pub mod events;
 pub mod experts;
+pub mod flow_exec;
 pub mod pending_ask;
 pub mod ports;
 pub mod session_context;

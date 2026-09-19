@@ -19,17 +19,170 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use subhuti_core::orchestrator::{FlowContext, FlowNodeResult, ReactStage};
 
 use crate::domain::events::DomainEvent;
+use crate::domain::flow_exec::{flow_flag, flow_str, run_react_flow, FlowKeyId, FlowNodeExecutor};
 use crate::domain::traits::{
     chat_stream_to_progress, DomainContext, DomainError, DomainExecutionContext, DomainExpert,
     DomainMessage, DomainResult, DomainRole, DomainSkill,
 };
 
+// 技能种类（决定 Flow 各节点如何执行）
+//
+// 这是所有技能的**唯一注册表**：id / 名称 / 描述 / 参数 / 阶段 都从这里派生，
+// `skills()`（元数据）与 `execute_skill`（调度）共用同一份定义，消除
+// `DomainSkill.id` 与 `match skill_id` 字符串的多处手工同步。
+//
+// 由 [`skill_catalog!`] 宏从一张数据表生成；新增技能只需补一行。
+skill_catalog!(
+    RustSkillKind,
+    stages, &'static [ReactStage],
+    {
+        Chat {
+            id: "rust-chat",
+            name: "自由对话",
+            desc: "与 Rust 编程专家自由对话，回答 Rust 相关问题和一般性咨询",
+            params: ["question: 用户的问题或咨询内容（必填）"],
+            custom: &[ReactStage::Analyze, ReactStage::Edit, ReactStage::Done],
+        },
+        Coding {
+            id: "rust-coding",
+            name: "项目编码",
+            desc: "在项目工作目录中执行完整的编码任务：创建项目、生成代码、编译验证、修复错误。需要先在聊天设置中配置「项目工作目录」",
+            params: ["task: 编码任务描述（必填）"],
+            custom: &[ReactStage::Analyze, ReactStage::Plan, ReactStage::Edit, ReactStage::Verify, ReactStage::Done],
+        },
+        Generate {
+            id: "rust-generate",
+            name: "生成代码",
+            desc: "根据需求描述生成完整的 Rust 代码，遵守六边形架构和编码规范",
+            params: ["requirement: 需求描述（必填）"],
+            custom: &[ReactStage::Analyze, ReactStage::Edit, ReactStage::Verify, ReactStage::Done],
+        },
+        Review {
+            id: "rust-review",
+            name: "代码审查",
+            desc: "审查 Rust 代码，检查架构、错误处理、命名规范等",
+            params: ["code: 待审查的代码（必填）"],
+            custom: &[ReactStage::Analyze, ReactStage::Edit, ReactStage::Done],
+        },
+        Fix {
+            id: "rust-fix",
+            name: "修复编译错误",
+            desc: "分析编译错误并生成修复代码",
+            params: ["code_with_errors: 代码+编译错误信息（必填）"],
+            custom: &[ReactStage::Analyze, ReactStage::Edit, ReactStage::Done],
+        },
+        Refactor {
+            id: "rust-refactor",
+            name: "代码重构",
+            desc: "将代码重构为符合六边形架构和编码规范的版本",
+            params: ["code: 待重构的代码（必填）"],
+            custom: &[ReactStage::Edit, ReactStage::Done],
+        },
+        SkillList {
+            id: "rust-skill-list",
+            name: "技能列表",
+            desc: "查询并展示当前专家可用的所有技能列表及其详细说明",
+            params: ["format: 输出格式（可选，支持 markdown/plain）"],
+            custom: &[ReactStage::Done],
+        },
+        KnowledgeQuery {
+            id: "rust-knowledge-query",
+            name: "知识库查询",
+            desc: "查询 Rust 专家的知识库内容，包括四层知识库（Rust基础、设计模式、编码规范、项目结构）",
+            params: ["topic: 查询的主题或关键词（可选，为空则展示所有知识库目录）"],
+            custom: &[ReactStage::Analyze, ReactStage::Edit, ReactStage::Done],
+        },
+    }
+);
+
+/// 把 RustExpert 以「Skill = Flow + Tool」模式挂到固定 React 模板上。
+///
+/// 持有专家本体（可访问其私有辅助方法）与当前技能种类；节点逻辑统一交由
+/// `RustExpert::flow_pure / flow_llm` 按技能 + 节点分派。
+struct RustFlowExecutor {
+    skill: RustSkillKind,
+    expert: Arc<RustExpert>,
+}
+
+#[async_trait]
+impl FlowNodeExecutor for RustFlowExecutor {
+    async fn execute_pure(
+        &self,
+        stage: ReactStage,
+        exec_ctx: &DomainExecutionContext,
+        ctx: &mut FlowContext,
+    ) -> DomainResult<FlowNodeResult> {
+        self.expert
+            .flow_pure(self.skill, stage, exec_ctx, ctx)
+            .await
+    }
+
+    async fn execute_llm(
+        &self,
+        stage: ReactStage,
+        exec_ctx: &DomainExecutionContext,
+        ctx: &mut FlowContext,
+    ) -> DomainResult<FlowNodeResult> {
+        self.expert.flow_llm(self.skill, stage, exec_ctx, ctx).await
+    }
+}
+
+/// 编码类技能共享的中间结果 key（`FlowKeyId` / `flow_str` / `flow_flag`
+/// 共用定义见 [`crate::domain::flow_exec`]）
+#[derive(Clone, Copy)]
+enum CodingKey {
+    HasProject,
+    Existing,
+    Ws,
+    Sys,
+    VerifyOk,
+    PlanItems,
+}
+
+impl FlowKeyId for CodingKey {
+    fn as_str(&self) -> &'static str {
+        match self {
+            CodingKey::HasProject => "coding.has_project",
+            CodingKey::Existing => "coding.existing",
+            CodingKey::Ws => "coding.ws",
+            CodingKey::Sys => "coding.sys",
+            CodingKey::VerifyOk => "coding.verify_ok",
+            CodingKey::PlanItems => "coding.plan_items",
+        }
+    }
+}
+
+/// 代码生成类技能中间结果 key
+#[derive(Clone, Copy)]
+enum GenerateKey {
+    Sys,
+    Instruction,
+    LastCode,
+}
+
+impl FlowKeyId for GenerateKey {
+    fn as_str(&self) -> &'static str {
+        match self {
+            GenerateKey::Sys => "generate.sys",
+            GenerateKey::Instruction => "generate.instruction",
+            GenerateKey::LastCode => "generate.last_code",
+        }
+    }
+}
+
 /// Rust 编程专家
 ///
 /// 嵌入 4 层知识库作为 system prompt，支持代码生成/审查/修复/重构。
 /// 编译验证通过 DomainExecutionContext.toolchain 完成。
+///
+/// 执行模型：**Skill = Flow + Tool**。各技能复用固定 React 模板
+/// `analyze→plan→edit→verify→done`（按需启用阶段），节点处理逻辑 + 真实
+/// 工具绑定由 `RustFlowExecutor`（FlowNodeExecutor）提供，`FlowRunner` 负责
+/// 顺序、上下文传递与事件发射。
+#[derive(Clone)]
 pub struct RustExpert {
     skills: Vec<DomainSkill>,
     tags: Vec<String>,
@@ -58,59 +211,8 @@ impl RustExpert {
                 "analysis".to_string(),
                 "reporting".to_string(),
             ],
-            skills: vec![
-                DomainSkill {
-                    id: "rust-chat".to_string(),
-                    name: "自由对话".to_string(),
-                    description: "与 Rust 编程专家自由对话，回答 Rust 相关问题和一般性咨询"
-                        .to_string(),
-                    parameters: vec!["question: 用户的问题或咨询内容（必填）".to_string()],
-                },
-                DomainSkill {
-                    id: "rust-coding".to_string(),
-                    name: "项目编码".to_string(),
-                    description: "在项目工作目录中执行完整的编码任务：创建项目、生成代码、编译验证、修复错误。需要先在聊天设置中配置「项目工作目录」"
-                        .to_string(),
-                    parameters: vec!["task: 编码任务描述（必填）".to_string()],
-                },
-                DomainSkill {
-                    id: "rust-generate".to_string(),
-                    name: "生成代码".to_string(),
-                    description: "根据需求描述生成完整的 Rust 代码，遵守六边形架构和编码规范"
-                        .to_string(),
-                    parameters: vec!["requirement: 需求描述（必填）".to_string()],
-                },
-                DomainSkill {
-                    id: "rust-review".to_string(),
-                    name: "代码审查".to_string(),
-                    description: "审查 Rust 代码，检查架构、错误处理、命名规范等".to_string(),
-                    parameters: vec!["code: 待审查的代码（必填）".to_string()],
-                },
-                DomainSkill {
-                    id: "rust-fix".to_string(),
-                    name: "修复编译错误".to_string(),
-                    description: "分析编译错误并生成修复代码".to_string(),
-                    parameters: vec!["code_with_errors: 代码+编译错误信息（必填）".to_string()],
-                },
-                DomainSkill {
-                    id: "rust-refactor".to_string(),
-                    name: "代码重构".to_string(),
-                    description: "将代码重构为符合六边形架构和编码规范的版本".to_string(),
-                    parameters: vec!["code: 待重构的代码（必填）".to_string()],
-                },
-                DomainSkill {
-                    id: "rust-skill-list".to_string(),
-                    name: "技能列表".to_string(),
-                    description: "查询并展示当前专家可用的所有技能列表及其详细说明".to_string(),
-                    parameters: vec!["format: 输出格式（可选，支持 markdown/plain）".to_string()],
-                },
-                DomainSkill {
-                    id: "rust-knowledge-query".to_string(),
-                    name: "知识库查询".to_string(),
-                    description: "查询 Rust 专家的知识库内容，包括四层知识库（Rust基础、设计模式、编码规范、项目结构）".to_string(),
-                    parameters: vec!["topic: 查询的主题或关键词（可选，为空则展示所有知识库目录）".to_string()],
-                },
-            ],
+            // 技能元数据从唯一注册表 `RustSkillKind::ALL` 派生，不手写重复 id/name/desc
+            skills: RustSkillKind::ALL.iter().map(|k| k.meta()).collect(),
         }
     }
 
@@ -462,165 +564,164 @@ src/
         .to_string()
     }
 
-    // ─── 技能实现 ────────────────────────────────────────────────
+    // ─── Flow 节点逻辑（Skill = Flow + Tool）───────────────────────
 
-    /// 技能: rust-chat — 自由对话（非编码请求）
-    async fn skill_chat(
+    /// 按技能 + 阶段构造执行器并跑固定 React 模板，返回累积产物
+    async fn run_skill_flow(
         &self,
+        skill: RustSkillKind,
         exec_ctx: DomainExecutionContext,
-        question: &str,
+        stages: &[ReactStage],
     ) -> DomainResult<String> {
-        let is_knowledge_q = is_knowledge_query(question);
-
-        tracing::info!(
-            "skill_chat: knowledge_query={}, question={}",
-            is_knowledge_q,
-            question
-        );
-
-        // 如果用户自定义了 system_prompt，优先使用
-        let sys = if let Some(ref custom) = exec_ctx.ctx.system_prompt {
-            custom.clone()
-        } else if is_knowledge_q {
-            // 用户询问知识库/专家能力相关问题 → 从藏经阁动态加载知识库
-            tracing::info!("检测到知识库查询，从藏经阁动态加载知识库");
-            self.build_system_prompt_dynamic(&exec_ctx).await
-        } else {
-            // 闲聊模式：使用轻量级系统提示词
-            "你是 Rust 编程专家，擅长 Rust 语言、系统编程、Web 后端、架构设计等领域。\
-             \n\n请用简洁、专业的方式回答用户的问题。如果用户问的是 Rust 相关问题，请给出详细解答。\
-             \n如果用户只是打招呼或闲聊，请友好回应但保持专业。\
-             \n\n注意：除非用户明确要求生成代码，否则不要主动生成大量代码，先以对话方式回答。"
-                .to_string()
-        };
-
-        // 构建消息列表：system + 历史 + 当前问题
-        let mut messages = Vec::new();
-
-        // 1. 添加系统提示
-        messages.push(DomainMessage {
-            role: DomainRole::System,
-            content: sys,
+        let ex = Arc::new(RustFlowExecutor {
+            skill,
+            expert: Arc::new(self.clone()),
         });
-
-        // 2. 添加历史消息（排除历史中的 System 消息，避免重复）
-        for msg in &exec_ctx.ctx.history {
-            if msg.role != DomainRole::System {
-                messages.push(msg.clone());
-            }
-        }
-
-        // 3. 添加当前用户问题
-        messages.push(DomainMessage {
-            role: DomainRole::User,
-            content: question.to_string(),
-        });
-
-        tracing::info!(
-            "skill_chat: 历史消息数={}, 当前问题={}",
-            exec_ctx.ctx.history.len(),
-            question
-        );
-
-        // 真流式：闲聊/问答逐 delta 下发，首字即出
-        chat_stream_to_progress(&exec_ctx.llm, messages, &exec_ctx.progress_tx).await
+        run_react_flow(&exec_ctx, "rust.react", stages, ex).await
     }
 
-    /// 技能: rust-coding — 在项目工作目录中执行完整编码任务
-    ///
-    /// 流程：生成计划 → 展示待办 → 创建代码 → 写入文件 → cargo check → 修复
-    /// 技能: rust-coding — 在项目工作目录中执行完整编码任务
-    ///
-    /// **Workflow 已下沉到专家内部**：原先由框架 `rust_edit` 图
-    /// (`analyze → diff_plan → edit_files → verify → complete` + 条件 `fix_errors`)
-    /// 编排的多步流水线，现在完全由本专家以**确定性代码**驱动（仅代码生成/规划走 LLM），
-    /// 框架不再持有任何 Graph。各阶段对应原图节点：
-    ///   - `analyze`  ：勘察项目状态（是否已有 Cargo.toml / 现有 .rs 文件）
-    ///   - `plan`     ：LLM 制定执行计划（markdown 待办清单）
-    ///   - `edit`     ：(必要时 cargo init) + LLM 生成代码 + 写入文件
-    ///   - `verify`   ：cargo check（优先 toolchain，否则 command）
-    ///   - `complete` ：编译通过即完成
-    ///   - `fix`(条件)：编译失败则携错误回灌 LLM 修复，循环至通过或达上限
-    async fn skill_coding(
+    /// 纯工具节点：按 React 阶段 + 技能分派（analyze / verify / done）
+    async fn flow_pure(
         &self,
-        exec_ctx: DomainExecutionContext,
-        task: &str,
-    ) -> DomainResult<String> {
-        // ── 智能路由：判断是否为编码查询 ──────────────────────
-        if !Self::is_coding_query(task) {
-            tracing::info!("检测到非编码查询，转为聊天模式: {}", task);
-            return self.skill_chat(exec_ctx, task).await;
+        skill: RustSkillKind,
+        stage: ReactStage,
+        exec_ctx: &DomainExecutionContext,
+        ctx: &mut FlowContext,
+    ) -> DomainResult<FlowNodeResult> {
+        match stage {
+            ReactStage::Analyze => match skill {
+                RustSkillKind::Coding => self.flow_coding_analyze(exec_ctx, ctx).await,
+                _ => Ok(FlowNodeResult {
+                    output: String::new(),
+                    success: true,
+                }),
+            },
+            ReactStage::Verify => match skill {
+                RustSkillKind::Coding => self.flow_coding_verify(exec_ctx, ctx).await,
+                RustSkillKind::Generate => self.flow_generate_verify(exec_ctx, ctx).await,
+                _ => Ok(FlowNodeResult {
+                    output: String::new(),
+                    success: true,
+                }),
+            },
+            ReactStage::Done => match skill {
+                RustSkillKind::Coding => self.flow_coding_done(ctx).await,
+                RustSkillKind::SkillList => Ok(FlowNodeResult {
+                    output: self.format_skills_for_response(),
+                    success: true,
+                }),
+                _ => Ok(FlowNodeResult {
+                    output: String::new(),
+                    success: true,
+                }),
+            },
+            ReactStage::Plan | ReactStage::Edit => {
+                unreachable!("纯工具节点不能收到 plan/edit 阶段: {stage:?}")
+            }
         }
+    }
 
+    /// LLM 决策节点：按 React 阶段 + 技能分派（plan / edit）
+    async fn flow_llm(
+        &self,
+        skill: RustSkillKind,
+        stage: ReactStage,
+        exec_ctx: &DomainExecutionContext,
+        ctx: &mut FlowContext,
+    ) -> DomainResult<FlowNodeResult> {
+        match stage {
+            ReactStage::Plan => match skill {
+                RustSkillKind::Coding => self.flow_coding_plan(exec_ctx, ctx).await,
+                // 其余技能的 plan 仅为阶段占位（无 LLM 规划）
+                _ => Ok(FlowNodeResult {
+                    output: String::new(),
+                    success: true,
+                }),
+            },
+            ReactStage::Edit => match skill {
+                RustSkillKind::Coding => self.flow_coding_edit(exec_ctx, ctx).await,
+                RustSkillKind::Chat => self.flow_chat_edit(exec_ctx, ctx).await,
+                RustSkillKind::Review => self.flow_lang_edit(exec_ctx, ctx, "review").await,
+                RustSkillKind::Fix => self.flow_lang_edit(exec_ctx, ctx, "fix").await,
+                RustSkillKind::Refactor => self.flow_lang_edit(exec_ctx, ctx, "refactor").await,
+                RustSkillKind::KnowledgeQuery => self.flow_knowledge_edit(exec_ctx, ctx).await,
+                RustSkillKind::Generate => self.flow_generate_edit(exec_ctx, ctx).await,
+                RustSkillKind::SkillList => Err(DomainError::ExecutionError(
+                    "技能 rust-skill-list 不支持 edit 阶段".to_string(),
+                )),
+            },
+            ReactStage::Analyze | ReactStage::Verify | ReactStage::Done => {
+                unreachable!("LLM 决策节点只能收到 plan/edit 阶段: {stage:?}")
+            }
+        }
+    }
+
+    // ── coding：analyze / plan / edit / verify / done ─────────────
+
+    async fn flow_coding_analyze(
+        &self,
+        exec_ctx: &DomainExecutionContext,
+        ctx: &mut FlowContext,
+    ) -> DomainResult<FlowNodeResult> {
         let ws = exec_ctx
             .ctx
             .workspace_folder
             .as_ref()
             .ok_or_else(|| {
-                // 前置条件类失败：未配置工作目录时重试必然同样失败，
-                // 标为 Precondition 让自适应链跳过 L2 直接降级（省去数十秒空转）。
                 DomainError::Precondition(
                     "未配置项目工作目录。请在聊天设置中填写「项目工作目录」路径，或通过 extra.workspace_folder 传入。".to_string(),
                 )
             })?
             .clone();
-
-        let fs = exec_ctx
-            .file_system
-            .as_ref()
-            .ok_or_else(|| DomainError::Precondition("文件系统端口未注入".to_string()))?
-            .clone();
-        let cmd = exec_ctx
-            .command
-            .as_ref()
-            .ok_or_else(|| DomainError::Precondition("命令执行端口未注入".to_string()))?
-            .clone();
-        let llm = exec_ctx.llm.clone();
-        let toolchain = exec_ctx.toolchain.clone();
-
-        let mut output = String::new();
-        let progress_tx = exec_ctx.progress_tx.clone();
-
-        // 真实专家名（让编排层不必硬编码 "rust-expert"）
-        let expert_name = self.name().to_string();
-        // 阶段进度推送：直接发类型化 ProgressEvent，由应用层统一映射为前端 StreamEvent
-        let push_phase = |tx: &Option<crate::domain::traits::ProgressTx>,
-                          out: &String,
-                          phase: &str,
-                          step_msg: &str,
-                          done: usize,
-                          total: usize| {
-            crate::domain::traits::emit_step(
-                tx,
-                &expert_name,
-                Some(phase),
-                step_msg,
-                Some(out.as_str()),
-                done,
-                total,
-            );
-        };
-
-        // ── 阶段 1: ANALYZE 项目状态勘察 ───────────────────────
-        push_phase(&progress_tx, &output, "analyze", "🔍 分析项目状态...", 0, 1);
+        let fs = exec_ctx.require_file_system()?.clone();
         let has_project = fs.exists(&format!("{}/Cargo.toml", &ws)).await;
-        let existing_files = fs.search_files("**/*.rs", &ws).await.unwrap_or_default();
-        output.push_str(&format!("📂 **项目目录**: `{}`\n\n", ws));
-        if !has_project {
-            output.push_str("🆕 项目尚未创建，需要执行 `cargo init` 初始化\n\n");
-        } else {
-            output.push_str(&format!(
+        let existing = fs.search_files("**/*.rs", &ws).await.unwrap_or_default();
+        // 状态写入 ctx.results，供后续 plan/edit/verify/done 使用
+        ctx.results.insert(
+            CodingKey::Ws.as_str().to_string(),
+            FlowNodeResult {
+                output: ws.clone(),
+                success: true,
+            },
+        );
+        ctx.results.insert(
+            CodingKey::HasProject.as_str().to_string(),
+            FlowNodeResult {
+                output: if has_project { "true" } else { "false" }.to_string(),
+                success: true,
+            },
+        );
+        ctx.results.insert(
+            CodingKey::Existing.as_str().to_string(),
+            FlowNodeResult {
+                output: existing.join(", "),
+                success: true,
+            },
+        );
+        let mut out = format!("📂 **项目目录**: `{}`\n\n", ws);
+        if has_project {
+            out.push_str(&format!(
                 "📁 项目已存在，现有 Rust 文件: {} 个\n\n",
-                existing_files.len()
+                existing.len()
             ));
+        } else {
+            out.push_str("🆕 项目尚未创建，需要执行 `cargo init` 初始化\n\n");
         }
+        Ok(FlowNodeResult {
+            output: out,
+            success: true,
+        })
+    }
 
-        // 获取技能列表信息
+    async fn flow_coding_plan(
+        &self,
+        exec_ctx: &DomainExecutionContext,
+        ctx: &mut FlowContext,
+    ) -> DomainResult<FlowNodeResult> {
+        let has_project = flow_flag(ctx, CodingKey::HasProject);
+        let existing = flow_str(ctx, CodingKey::Existing);
+        let ws = flow_str(ctx, CodingKey::Ws);
         let skills_info = self.format_skills_info();
-
-        // ── 阶段 2: PLAN 制定执行计划 ──────────────────────────
-        push_phase(&progress_tx, &output, "plan", "📋 制定执行计划...", 0, 1);
-        output.push_str("## 📋 执行计划\n\n");
         let plan_prompt = format!(
             "你是一个 Rust 编程专家，正在项目目录 `{}` 中工作。\n\n\
              当前项目状态：\n\
@@ -636,75 +737,49 @@ src/
              注意：只输出计划本身，不要输出代码。",
             ws,
             if has_project { "是" } else { "否" },
-            existing_files.join(", "),
+            existing,
             skills_info,
-            task,
+            ctx.input,
         );
-        let plan = llm
+        let plan = exec_ctx
+            .llm
             .chat(self.build_messages(
                 "你是一个项目规划专家，负责制定清晰的执行计划。",
                 &plan_prompt,
             ))
             .await?;
-        output.push_str(&plan);
-        output.push_str("\n\n---\n\n## ⚡ 执行过程\n\n");
-
-        // 推送计划到前端（让用户在执行前看到待办列表）
-        // 语义等同 traits::send_struct_progress("plan", ...)：phase="plan"，todo_state 承载 markdown 清单
-        crate::domain::traits::emit_step(
-            &progress_tx,
-            &expert_name,
-            Some("plan"),
-            "已生成执行计划 (1 步)",
-            Some(plan.as_str()),
-            0,
-            1,
-        );
-
-        // 解析计划中的 - [ ] 项，用于后续更新状态
         let plan_items: Vec<String> = plan
             .lines()
             .filter(|l| l.trim().starts_with("- [ ]"))
             .map(|l| l.trim().to_string())
             .collect();
-        let plan_total = plan_items.len();
-        let mut next_item = 0usize;
-
-        // 辅助函数：标记未完成的计划项并返回标记数量
-        let mark_done =
-            |out: &mut String, next: &mut usize, count: Option<usize>, items: &[String]| -> usize {
-                let mut marked = 0usize;
-                let limit = count.unwrap_or(items.len());
-                while *next < items.len() && marked < limit {
-                    let old = &items[*next];
-                    let new = old.replace("- [ ]", "- [x]");
-                    *out = out.replace(old, &new);
-                    *next += 1;
-                    marked += 1;
-                }
-                marked
-            };
-
-        // ── 阶段 3: EDIT 生成 + 写入文件 ──────────────────────
-        push_phase(
-            &progress_tx,
-            &output,
-            "edit",
-            "✏️ 生成并写入代码...",
-            next_item,
-            plan_total.max(1),
+        ctx.results.insert(
+            CodingKey::PlanItems.as_str().to_string(),
+            FlowNodeResult {
+                output: plan_items.join("|"),
+                success: true,
+            },
         );
-        // 3.1 若项目不存在，先 cargo init
+        let out = format!("## 📋 执行计划\n\n{}\n\n---\n\n## ⚡ 执行过程\n\n", plan);
+        Ok(FlowNodeResult {
+            output: out,
+            success: true,
+        })
+    }
+
+    async fn flow_coding_edit(
+        &self,
+        exec_ctx: &DomainExecutionContext,
+        ctx: &mut FlowContext,
+    ) -> DomainResult<FlowNodeResult> {
+        let ws = flow_str(ctx, CodingKey::Ws);
+        let has_project = flow_flag(ctx, CodingKey::HasProject);
+        let existing = flow_str(ctx, CodingKey::Existing);
+        let cmd = exec_ctx.require_command()?.clone();
+        let fs = exec_ctx.require_file_system()?.clone();
+        let skills_info = self.format_skills_info();
+        let mut out = String::new();
         if !has_project {
-            mark_done(&mut output, &mut next_item, Some(1), &plan_items);
-            push_phase(
-                &progress_tx,
-                &output,
-                "edit",
-                "📦 初始化项目 (cargo init)...",
-                next_item,
-                plan_total.max(1),
-            );
             let init = cmd
                 .run_command(
                     "cargo",
@@ -713,15 +788,12 @@ src/
                 )
                 .await
                 .map_err(|e| DomainError::ExecutionError(format!("cargo init 失败: {}", e)))?;
-            output.push_str(&format!("> `cargo init`: exit={}\n", init.exit_code));
+            out.push_str(&format!("> `cargo init`: exit={}\n", init.exit_code));
             if !init.stderr.is_empty() {
-                let stderr = &init.stderr[..init.stderr.len().min(200)];
-                output.push_str(&format!("> stderr: `{}`\n", stderr));
+                let len = init.stderr.len().min(200);
+                out.push_str(&format!("> stderr: `{}`\n", &init.stderr[..len]));
             }
         }
-
-        // 3.2 LLM 生成代码
-        mark_done(&mut output, &mut next_item, Some(1), &plan_items);
         let sys_prompt = format!(
             "你是一个 Rust 编程专家，正在项目目录 `{}` 中工作。\n\
              \n当前项目状态：\n\
@@ -743,74 +815,66 @@ src/
              4. 完成所有修改后，给出 `cargo check` 可以执行的命令提示",
             ws,
             if has_project { "是" } else { "否" },
-            existing_files.join(", "),
+            existing,
             skills_info,
-            task,
+            ctx.input,
+        );
+        ctx.results.insert(
+            CodingKey::Sys.as_str().to_string(),
+            FlowNodeResult {
+                output: sys_prompt.clone(),
+                success: true,
+            },
         );
         let user_prompt = format!(
             "请为项目 `{}` 实现以下功能：\n\n{}\n\n输出所有需要创建或修改的文件，每个文件用 File: 路径 标记。",
-            ws, task
+            ws, ctx.input
         );
-        let llm_response = llm
+        let llm_response = exec_ctx
+            .llm
             .chat(self.build_messages(&sys_prompt, &user_prompt))
             .await?;
-
-        // 3.2.1 模型已生成代码（think 之后进入 edit，阶段顺序更自然）
-        push_phase(
-            &progress_tx,
-            &output,
-            "edit",
-            "🤖 模型已生成代码",
-            next_item,
-            plan_total.max(1),
-        );
-
-        // 3.3 写入文件
-        mark_done(&mut output, &mut next_item, Some(1), &plan_items);
-        push_phase(
-            &progress_tx,
-            &output,
-            "edit",
-            "💾 写入文件...",
-            next_item,
-            plan_total.max(1),
-        );
-        let written = self
+        match self
             .write_files_from_llm_output(&ws, &llm_response, &fs)
-            .await;
-        match written {
+            .await
+        {
             Ok(files) => {
                 for f in &files {
-                    output.push_str(&format!("> 📄 `{}`\n", f));
+                    out.push_str(&format!("> 📄 `{}`\n", f));
                 }
-                output.push_str(&format!("> 共写入 {} 个文件\n", files.len()));
+                out.push_str(&format!("> 共写入 {} 个文件\n", files.len()));
             }
             Err(e) => {
-                output.push_str(&format!("> ⚠️ 部分文件写入失败: {}\n", e));
+                out.push_str(&format!("> ⚠️ 部分文件写入失败: {}\n", e));
             }
         }
+        Ok(FlowNodeResult {
+            output: out,
+            success: true,
+        })
+    }
 
-        // ── 阶段 4+5: VERIFY / FIX / COMPLETE ─────────────────
-        // 统一验证-修复闭环：优先 toolchain.check，否则 command.run_command("cargo", ["check"])。
-        // 失败则携编译错误回灌 LLM 修复，循环至通过或达上限（MAX_FIX_RETRIES）。
+    async fn flow_coding_verify(
+        &self,
+        exec_ctx: &DomainExecutionContext,
+        ctx: &mut FlowContext,
+    ) -> DomainResult<FlowNodeResult> {
+        let ws = flow_str(ctx, CodingKey::Ws);
+        let sys = flow_str(ctx, CodingKey::Sys);
+        let cmd = exec_ctx.require_command()?.clone();
+        let fs = exec_ctx.require_file_system()?.clone();
+        let toolchain = exec_ctx.toolchain.clone();
         const MAX_FIX_RETRIES: usize = 3;
+        let mut out = String::new();
         for attempt in 0..=MAX_FIX_RETRIES {
-            push_phase(
-                &progress_tx,
-                &output,
-                "verify",
-                &format!("🔧 编译验证 (第 {} 次)...", attempt + 1),
-                next_item,
-                plan_total.max(1),
-            );
             let check = if let Some(tc) = &toolchain {
                 let r = tc.check(&ws).await;
-                Some((r.success, r.errors.join("\n"), r.output))
+                Some((r.success, r.errors.join("\n")))
             } else {
                 None
             };
             let (ok, detail) = match check {
-                Some((success, errors, _out)) => {
+                Some((success, errors)) => {
                     if success {
                         (true, "> `cargo check` (toolchain): 通过\n".to_string())
                     } else {
@@ -839,53 +903,41 @@ src/
                     }
                 }
             };
-
             if ok {
-                output.push_str(&detail);
-                mark_done(&mut output, &mut next_item, None, &plan_items);
-                push_phase(
-                    &progress_tx,
-                    &output,
-                    "complete",
-                    "✅ 任务完成",
-                    plan_total.max(1),
-                    plan_total.max(1),
+                ctx.results.insert(
+                    CodingKey::VerifyOk.as_str().to_string(),
+                    FlowNodeResult {
+                        output: "true".to_string(),
+                        success: true,
+                    },
                 );
-                output
-                    .push_str("\n\n---\n\n## ✅ 任务完成\n\n所有步骤均已完成，项目已可正常编译。");
-                return Ok(output);
+                out.push_str(&detail);
+                return Ok(FlowNodeResult {
+                    output: out,
+                    success: true,
+                });
             }
-
-            output.push_str(&detail);
+            out.push_str(&detail);
             if attempt >= MAX_FIX_RETRIES {
-                mark_done(&mut output, &mut next_item, None, &plan_items);
-                push_phase(
-                    &progress_tx,
-                    &output,
-                    "complete",
-                    "⚠️ 需要手动修复",
-                    plan_total.max(1),
-                    plan_total.max(1),
+                ctx.results.insert(
+                    CodingKey::VerifyOk.as_str().to_string(),
+                    FlowNodeResult {
+                        output: "false".to_string(),
+                        success: true,
+                    },
                 );
-                output.push_str("\n\n---\n\n## ⚠️ 需要手动修复\n\n自动修复未能解决所有编译错误，请查看上方错误信息手动修复。");
-                return Ok(output);
+                return Ok(FlowNodeResult {
+                    output: out,
+                    success: true,
+                });
             }
-
-            // 条件阶段 FIX：携错误回灌 LLM 重新生成并写入
-            push_phase(
-                &progress_tx,
-                &output,
-                "fix",
-                &format!("🩹 修复编译错误 (第 {} 次)...", attempt + 1),
-                next_item,
-                plan_total.max(1),
-            );
             let fix_prompt = format!(
                 "以下 Rust 项目（目录 `{}`）编译失败。\n\n编译错误：\n{}\n\n请分析错误原因并修复。输出所有需要修改的文件，每个文件用 File: 路径 标记。",
                 ws, detail
             );
-            let fix_response = llm
-                .chat(self.build_messages(&sys_prompt, &fix_prompt))
+            let fix_response = exec_ctx
+                .llm
+                .chat(self.build_messages(&sys, &fix_prompt))
                 .await?;
             match self
                 .write_files_from_llm_output(&ws, &fix_response, &fs)
@@ -893,45 +945,162 @@ src/
             {
                 Ok(files) => {
                     for f in &files {
-                        output.push_str(&format!("> 📄 修复 `{}`\n", f));
+                        out.push_str(&format!("> 📄 修复 `{}`\n", f));
                     }
                 }
                 Err(e) => {
-                    output.push_str(&format!("> ⚠️ 修复写入失败: {}\n", e));
+                    out.push_str(&format!("> ⚠️ 修复写入失败: {}\n", e));
                 }
             }
         }
-
-        Ok(output)
+        Ok(FlowNodeResult {
+            output: out,
+            success: true,
+        })
     }
 
-    /// 技能: rust-generate — 从需求生成代码（带验证循环）
-    async fn skill_generate(
-        &self,
-        exec_ctx: DomainExecutionContext,
-        requirement: &str,
-    ) -> DomainResult<String> {
-        // 获取技能列表信息
-        let skills_info = self.format_skills_info();
+    async fn flow_coding_done(&self, ctx: &mut FlowContext) -> DomainResult<FlowNodeResult> {
+        ctx.output = ctx.output.replace("- [ ]", "- [x]");
+        let ok = flow_flag(ctx, CodingKey::VerifyOk);
+        let footer = if ok {
+            "\n\n---\n\n## ✅ 任务完成\n\n所有步骤均已完成，项目已可正常编译。"
+        } else {
+            "\n\n---\n\n## ⚠️ 需要手动修复\n\n自动修复未能解决所有编译错误，请查看上方错误信息手动修复。"
+        };
+        Ok(FlowNodeResult {
+            output: footer.to_string(),
+            success: true,
+        })
+    }
 
-        // 如果用户自定义了 system_prompt，优先使用
+    // ── chat：单轮自由对话 ────────────────────────────────────────
+
+    async fn flow_chat_edit(
+        &self,
+        exec_ctx: &DomainExecutionContext,
+        ctx: &mut FlowContext,
+    ) -> DomainResult<FlowNodeResult> {
+        let question = &ctx.input;
+        let is_knowledge_q = is_knowledge_query(question);
+        let sys = if let Some(ref custom) = exec_ctx.ctx.system_prompt {
+            custom.clone()
+        } else if is_knowledge_q {
+            tracing::info!("检测到知识库查询，从藏经阁动态加载知识库");
+            self.build_system_prompt_dynamic(exec_ctx).await
+        } else {
+            "你是 Rust 编程专家，擅长 Rust 语言、系统编程、Web 后端、架构设计等领域。\
+             \n\n请用简洁、专业的方式回答用户的问题。如果用户问的是 Rust 相关问题，请给出详细解答。\
+             \n如果用户只是打招呼或闲聊，请友好回应但保持专业。\
+             \n\n注意：除非用户明确要求生成代码，否则不要主动生成大量代码，先以对话方式回答。"
+                .to_string()
+        };
+        let mut messages = vec![DomainMessage {
+            role: DomainRole::System,
+            content: sys,
+        }];
+        for msg in &exec_ctx.ctx.history {
+            if msg.role != DomainRole::System {
+                messages.push(msg.clone());
+            }
+        }
+        messages.push(DomainMessage {
+            role: DomainRole::User,
+            content: question.to_string(),
+        });
+        let text = chat_stream_to_progress(&exec_ctx.llm, messages, &exec_ctx.progress_tx).await?;
+        Ok(FlowNodeResult {
+            output: text,
+            success: true,
+        })
+    }
+
+    // ── review / fix / refactor：单轮 LLM（真流式） ───────────────
+
+    async fn flow_lang_edit(
+        &self,
+        exec_ctx: &DomainExecutionContext,
+        ctx: &mut FlowContext,
+        kind: &str,
+    ) -> DomainResult<FlowNodeResult> {
+        let code = &ctx.input;
+        let skills_info = self.format_skills_info();
+        let (role_desc, msg) = match kind {
+            "review" => (
+                "你是 Rust 代码审查专家。检查：架构分层、错误处理、异步安全、命名一致性、不必要的 clone、潜在死锁。",
+                format!("请审查以下 Rust 代码：\n\n```rust\n{}\n```", code),
+            ),
+            "fix" => (
+                "你是 Rust 编译错误修复专家。\n常见错误修复策略：\n\
+                 - E0597 (borrow lifetime): 减少不必要的借用\n\
+                 - E0382 (move): 使用 clone 或引用\n\
+                 - E0277 (trait bound): 添加必要的 trait 约束\n\
+                 - E0507 (move out): 使用 clone 或 ref",
+                format!("## 代码与编译错误\n\n{}", code),
+            ),
+            _ => (
+                "你是 Rust 代码重构专家。将代码重构为符合六边形架构和编码规范的版本。\n\
+                 目标：分离端口定义和实现、引入 trait 抽象、使用 Arc<dyn Port> 依赖注入、添加文档注释。",
+                format!("请重构以下 Rust 代码：\n\n```rust\n{}\n```", code),
+            ),
+        };
+        let sys = format!(
+            "{}\n\n## 可用技能\n{}\n\n{}",
+            self.build_system_prompt_dynamic(exec_ctx).await,
+            skills_info,
+            role_desc
+        );
+        let text = chat_stream_to_progress(
+            &exec_ctx.llm,
+            self.build_messages(&sys, &msg),
+            &exec_ctx.progress_tx,
+        )
+        .await?;
+        Ok(FlowNodeResult {
+            output: text,
+            success: true,
+        })
+    }
+
+    // ── knowledge-query：藏经阁召回（原 skill_knowledge_query 逻辑） ──
+
+    async fn flow_knowledge_edit(
+        &self,
+        exec_ctx: &DomainExecutionContext,
+        ctx: &mut FlowContext,
+    ) -> DomainResult<FlowNodeResult> {
+        let topic = Self::extract_param(&ctx.input, "topic");
+        let text = self.skill_knowledge_query(exec_ctx.clone(), &topic).await?;
+        Ok(FlowNodeResult {
+            output: text,
+            success: true,
+        })
+    }
+
+    // ── generate：生成 + 验证修复闭环 ─────────────────────────────
+
+    async fn flow_generate_edit(
+        &self,
+        exec_ctx: &DomainExecutionContext,
+        ctx: &mut FlowContext,
+    ) -> DomainResult<FlowNodeResult> {
+        let skills_info = self.format_skills_info();
         let sys = if let Some(ref custom) = exec_ctx.ctx.system_prompt {
             custom.clone()
         } else {
             format!(
                 "{}\n\n## 可用技能\n{}",
-                self.build_system_prompt_dynamic(&exec_ctx).await,
+                self.build_system_prompt_dynamic(exec_ctx).await,
                 skills_info
             )
         };
-
-        // 如果设置了 workspace_folder，附加到指令中
         let ws_hint = if let Some(ref ws) = exec_ctx.ctx.workspace_folder {
-            format!("\n\n项目工作目录: {}\n如果项目已存在，请在指定目录下操作；如果首次生成，请按项目结构规划。", ws)
+            format!(
+                "\n\n项目工作目录: {}\n如果项目已存在，请在指定目录下操作；如果首次生成，请按项目结构规划。",
+                ws
+            )
         } else {
             String::new()
         };
-
         let gen_instruction = format!(
             "你是 Rust 编程专家。根据以下需求生成完整、可编译的 Rust 代码。{ws_hint}\n\n\
              ## 你的可用技能\n{}\n\
@@ -941,90 +1110,123 @@ src/
              3. 不要省略任何必要的 use 语句\n\
              4. 用 ```rust 代码块标注文件路径\n\n\
              ---\n需求：{}",
-            skills_info, requirement,
+            skills_info, ctx.input,
         );
-
-        self.generate_with_verify(exec_ctx, &sys, &gen_instruction, requirement)
-            .await
-    }
-
-    /// 技能: rust-review — 审查代码
-    async fn skill_review(
-        &self,
-        exec_ctx: DomainExecutionContext,
-        code: &str,
-    ) -> DomainResult<String> {
-        let skills_info = self.format_skills_info();
-        let sys = format!(
-            "{}\n\n## 可用技能\n{}\n\n你是 Rust 代码审查专家。检查：架构分层、错误处理、异步安全、命名一致性、不必要的 clone、潜在死锁。",
-            self.build_system_prompt_dynamic(&exec_ctx).await,
-            skills_info
+        let response = exec_ctx
+            .llm
+            .chat(self.build_messages(&sys, &gen_instruction))
+            .await?;
+        // 供 verify 节点复用：system 提示 / 原始生成指令
+        ctx.results.insert(
+            GenerateKey::Sys.as_str().to_string(),
+            FlowNodeResult {
+                output: sys,
+                success: true,
+            },
         );
-        let msg = format!("请审查以下 Rust 代码：\n\n```rust\n{}\n```", code);
-        chat_stream_to_progress(
-            &exec_ctx.llm,
-            self.build_messages(&sys, &msg),
-            &exec_ctx.progress_tx,
-        )
-        .await
-    }
-
-    /// 技能: rust-fix — 修复编译错误
-    async fn skill_fix(
-        &self,
-        exec_ctx: DomainExecutionContext,
-        input: &str,
-    ) -> DomainResult<String> {
-        let skills_info = self.format_skills_info();
-        let sys = format!(
-            "{}\n\n## 可用技能\n{}\n\n你是 Rust 编译错误修复专家。\n常见错误修复策略：\n\
-             - E0597 (borrow lifetime): 减少不必要的借用\n\
-             - E0382 (move): 使用 clone 或引用\n\
-             - E0277 (trait bound): 添加必要的 trait 约束\n\
-             - E0507 (move out): 使用 clone 或 ref",
-            self.build_system_prompt_dynamic(&exec_ctx).await,
-            skills_info
+        ctx.results.insert(
+            GenerateKey::Instruction.as_str().to_string(),
+            FlowNodeResult {
+                output: gen_instruction,
+                success: true,
+            },
         );
-        let msg = format!("## 代码与编译错误\n\n{}", input);
-        chat_stream_to_progress(
-            &exec_ctx.llm,
-            self.build_messages(&sys, &msg),
-            &exec_ctx.progress_tx,
-        )
-        .await
+        Ok(FlowNodeResult {
+            output: response,
+            success: true,
+        })
     }
 
-    /// 技能: rust-refactor — 重构代码符合范式
-    async fn skill_refactor(
+    async fn flow_generate_verify(
         &self,
-        exec_ctx: DomainExecutionContext,
-        code: &str,
-    ) -> DomainResult<String> {
-        let skills_info = self.format_skills_info();
-        let sys = format!(
-            "{}\n\n## 可用技能\n{}\n\n你是 Rust 代码重构专家。将代码重构为符合六边形架构和编码规范的版本。\n\
-             目标：分离端口定义和实现、引入 trait 抽象、使用 Arc<dyn Port> 依赖注入、添加文档注释。",
-            self.build_system_prompt_dynamic(&exec_ctx).await,
-            skills_info
-        );
-        let msg = format!("请重构以下 Rust 代码：\n\n```rust\n{}\n```", code);
-        chat_stream_to_progress(
-            &exec_ctx.llm,
-            self.build_messages(&sys, &msg),
-            &exec_ctx.progress_tx,
-        )
-        .await
+        exec_ctx: &DomainExecutionContext,
+        ctx: &mut FlowContext,
+    ) -> DomainResult<FlowNodeResult> {
+        let sys = flow_str(ctx, GenerateKey::Sys);
+        let instruction = flow_str(ctx, GenerateKey::Instruction);
+        // 首次从 edit 节点的产出发验证，避免重复生成
+        let mut response = flow_str(ctx, ReactStage::Edit);
+        let mut current_req = instruction;
+        let max_retries = 3;
+        for retry in 0..=max_retries {
+            if retry > 0 {
+                let code = self.extract_code(&response);
+                current_req = format!(
+                    "原始需求：{}\n\n上次生成的代码：\n```rust\n{}\n```\n\n编译错误（请修复，只输出修复后的完整代码）：\n{}",
+                    ctx.input,
+                    code,
+                    "请参考上轮结果自行校验"
+                );
+                response = exec_ctx
+                    .llm
+                    .chat(self.build_messages(&sys, &current_req))
+                    .await?;
+            }
+            let toolchain = match &exec_ctx.toolchain {
+                Some(t) => t.clone(),
+                None => {
+                    return Ok(FlowNodeResult {
+                        output: format!(
+                            "✅ 代码已生成（未启用编译验证，设置 toolchain 以启用自动验证）\n\n{}",
+                            response
+                        ),
+                        success: true,
+                    });
+                }
+            };
+            let result = toolchain.check("").await;
+            if result.success {
+                return Ok(FlowNodeResult {
+                    output: format!(
+                        "✅ 编译通过({} 轮)\n\n{}\n\n---\n## 编译检查\n{}",
+                        retry + 1,
+                        response,
+                        result.output
+                    ),
+                    success: true,
+                });
+            }
+            if retry >= max_retries {
+                return Ok(FlowNodeResult {
+                    output: format!(
+                        "⚠️ 编译未通过（已重试 {} 次）\n\n## 生成的代码\n{}\n\n## 编译错误\n{}",
+                        max_retries,
+                        response,
+                        result.errors.join("\n")
+                    ),
+                    success: true,
+                });
+            }
+            // 携误差继续下一轮修复
+            let code = self.extract_code(&response);
+            ctx.results.insert(
+                GenerateKey::LastCode.as_str().to_string(),
+                FlowNodeResult {
+                    output: code.clone(),
+                    success: true,
+                },
+            );
+            if current_req.is_empty() {
+                current_req = format!(
+                    "原始需求：{}\n\n编译错误（请修复，只输出修复后的完整代码）：\n{}",
+                    ctx.input,
+                    result.errors.join("\n")
+                );
+            } else {
+                current_req = format!(
+                    "原始需求：{}\n\n上次生成的代码：\n```rust\n{}\n```\n\n编译错误（请修复，只输出修复后的完整代码）：\n{}",
+                    ctx.input,
+                    code,
+                    result.errors.join("\n")
+                );
+            }
+        }
+        Err(DomainError::ExecutionError(
+            "代码生成验证循环异常退出".to_string(),
+        ))
     }
 
-    /// 技能: rust-skill-list — 查询并返回技能列表（不调用LLM）
-    async fn skill_skill_list(
-        &self,
-        _exec_ctx: DomainExecutionContext,
-        _params: &str,
-    ) -> DomainResult<String> {
-        tracing::info!("[skill_skill_list] 返回技能列表");
-        Ok(self.format_skills_for_response())
-    }
+    // ── 技能实现已迁移至 Flow 节点逻辑 ──────────────────────────
 
     /// 技能: rust-knowledge-query — 查询知识库内容（通过藏经阁引擎召回）
     async fn skill_knowledge_query(
@@ -1361,90 +1563,6 @@ src/
 
     // ─── 验证修复闭环 ─────────────────────────────────────────────
 
-    /// 代码生成 + 编译验证 + 错误修复循环
-    async fn generate_with_verify(
-        &self,
-        exec_ctx: DomainExecutionContext,
-        sys: &str,
-        instruction: &str,
-        requirement: &str,
-    ) -> DomainResult<String> {
-        let max_retries = 3;
-        let mut current_req = instruction.to_string();
-        // 阶段进度推送（与 skill_coding 共用 phase 词汇表：edit/verify/fix）
-        let expert_name = self.name().to_string();
-        let push_phase = |tx: &Option<crate::domain::traits::ProgressTx>,
-                          phase: &str,
-                          step_msg: &str| {
-            crate::domain::traits::emit_step(tx, &expert_name, Some(phase), step_msg, None, 0, 0);
-        };
-
-        for retry in 0..=max_retries {
-            // 1. 调用 LLM 生成代码（think 阶段由 LLM 适配器在调用中自动发出：模型推理中…）
-            let response = exec_ctx
-                .llm
-                .chat(self.build_messages(sys, &current_req))
-                .await?;
-
-            // 2. 代码已生成（think 之后才进入 edit，阶段顺序更自然）
-            push_phase(
-                &exec_ctx.progress_tx,
-                "edit",
-                &format!("✏️ {} 已生成代码", expert_name),
-            );
-
-            // 3. 如果没有工具链，直接返回
-            push_phase(&exec_ctx.progress_tx, "verify", "🔍 正在验证编译...");
-            let toolchain = match &exec_ctx.toolchain {
-                Some(t) => t.clone(),
-                None => {
-                    return Ok(format!(
-                        "✅ 代码已生成（未启用编译验证，设置 toolchain 以启用自动验证）\n\n{}",
-                        response
-                    ));
-                }
-            };
-
-            // 3. 运行 cargo check 验证
-            let result = toolchain.check("").await;
-            if result.success {
-                return Ok(format!(
-                    "✅ 编译通过（{} 轮验证）\n\n{}\n\n---\n## 编译检查\n{}",
-                    retry + 1,
-                    response,
-                    result.output
-                ));
-            }
-
-            // 4. 达到最大重试次数
-            if retry >= max_retries {
-                return Ok(format!(
-                    "⚠️ 编译未通过（已重试 {} 次）\n\n## 生成的代码\n{}\n\n## 编译错误\n{}",
-                    max_retries,
-                    response,
-                    result.errors.join("\n")
-                ));
-            }
-
-            // 5. 用错误信息重新请求 LLM 修复
-            push_phase(
-                &exec_ctx.progress_tx,
-                "fix",
-                &format!("🔧 编译失败，第 {} 轮修复中...", retry + 1),
-            );
-            let code = self.extract_code(&response);
-            current_req = format!(
-                "原始需求：{}\n\n上次生成的代码：\n```rust\n{}\n```\n\n编译错误（请修复，只输出修复后的完整代码）：\n{}",
-                requirement, code,
-                result.errors.join("\n")
-            );
-        }
-
-        Err(DomainError::ExecutionError(
-            "代码生成验证循环异常退出".to_string(),
-        ))
-    }
-
     /// 从 LLM 响应中提取代码块
     fn extract_code(&self, response: &str) -> String {
         let mut code = String::new();
@@ -1659,27 +1777,37 @@ impl DomainExpert for RustExpert {
         params: &str,
         exec_ctx: DomainExecutionContext,
     ) -> DomainResult<String> {
-        match skill_id {
-            "rust-chat" => self.skill_chat(exec_ctx, params).await,
-            "rust-coding" => self.skill_coding(exec_ctx, params).await,
-            "rust-generate" => self.skill_generate(exec_ctx, params).await,
-            "rust-review" => self.skill_review(exec_ctx, params).await,
-            "rust-fix" => self.skill_fix(exec_ctx, params).await,
-            "rust-refactor" => self.skill_refactor(exec_ctx, params).await,
-            "rust-skill-list" => self.skill_skill_list(exec_ctx, params).await,
-            "rust-knowledge-query" => self.skill_knowledge_query(exec_ctx, params).await,
-            _ => {
-                // 未知技能，走默认 run
-                let new_ctx = DomainExecutionContext {
-                    ctx: DomainContext {
-                        input: format!("技能ID: {}, 参数: {}", skill_id, params),
-                        ..exec_ctx.ctx
-                    },
-                    ..exec_ctx
-                };
-                self.run(new_ctx).await
-            }
+        // 技能参数即 Flow 输入（与原 skill_* 方法口径一致）
+        let exec_ctx = DomainExecutionContext {
+            ctx: DomainContext {
+                input: params.to_string(),
+                ..exec_ctx.ctx
+            },
+            ..exec_ctx
+        };
+        // rust-coding 智能路由：非编码查询降级为聊天（与原 skill_coding 口径一致）
+        if skill_id == RustSkillKind::Coding.id() && !Self::is_coding_query(params) {
+            tracing::info!("检测到非编码查询，转为聊天模式: {}", params);
+            return self
+                .run_skill_flow(RustSkillKind::Chat, exec_ctx, RustSkillKind::Chat.stages())
+                .await;
         }
+        // 从唯一注册表查技能：id → 种类 + 阶段（消除 match skill_id 魔法字符串）
+        let Some(kind) = RustSkillKind::from_id(skill_id) else {
+            // 未知技能，走默认 run
+            let new_ctx = DomainExecutionContext {
+                ctx: DomainContext {
+                    input: format!("技能ID: {}, 参数: {}", skill_id, params),
+                    ..exec_ctx.ctx
+                },
+                // 清掉 skill_id，避免 run() 的 has_skill_id 分支再次命中，
+                // 导致 execute_skill ↔ run 无限递归（无效 skill_id 超时卡死）。
+                skill_id: None,
+                ..exec_ctx
+            };
+            return self.run(new_ctx).await;
+        };
+        self.run_skill_flow(kind, exec_ctx, kind.stages()).await
     }
 }
 

@@ -203,114 +203,6 @@ impl TraceEventBridge {
                 }
             }
 
-            AgentEventData::GraphStarted {
-                graph_name,
-                run_id,
-                entry_node,
-            } => {
-                extra.insert("run_id".into(), run_id.clone());
-                extra.insert("entry_node".into(), entry_node.clone());
-                SpanData {
-                    span_type,
-                    name: graph_name.clone(),
-                    input: None,
-                    output: None,
-                    duration_ms: None,
-                    tokens: None,
-                    timestamp,
-                    success: None,
-                    extra: extra_empty(),
-                }
-            }
-
-            AgentEventData::NodeExecuteRequested {
-                run_id,
-                node_name,
-                step,
-                state: _,
-            } => {
-                extra.insert("run_id".into(), run_id.clone());
-                extra.insert("step".into(), step.to_string());
-                SpanData {
-                    span_type,
-                    name: node_name.clone(),
-                    input: None,
-                    output: None,
-                    duration_ms: None,
-                    tokens: None,
-                    timestamp,
-                    success: None,
-                    extra: extra_empty(),
-                }
-            }
-
-            AgentEventData::NodeCompleted {
-                run_id,
-                node_name,
-                actor_name: _,
-                output,
-                success,
-                duration_ms,
-                next_nodes,
-                state_updates: _,
-            } => {
-                extra.insert("run_id".into(), run_id.clone());
-                extra.insert("next_nodes".into(), next_nodes.join(","));
-                SpanData {
-                    span_type,
-                    name: node_name.clone(),
-                    input: None,
-                    output: Some(output.clone()),
-                    duration_ms: Some(*duration_ms),
-                    tokens: None,
-                    timestamp,
-                    success: Some(*success),
-                    extra: extra_empty(),
-                }
-            }
-
-            AgentEventData::NodeFailed {
-                run_id,
-                node_name,
-                error,
-                duration_ms,
-            } => {
-                extra.insert("run_id".into(), run_id.clone());
-                extra.insert("error".into(), error.clone());
-                SpanData {
-                    span_type,
-                    name: node_name.clone(),
-                    input: None,
-                    output: None,
-                    duration_ms: Some(*duration_ms),
-                    tokens: None,
-                    timestamp,
-                    success: Some(false),
-                    extra: extra_empty(),
-                }
-            }
-
-            AgentEventData::GraphCompleted {
-                run_id,
-                success,
-                total_steps,
-                duration_ms,
-            } => {
-                extra.insert("run_id".into(), run_id.clone());
-                extra.insert("total_steps".into(), total_steps.to_string());
-                SpanData {
-                    span_type,
-                    name: "graph".into(),
-                    input: None,
-                    output: None,
-                    duration_ms: Some(*duration_ms),
-                    tokens: None,
-                    timestamp,
-                    success: Some(*success),
-                    extra: extra_empty(),
-                }
-            }
-
             // ── LLM 层事件 ──
             AgentEventData::LLMCalling {
                 messages_count,
@@ -498,8 +390,11 @@ impl ProgressEventBridge {
                 format!("📚 检索记忆: {query} ({results_count} 条)"),
                 source(),
             ),
-            // 其余事件（AgentStarted/Completed、LLMResponded 等）不在此桥渲染，
-            // 避免与编排层自身发出的 run/done 阶段重复
+            // FlowRunner 逐步执行：step_name 即 analyze/plan/edit/verify/done，
+            // 以它为 phase 原样渲染，前端阶段徽标与旧分析→规划→...面容保持一致。
+            FlowStepExecuted { step_name, .. } => ("flow", format!("📈 {}", step_name), source()),
+            // 其余事件（AgentStarted/Completed、FlowStarted/FlowCompleted、LLMResponded 等）
+            // 不在此桥渲染，避免与编排层自身发出的 run/done 阶段重复
             _ => return None,
         };
         Some(ProgressEvent::Step {
@@ -527,6 +422,9 @@ impl EventHandler for ProgressEventBridge {
             "tool_calling",
             "tool_responded",
             "memory_retrieved",
+            // FlowRunner 逐步执行的阶段徽标（analyze/plan/edit/verify/done）：
+            // FlowRunner 发射 FlowStepExecuted，落为前端阶段渲染，保持阶段流不变。
+            "flow_step_executed",
         ])
     }
 

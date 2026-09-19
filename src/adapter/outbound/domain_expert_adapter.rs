@@ -278,6 +278,18 @@ where
             // 框架级会话上下文：专家可直接读写（除 LLM 出口自动回流外，
             // 专家也能主动 `push_tool` / `set_metadata` 沉淀内容给其他消费方）
             session_context,
+            // 框架事件总线：供领域技能经 run_react_flow 交给 core FlowRunner 发射
+            // Flow*/Tool* 事件（经 ProgressEventBridge 落为 SSE 阶段流）。
+            event_bus: self.event_bus.clone(),
+        };
+
+        // params 缺省（仅传 skill_id 未传 skill_params）时回退到原始输入，
+        // 与 rust_expert.run 的 has_skill_id 分支口径一致；否则 execute_skill
+        // 会把空 params 覆盖为 Flow 输入，导致 LLM 收到空 prompt。
+        let params = if params.is_empty() {
+            exec_ctx.ctx.input.clone()
+        } else {
+            params.clone()
         };
 
         // 6. 根据是否有技能ID选择执行方式

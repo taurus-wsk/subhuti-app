@@ -172,78 +172,6 @@ pub enum AgentEventData {
     MemoryWritten { key: String, category: String },
     /// 记忆检索
     MemoryRetrieved { query: String, results_count: usize },
-
-    // ── 图调度事件（事件驱动编排）──
-    /// 图执行开始
-    GraphStarted {
-        graph_name: String,
-        run_id: String,
-        entry_node: String,
-    },
-    /// 请求节点执行（调度器 → Actor）
-    NodeExecuteRequested {
-        run_id: String,
-        node_name: String,
-        step: usize,
-        /// 当前图状态（Actor 基于此状态执行，符合 Actor 模型消息传递哲学）
-        state: std::collections::HashMap<String, serde_json::Value>,
-    },
-    /// 节点执行完成（Actor → 调度器）
-    NodeCompleted {
-        run_id: String,
-        node_name: String,
-        actor_name: String,
-        output: String,
-        success: bool,
-        duration_ms: u64,
-        next_nodes: Vec<String>,
-        /// 节点执行产生的状态更新（用于调度器合并状态后判断路由）
-        state_updates: std::collections::HashMap<String, serde_json::Value>,
-    },
-    /// 节点执行失败（Actor → 调度器）
-    NodeFailed {
-        run_id: String,
-        node_name: String,
-        error: String,
-        duration_ms: u64,
-    },
-    /// 图执行完成
-    GraphCompleted {
-        run_id: String,
-        success: bool,
-        total_steps: usize,
-        duration_ms: u64,
-    },
-
-    // ── Actor 竞标事件 ──
-    /// 演员任务可用（调度器发布，通知所有 Actor 有任务了）
-    ActorTaskRequested {
-        run_id: String,
-        node_name: String,
-        /// 任务标签（Actor 根据此标签自评分数）
-        task_tags: Vec<String>,
-        /// 任务描述
-        task_description: String,
-        step: usize,
-        /// 当前图状态
-        state: std::collections::HashMap<String, serde_json::Value>,
-    },
-    /// 演员竞标（Actor 自评后发布分数）
-    ActorBid {
-        run_id: String,
-        node_name: String,
-        actor_id: String,
-        score: u32,
-    },
-    /// 节点任务分配（调度器选中最匹配 Actor 后发布）
-    NodeTaskAssigned {
-        run_id: String,
-        node_name: String,
-        actor_id: String,
-        actor_name: String,
-        score: u32,
-        state: std::collections::HashMap<String, serde_json::Value>,
-    },
 }
 
 // ─── 便捷类型别名 ──────────────────────────────────────────
@@ -316,14 +244,6 @@ impl AgentEventData {
             Self::ToolResponded { .. } => "tool_responded",
             Self::MemoryWritten { .. } => "memory_written",
             Self::MemoryRetrieved { .. } => "memory_retrieved",
-            Self::GraphStarted { .. } => "graph_started",
-            Self::NodeExecuteRequested { .. } => "node_execute_requested",
-            Self::NodeCompleted { .. } => "node_completed",
-            Self::NodeFailed { .. } => "node_failed",
-            Self::GraphCompleted { .. } => "graph_completed",
-            Self::ActorTaskRequested { .. } => "actor_task_requested",
-            Self::ActorBid { .. } => "actor_bid",
-            Self::NodeTaskAssigned { .. } => "node_task_assigned",
         }
     }
 }

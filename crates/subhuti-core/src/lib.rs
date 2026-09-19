@@ -28,11 +28,13 @@ pub use observe::{
     TraceObserverPort, TraceStatus,
 };
 pub use orchestrator::{
-    execute_plan, execute_plan_adaptive, generate_plan, parse_plan, parse_plan_or_ask, Actor,
-    ActorRegistry, AdaptiveOptions, AgentContext, AgentRegistry, AskRequest, BoxFuture,
-    EventBusRef, ExpertAgent, ExpertAgentActorAdapter, ExpertState, FrameworkExpertInfo, FromState,
-    Llm, OrchestrationResult, Orchestrator, PlanExecution, PlanOrAsk, PlanStep, SkillPlan,
-    StepFallback, TaskAnalysisRule, TaskProfile, TokenUsage, ToolExecutor,
+    execute_plan, execute_plan_adaptive, generate_plan, parse_plan, parse_plan_or_ask, react_flow,
+    Actor, ActorRegistry, AdaptiveOptions, AgentContext, AgentRegistry, AskRequest, BoxFuture,
+    EventBusRef, ExpertAgent, ExpertAgentActorAdapter, ExpertState, FlowContext, FlowNode,
+    FlowNodeResult, FlowRunner, FlowTemplate, FrameworkExpertInfo, FromState, Llm,
+    OrchestrationResult, Orchestrator, PlanExecution, PlanOrAsk, PlanStep, ReactStage, SkillPlan,
+    StepFallback, TaskAnalysisRule, TaskProfile, TokenUsage, ToolExecutor, ToolRuntime,
+    REACT_FLOW_TYPE,
 };
 pub use runtime::{
     LLMConfig, LLMProvider, LLMResponse, Message, Role, Session, Tool, ToolCall, ToolCallResult,

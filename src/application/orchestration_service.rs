@@ -264,6 +264,8 @@ impl ChatPort for OrchestrationService {
     }
 
     fn orchestrate_stream(&self, request: OrchestrateRequest) -> mpsc::Receiver<StreamEvent> {
+        // 单条结构化进度通道：专家经 ctx.progress 直接发 ProgressEvent；
+        // 框架动作事件经 ProgressEventBridge 汇入同一条流。应用层只做 ProgressEvent → StreamEvent 映射。
         let (tx, rx) = mpsc::channel(32);
         let engine = self.orchestration_engine.clone();
         let user_id = request.user_id.unwrap_or_else(|| "default".to_string());
@@ -279,310 +281,425 @@ impl ChatPort for OrchestrationService {
         let extra = extra_value.unwrap_or(serde_json::Value::Null);
         let session_manager = self.session_manager.clone();
         let memory_consolidator = self.memory_consolidator.clone();
-        // 拷贝 event_bus 引用进闭包（self 不能整体 move 进 task）
+        // 拷贝 event_bus 引用进构造器（self 不能整体 move 进 task）
         let event_bus = self.event_bus.clone();
 
-        // 单条结构化进度通道：专家经 ctx.progress 直接发 ProgressEvent；
-        // 框架动作事件经 ProgressEventBridge 汇入同一条流。应用层只做 ProgressEvent → StreamEvent 映射。
-        let (p_tx, mut p_rx) = mpsc::channel::<ProgressEvent>(128);
+        let pipeline = StreamPipeline::new(
+            engine,
+            session_manager,
+            memory_consolidator,
+            event_bus,
+            message,
+            user_id,
+            chain,
+            expert_id,
+            trace_id,
+            session_id,
+            system_prompt,
+            extra,
+            tx,
+        );
 
+        tokio::spawn(async move {
+            pipeline.run().await;
+        });
+
+        rx
+    }
+}
+
+// ─── StreamPipeline（per-request SSE 生命周期封装）───────────────
+//
+// Facade：`orchestrate_stream` 只负责参数摊平与 spawn；模板方法 `run`
+// 承载单次 /orchestrate 请求从 Start 到 Done/Error 的完整生命周期骨架，
+// `pump` 作为汇流器合并统一 ProgressEvent 流与引擎最终响应。
+
+/// per-request SSE 生命周期处理器
+struct StreamPipeline {
+    engine: Arc<dyn OrchestrationEnginePort>,
+    session_manager: Option<Arc<SessionManager>>,
+    memory_consolidator: Option<Arc<MemoryConsolidator>>,
+    event_bus: Option<Arc<EventBus>>,
+    message: String,
+    user_id: String,
+    chain: String,
+    expert_id: String,
+    trace_id: String,
+    session_id: String,
+    system_prompt: String,
+    extra: serde_json::Value,
+    tx: mpsc::Sender<StreamEvent>,
+    p_tx: mpsc::Sender<ProgressEvent>,
+    p_rx: mpsc::Receiver<ProgressEvent>,
+}
+
+impl StreamPipeline {
+    fn new(
+        engine: Arc<dyn OrchestrationEnginePort>,
+        session_manager: Option<Arc<SessionManager>>,
+        memory_consolidator: Option<Arc<MemoryConsolidator>>,
+        event_bus: Option<Arc<EventBus>>,
+        message: String,
+        user_id: String,
+        chain: String,
+        expert_id: String,
+        trace_id: String,
+        session_id: String,
+        system_prompt: String,
+        extra: serde_json::Value,
+        tx: mpsc::Sender<StreamEvent>,
+    ) -> Self {
+        let (p_tx, p_rx) = mpsc::channel::<ProgressEvent>(128);
+        Self {
+            engine,
+            session_manager,
+            memory_consolidator,
+            event_bus,
+            message,
+            user_id,
+            chain,
+            expert_id,
+            trace_id,
+            session_id,
+            system_prompt,
+            extra,
+            tx,
+            p_tx,
+            p_rx,
+        }
+    }
+
+    /// 模板方法：per-request 生命周期骨架（Start → 订阅 → 框架 Step → 引擎 → 汇流 → 注销 → 收尾）
+    async fn run(mut self) {
         // 本请求 token 用量累计：桥在 LLMResponded 时累加，Done.meta 透出给调用方
         let token_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let llm_calls = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-        tokio::spawn(async move {
-            // 生命期起点：Start
-            let _ = tx.send(StreamEvent::Start).await;
+        // 生命期起点：Start
+        let _ = self.tx.send(StreamEvent::Start).await;
 
-            // per-request 订阅：框架动作事件 → 同一条 ProgressEvent 流（取代全局 stream_registry）
-            let mut progress_sub_id: Option<String> = None;
-            if !trace_id.is_empty() {
-                if let Some(bus) = &event_bus {
-                    let bridge = Arc::new(
-                        crate::adapter::outbound::event_bridge::ProgressEventBridge::new(
-                            trace_id.clone(),
-                            p_tx.clone(),
-                            token_counter.clone(),
-                            llm_calls.clone(),
-                        ),
-                    );
-                    progress_sub_id = Some(bus.subscribe(bridge).await);
-                }
+        // per-request 订阅：框架动作事件 → 同一条 ProgressEvent 流（取代全局 stream_registry）
+        let mut progress_sub_id: Option<String> = None;
+        if !self.trace_id.is_empty() {
+            if let Some(bus) = &self.event_bus {
+                let bridge = Arc::new(
+                    crate::adapter::outbound::event_bridge::ProgressEventBridge::new(
+                        self.trace_id.clone(),
+                        self.p_tx.clone(),
+                        token_counter.clone(),
+                        llm_calls.clone(),
+                    ),
+                );
+                progress_sub_id = Some(bus.subscribe(bridge).await);
             }
+        }
 
-            // 记录本轮用户消息（框架级上下文，专家随后从这里读历史）
-            if let Some(mgr) = &session_manager {
-                mgr.record_user(&session_id, &message);
-            }
+        // 记录本轮用户消息（框架级上下文，专家随后从这里读历史）
+        if let Some(mgr) = &self.session_manager {
+            mgr.record_user(&self.session_id, &self.message);
+        }
 
-            // 编排生命期步骤（analyze / run）以 ProgressEvent::Step 注入同一条流，
-            // 与专家/框架事件统一经 p_rx → map_progress → StreamEvent，杜绝双通道。
-            let routing_msg = if !expert_id.is_empty() {
-                format!("指定专家: {}", expert_id)
-            } else {
-                "分析任务中...".to_string()
-            };
-            let _ = p_tx.try_send(ProgressEvent::Step {
-                message: routing_msg,
-                source: "框架".to_string(),
-                phase: Some("analyze".to_string()),
-                todo_state: None,
-                done: None,
-                total: None,
-            });
-            let _ = p_tx.try_send(ProgressEvent::Step {
-                message: "开始执行...".to_string(),
-                source: "框架".to_string(),
-                phase: Some("run".to_string()),
-                todo_state: None,
-                done: None,
-                total: None,
-            });
+        // 编排生命期步骤（analyze / run）以 ProgressEvent::Step 注入同一条流，
+        // 与专家/框架事件统一经 p_rx → map_progress → StreamEvent，杜绝双通道。
+        let routing_msg = if !self.expert_id.is_empty() {
+            format!("指定专家: {}", self.expert_id)
+        } else {
+            "分析任务中...".to_string()
+        };
+        self.inject_step("analyze", routing_msg);
+        self.inject_step("run", "开始执行...".to_string());
 
-            // 把框架/专家统一的 ProgressEvent 映射为前端 StreamEvent（适配层塌缩到这里）
-            let map_progress = |ev: ProgressEvent| -> StreamEvent {
-                match ev {
-                    ProgressEvent::Step {
-                        message,
-                        source,
-                        phase,
-                        todo_state,
-                        done,
-                        total,
-                    } => {
-                        let message = match (done, total) {
-                            (Some(d), Some(t)) if t > 0 => format!("{} ({}/{})", message, d, t),
-                            _ => message,
-                        };
-                        StreamEvent::Step {
-                            message,
-                            source,
-                            phase,
-                            todo_state,
-                        }
-                    }
-                    ProgressEvent::Chunk { content } => StreamEvent::Chunk { content },
-                    ProgressEvent::Ask {
-                        ask_id,
-                        question,
-                        options,
-                    } => StreamEvent::Ask {
-                        ask_id,
-                        question,
-                        options,
-                    },
-                }
-            };
-
-            // 启动编排执行（把 p_tx 经引擎注入 agent ctx.progress，专家直接发 ProgressEvent）
-            let engine_handle = tokio::spawn({
-                let engine = engine.clone();
-                let message = message.clone();
-                let user_id = user_id.clone();
-                let chain = chain.clone();
-                let expert_id = expert_id.clone();
-                let trace_id = trace_id.clone();
-                let session_id = session_id.clone();
-                let system_prompt = system_prompt.clone();
-                let extra = extra.clone();
-                let p_tx = p_tx.clone();
-                async move {
-                    engine
-                        .orchestrate(
-                            &message,
-                            &user_id,
-                            &chain,
-                            &expert_id,
-                            &trace_id,
-                            &session_id,
-                            &system_prompt,
-                            &extra,
-                            Some(p_tx),
-                        )
-                        .await
-                }
-            });
-
-            // 单源合并：统一 ProgressEvent 流（p_rx）与引擎最终响应。
-            // 框架 AgentEventData 与专家 ProgressEvent 已汇入同一条流，无需多通道 select。
-            let mut streamed_chunks = false;
-            let mut engine_handle = Some(engine_handle);
-            let final_response = loop {
-                tokio::select! {
-                    progress = p_rx.recv() => {
-                        match progress {
-                            Some(ev) => {
-                                let stream_ev = map_progress(ev);
-                                if matches!(stream_ev, StreamEvent::Chunk { .. }) {
-                                    streamed_chunks = true;
-                                }
-                                let _ = tx.send(stream_ev).await;
-                            }
-                            None => {
-                                // 通道关闭：引擎已完成并丢弃其 p_tx。
-                                // 兜底收割引擎结果（正常路径下 result 分支先命中）。
-                                if let Some(h) = engine_handle.take() {
-                                    match h.await {
-                                        Ok(r) => break r,
-                                        Err(e) => {
-                                            let _ = tx
-                                                .send(StreamEvent::Error {
-                                                    error: format!("任务执行错误: {}", e),
-                                                })
-                                                .await;
-                                            break crate::domain::dto::OrchestrateResponse {
-                                                success: false,
-                                                output: String::new(),
-                                                chain: vec![],
-                                                expert_chain: vec![],
-                                                expert_outputs: vec![],
-                                                duration_ms: 0,
-                                                error: Some(format!("任务执行错误: {}", e)),
-                                                trace_id: trace_id.clone(),
-                                                session_id: session_id.clone(),
-                                            };
-                                        }
-                                    }
-                                } else {
-                                    break crate::domain::dto::OrchestrateResponse {
-                                        success: false,
-                                        output: String::new(),
-                                        chain: vec![],
-                                        expert_chain: vec![],
-                                        expert_outputs: vec![],
-                                        duration_ms: 0,
-                                        error: Some("进度通道异常关闭".to_string()),
-                                        trace_id: trace_id.clone(),
-                                        session_id: session_id.clone(),
-                                    };
-                                }
-                            }
-                        }
-                    }
-                    result = async {
-                        if let Some(ref mut h) = engine_handle {
-                            h.await
-                        } else {
-                            std::future::pending().await
-                        }
-                    } => {
-                        match result {
-                            Ok(response) => break response,
-                            Err(e) => {
-                                let _ = tx
-                                    .send(StreamEvent::Error {
-                                        error: format!("任务执行错误: {}", e),
-                                    })
-                                    .await;
-                                break crate::domain::dto::OrchestrateResponse {
-                                    success: false,
-                                    output: String::new(),
-                                    chain: vec![],
-                                    expert_chain: vec![],
-                                    expert_outputs: vec![],
-                                    duration_ms: 0,
-                                    error: Some(format!("任务执行错误: {}", e)),
-                                    trace_id: trace_id.clone(),
-                                    session_id: session_id.clone(),
-                                };
-                            }
-                        }
-                    }
-                }
-            };
-
-            // 注销本次请求的进度桥订阅（per-request，非全局注册表），避免泄漏与跨请求误投
-            if let (Some(bus), Some(id)) = (&event_bus, progress_sub_id.as_ref()) {
-                bus.unsubscribe(id).await;
-            }
-
-            // EventBus 对 handler 是 tokio::spawn 派发（fire-and-forget），
-            // 等 final LLMResponded 的累计落地后再读 token 计数器，避免 Done.meta 少计最后一次调用
-            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-
-            // 消费剩余的进度事件（确保不丢失最后的进度更新）
-            while let Ok(ev) = p_rx.try_recv() {
-                let stream_ev = map_progress(ev);
-                if matches!(stream_ev, StreamEvent::Chunk { .. }) {
-                    streamed_chunks = true;
-                }
-                let _ = tx.send(stream_ev).await;
-            }
-
-            if final_response.success {
-                // 记录最终答案（专家回流过同内容则去重）+ flush 整个上下文增量
-                if let Some(mgr) = &session_manager {
-                    mgr.record_final_answer(
-                        &session_id,
-                        &final_response.output,
-                        final_response
-                            .expert_chain
-                            .last()
-                            .map(|s| s.as_str())
-                            .unwrap_or("框架"),
-                    );
-                    mgr.flush(&session_id);
-                }
-
-                // 记忆沉淀：提炼本轮事实 → 藏经阁 → 落库（失败静默，不阻塞响应）
-                if let Some(mc) = &memory_consolidator {
-                    let domain = Self::domain_of(&final_response.expert_chain);
-                    mc.consolidate(&session_id, &domain, &message, &final_response.output)
-                        .await;
-                    mc.record_execution(
+        // 启动编排执行（把 p_tx 经引擎注入 agent ctx.progress，专家直接发 ProgressEvent）
+        let engine_handle = tokio::spawn({
+            let engine = self.engine.clone();
+            let message = self.message.clone();
+            let user_id = self.user_id.clone();
+            let chain = self.chain.clone();
+            let expert_id = self.expert_id.clone();
+            let trace_id = self.trace_id.clone();
+            let session_id = self.session_id.clone();
+            let system_prompt = self.system_prompt.clone();
+            let extra = self.extra.clone();
+            let p_tx = self.p_tx.clone();
+            async move {
+                engine
+                    .orchestrate(
                         &message,
-                        final_response.success,
-                        &domain,
+                        &user_id,
+                        &chain,
+                        &expert_id,
+                        &trace_id,
                         &session_id,
-                        &final_response.output,
-                    );
-                }
-
-                // 发送中间步骤：专家执行完成
-                if !final_response.expert_chain.is_empty() {
-                    let _ = tx
-                        .send(StreamEvent::Step {
-                            message: format!(
-                                "专家执行完成: {}",
-                                final_response.expert_chain.join(" → ")
-                            ),
-                            source: "框架".to_string(),
-                            phase: Some("done".to_string()),
-                            todo_state: None,
-                        })
-                        .await;
-                }
-
-                // 已经真流式下发过分片时，不再重复整块下发；
-                // `Done` 仍携带完整 output，作为前端权威结果（可据此覆盖/校正）。
-                if !streamed_chunks {
-                    let _ = tx
-                        .send(StreamEvent::Chunk {
-                            content: final_response.output.clone(),
-                        })
-                        .await;
-                }
-                let _ = tx
-                    .send(StreamEvent::Done {
-                        output: final_response.output,
-                        meta: serde_json::json!({
-                            "chain": final_response.expert_chain,
-                            "duration_ms": final_response.duration_ms,
-                            "tokens_used": token_counter.load(std::sync::atomic::Ordering::Relaxed),
-                            "llm_calls": llm_calls.load(std::sync::atomic::Ordering::Relaxed),
-                        }),
-                    })
-                    .await;
-            } else {
-                let _ = tx
-                    .send(StreamEvent::Error {
-                        error: final_response.error.unwrap_or_default(),
-                    })
-                    .await;
+                        &system_prompt,
+                        &extra,
+                        Some(p_tx),
+                    )
+                    .await
             }
         });
 
-        rx
+        // 单源合并：统一 ProgressEvent 流（p_rx）与引擎最终响应
+        let (final_response, streamed_chunks) = self.pump(Some(engine_handle)).await;
+
+        // 注销本次请求的进度桥订阅（per-request，非全局注册表），避免泄漏与跨请求误投
+        if let (Some(bus), Some(id)) = (&self.event_bus, progress_sub_id.as_ref()) {
+            bus.unsubscribe(id).await;
+        }
+
+        // EventBus 对 handler 是 tokio::spawn 派发（fire-and-forget），
+        // 等 final LLMResponded 的累计落地后再读 token 计数器，避免 Done.meta 少计最后一次调用
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        // 消费剩余的进度事件（确保不丢失最后的进度更新）
+        let mut streamed_chunks = streamed_chunks;
+        while let Ok(ev) = self.p_rx.try_recv() {
+            let stream_ev = Self::map_progress(ev);
+            if matches!(stream_ev, StreamEvent::Chunk { .. }) {
+                streamed_chunks = true;
+            }
+            let _ = self.tx.send(stream_ev).await;
+        }
+
+        if final_response.success {
+            // 记录最终答案（专家回流过同内容则去重）+ flush 整个上下文增量
+            if let Some(mgr) = &self.session_manager {
+                mgr.record_final_answer(
+                    &self.session_id,
+                    &final_response.output,
+                    final_response
+                        .expert_chain
+                        .last()
+                        .map(|s| s.as_str())
+                        .unwrap_or("框架"),
+                );
+                mgr.flush(&self.session_id);
+            }
+
+            // 记忆沉淀：提炼本轮事实 → 藏经阁 → 落库（失败静默，不阻塞响应）
+            if let Some(mc) = &self.memory_consolidator {
+                let domain = Self::domain_of(&final_response.expert_chain);
+                mc.consolidate(
+                    &self.session_id,
+                    &domain,
+                    &self.message,
+                    &final_response.output,
+                )
+                .await;
+                mc.record_execution(
+                    &self.message,
+                    final_response.success,
+                    &domain,
+                    &self.session_id,
+                    &final_response.output,
+                );
+            }
+
+            // 发送中间步骤：专家执行完成
+            if !final_response.expert_chain.is_empty() {
+                let _ = self
+                    .tx
+                    .send(StreamEvent::Step {
+                        message: format!(
+                            "专家执行完成: {}",
+                            final_response.expert_chain.join(" → ")
+                        ),
+                        source: "框架".to_string(),
+                        phase: Some("done".to_string()),
+                        todo_state: None,
+                    })
+                    .await;
+            }
+
+            // 已经真流式下发过分片时，不再重复整块下发；
+            // `Done` 仍携带完整 output，作为前端权威结果（可据此覆盖/校正）。
+            if !streamed_chunks {
+                let _ = self
+                    .tx
+                    .send(StreamEvent::Chunk {
+                        content: final_response.output.clone(),
+                    })
+                    .await;
+            }
+            let _ = self
+                .tx
+                .send(StreamEvent::Done {
+                    output: final_response.output,
+                    meta: serde_json::json!({
+                        "chain": final_response.expert_chain,
+                        "duration_ms": final_response.duration_ms,
+                        "tokens_used": token_counter.load(std::sync::atomic::Ordering::Relaxed),
+                        "llm_calls": llm_calls.load(std::sync::atomic::Ordering::Relaxed),
+                    }),
+                })
+                .await;
+        } else {
+            let _ = self
+                .tx
+                .send(StreamEvent::Error {
+                    error: final_response.error.unwrap_or_default(),
+                })
+                .await;
+        }
+    }
+
+    /// 框架动作步骤注入（analyze / run / done phase）
+    fn inject_step(&self, phase: &str, msg: String) {
+        let _ = self.p_tx.try_send(ProgressEvent::Step {
+            message: msg,
+            source: "框架".to_string(),
+            phase: Some(phase.to_string()),
+            todo_state: None,
+            done: None,
+            total: None,
+        });
+    }
+
+    /// 汇流器：合并统一 ProgressEvent 流（p_rx）与引擎最终响应。
+    /// 返回 `(final_response, streamed_chunks)`。Channel 关闭兜底、JoinHandle await 成功/Err、
+    /// `pending()` 分支逻辑在此逐字保留。
+    async fn pump(
+        &mut self,
+        mut engine_handle: Option<tokio::task::JoinHandle<OrchestrateResponse>>,
+    ) -> (OrchestrateResponse, bool) {
+        // 单源合并：统一 ProgressEvent 流（p_rx）与引擎最终响应。
+        // 框架 AgentEventData 与专家 ProgressEvent 已汇入同一条流，无需多通道 select。
+        let mut streamed_chunks = false;
+        let final_response = loop {
+            tokio::select! {
+                progress = self.p_rx.recv() => {
+                    match progress {
+                        Some(ev) => {
+                            let stream_ev = Self::map_progress(ev);
+                            if matches!(stream_ev, StreamEvent::Chunk { .. }) {
+                                streamed_chunks = true;
+                            }
+                            let _ = self.tx.send(stream_ev).await;
+                        }
+                        None => {
+                            // 通道关闭：引擎已完成并丢弃其 p_tx。
+                            // 兜底收割引擎结果（正常路径下 result 分支先命中）。
+                            if let Some(h) = engine_handle.take() {
+                                match h.await {
+                                    Ok(r) => break r,
+                                    Err(e) => {
+                                        let _ = self
+                                            .tx
+                                            .send(StreamEvent::Error {
+                                                error: format!("任务执行错误: {}", e),
+                                            })
+                                            .await;
+                                        break Self::err_response(
+                                            &self.trace_id,
+                                            &self.session_id,
+                                            format!("任务执行错误: {}", e),
+                                        );
+                                    }
+                                }
+                            } else {
+                                break Self::err_response(
+                                    &self.trace_id,
+                                    &self.session_id,
+                                    "进度通道异常关闭".to_string(),
+                                );
+                            }
+                        }
+                    }
+                }
+                result = async {
+                    if let Some(ref mut h) = engine_handle {
+                        h.await
+                    } else {
+                        std::future::pending().await
+                    }
+                } => {
+                    match result {
+                        Ok(response) => break response,
+                        Err(e) => {
+                            let _ = self
+                                .tx
+                                .send(StreamEvent::Error {
+                                    error: format!("任务执行错误: {}", e),
+                                })
+                                .await;
+                            break Self::err_response(
+                                &self.trace_id,
+                                &self.session_id,
+                                format!("任务执行错误: {}", e),
+                            );
+                        }
+                    }
+                }
+            }
+        };
+        (final_response, streamed_chunks)
+    }
+
+    /// 把框架/专家统一的 ProgressEvent 映射为前端 StreamEvent（适配层塌缩到这里）
+    fn map_progress(ev: ProgressEvent) -> StreamEvent {
+        match ev {
+            ProgressEvent::Step {
+                message,
+                source,
+                phase,
+                todo_state,
+                done,
+                total,
+            } => {
+                let message = match (done, total) {
+                    (Some(d), Some(t)) if t > 0 => format!("{} ({}/{})", message, d, t),
+                    _ => message,
+                };
+                StreamEvent::Step {
+                    message,
+                    source,
+                    phase,
+                    todo_state,
+                }
+            }
+            ProgressEvent::Chunk { content } => StreamEvent::Chunk { content },
+            ProgressEvent::Ask {
+                ask_id,
+                question,
+                options,
+            } => StreamEvent::Ask {
+                ask_id,
+                question,
+                options,
+            },
+        }
+    }
+
+    /// 兜底失败响应（替换三处重复的 break 构造）
+    fn err_response(trace_id: &str, session_id: &str, msg: String) -> OrchestrateResponse {
+        OrchestrateResponse {
+            success: false,
+            output: String::new(),
+            chain: vec![],
+            expert_chain: vec![],
+            expert_outputs: vec![],
+            duration_ms: 0,
+            error: Some(msg),
+            trace_id: trace_id.to_string(),
+            session_id: session_id.to_string(),
+        }
+    }
+
+    /// 按专家链推断记忆领域（与 OrchestrationService::domain_of 语义一致，
+    /// 用于把沉淀挂到正确的领域集合）
+    fn domain_of(chain: &[String]) -> String {
+        chain
+            .last()
+            .map(|s| s.to_lowercase())
+            .map(|name| {
+                if name.contains("blender") {
+                    "blender".to_string()
+                } else if name.contains("rust") {
+                    "rust".to_string()
+                } else {
+                    "general".to_string()
+                }
+            })
+            .unwrap_or_else(|| "general".to_string())
     }
 }
 

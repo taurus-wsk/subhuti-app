@@ -71,6 +71,39 @@ impl SkillPlan {
     }
 }
 
+/// 主管编排计划步骤（**主管层专用**，与专家内部 `PlanStep.skill_id` 语义区分）
+///
+/// 字段用 `expert_id` 而非 `skill_id`：主管层计划的一项 = **调度一个已注册专家**
+/// （黑盒），不是调用专家内部的某个技能。此前复用 `SkillPlan`/`PlanStep` ，
+/// 把专家 id 塞进名为 `skill_id` 的字段里，命名词不副实（实测易误导）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpertStep {
+    /// 步骤序号（从 1 开始）
+    pub order: u32,
+    /// 被调度的专家 id（必须来自已注册专家）
+    pub expert_id: String,
+    /// 步骤描述（给该专家看的任务说明）
+    pub description: String,
+    /// 专家参数（LLM 常漏掉此字段，缺省为空串）
+    #[serde(default, deserialize_with = "deserialize_params")]
+    pub params: String,
+}
+
+/// 主管编排计划：把多领域请求按顺序拆给多个专家串行执行。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpertPlan {
+    /// 计划描述
+    pub description: String,
+    /// 专家步骤（严格按顺序执行，上一步输出喂给下一步）
+    pub steps: Vec<ExpertStep>,
+}
+
+impl ExpertPlan {
+    pub fn step_count(&self) -> usize {
+        self.steps.len()
+    }
+}
+
 /// 计划执行的汇总结果：产物 + 步骤成败统计。
 ///
 /// 存在的意义：**整体成败必须由步骤成败聚合得出**。执行链不再"永远返回 Ok"——
@@ -226,6 +259,53 @@ pub fn parse_plan_or_ask(output: &str) -> Result<PlanOrAsk> {
     }
 }
 
+/// 主管编排计划（或提问）产出。
+///
+/// 与 `PlanOrAsk` 分离：`PlanOrAsk` 的 `Plan` 承载专家内部技能计划（`SkillPlan`），
+/// 主管层这里承载**专家调度计划**（`ExpertPlan`，字段为 `expert_id`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ExpertPlanOrAsk {
+    /// 可执行的专家编排计划
+    Plan(ExpertPlan),
+    /// 信息不足，需要先向用户提问
+    Ask(AskRequest),
+}
+
+/// 解析主管 LLM 输出的专家编排计划（计划 或 提问）。
+///
+/// 与 `parse_plan_or_ask` 共用 `question`/`options` 判定与 JSON 抽取逻辑，
+/// 唯一区别是 `Plan` 分支落到 `ExpertPlan`（而非 `SkillPlan`）。
+pub fn parse_expert_plan_or_ask(output: &str) -> Result<ExpertPlanOrAsk> {
+    let json_str = extract_json(output);
+    let value: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| {
+        crate::Error::Expert(format!(
+            "解析主管规划结果失败: {}, 原始输出: {}",
+            e,
+            output_preview(output)
+        ))
+    })?;
+
+    if value.get("question").is_some() && value.get("options").is_some() {
+        let ask: AskRequest = serde_json::from_value(value).map_err(|e| {
+            crate::Error::Expert(format!(
+                "解析提问请求失败: {}, 原始输出: {}",
+                e,
+                output_preview(output)
+            ))
+        })?;
+        Ok(ExpertPlanOrAsk::Ask(ask))
+    } else {
+        let plan: ExpertPlan = serde_json::from_value(value).map_err(|e| {
+            crate::Error::Expert(format!(
+                "解析专家编排计划失败: {}, 原始输出: {}",
+                e,
+                output_preview(output)
+            ))
+        })?;
+        Ok(ExpertPlanOrAsk::Plan(plan))
+    }
+}
+
 /// 规划结果解析失败时的**纠错重试指令**。
 ///
 /// 实测（2026-09-13）：LLM 偶发把 JSON 截断（如只吐到 `{"desc`）或在 JSON 前后
@@ -338,6 +418,12 @@ const PLAN_OUTPUT_EXAMPLE: &str = "```json\n\
 const ASK_OUTPUT_EXAMPLE: &str = "```json\n\
 {\n  \"question\": \"问题\", \"options\": [\"选项1\", \"选项2\"], \"context\": \"为何询问的说明\"\n}\n```";
 
+/// 主管编排计划 JSON 输出模板（主管层专用，字段为 `expert_id`）。
+const EXPERT_PLAN_OUTPUT_EXAMPLE: &str = "```json\n\
+{\n  \"description\": \"计划描述\",\n  \"steps\": [\n\
+    {\n      \"order\": 1, \"expert_id\": \"<专家id>\", \"description\": \"步骤描述\", \"params\": \"参数\" }\n\
+  ]\n}\n```";
+
 /// 调用 LLM 生成规划结果，并在**解析失败时自动纠错重试一次**。
 ///
 /// 为什么在框架层做：`generate_plan`（专家内部规划）与 `generate_expert_plan`
@@ -386,6 +472,46 @@ async fn chat_and_parse_plan(
                 second
             ))
         })
+}
+
+/// 主管版规划生成：与 `chat_and_parse_plan` 同款的「解析失败自动纠错重试一次」机制，
+/// 仅落到 `ExpertPlanOrAsk`（专家编排计划）而非 `PlanOrAsk`（专家内部技能计划）。
+async fn chat_and_parse_expert_plan(
+    llm: &Arc<dyn LLM>,
+    messages: Vec<Message>,
+    label: &str,
+) -> Result<ExpertPlanOrAsk> {
+    let llm_output = llm.chat(messages.clone()).await?;
+    let first_err = match parse_expert_plan_or_ask(&llm_output) {
+        Ok(parsed) => return Ok(parsed),
+        Err(e) => e,
+    };
+
+    tracing::warn!(
+        "[planner] {} 首次输出无法解析，带纠错提示重试一次: {}",
+        label,
+        first_err
+    );
+
+    let mut retry_messages = messages;
+    retry_messages.push(Message {
+        role: Role::Assistant,
+        content: llm_output,
+        tool_call_id: None,
+    });
+    retry_messages.push(Message {
+        role: Role::User,
+        content: PLAN_RETRY_INSTRUCTION.to_string(),
+        tool_call_id: None,
+    });
+
+    let retry_output = llm.chat(retry_messages).await?;
+    parse_expert_plan_or_ask(&retry_output).map_err(|second| {
+        crate::Error::Expert(format!(
+            "主管编排计划解析失败（已自动重试一次仍不合法）: {}",
+            second
+        ))
+    })
 }
 
 /// 使用 LLM 生成执行计划
@@ -458,16 +584,15 @@ pub async fn generate_plan(
 /// 框架主管（Planner/ReAct 主管）专用的「专家编排计划」生成器。
 ///
 /// 与专家内部的 `generate_plan` 不同：这里的"技能"就是已注册专家本身，
-/// 计划步骤的 `skill_id` 直接是专家 id。主管据此把多领域请求拆给多个专家串行执行，
-/// 上一步专家的输出会作为下一步专家的输入（黑盒专家之间的上下文传递）。
-///
-/// 触发场景：用户输入同时命中多个专家的标签（多领域），需要多专家协作。
+/// 计划步骤的字段 `expert_id` 直接是专家 id。主管据此把请求拆给一个或多个专家
+/// （单领域排一个，多领域排多个）串行执行，上一步专家的输出会作为下一步专家的输入
+/// （黑盒专家之间的上下文传递）。
 pub async fn generate_expert_plan(
     llm: &Arc<dyn LLM>,
     input: &str,
     experts: &[SkillInfo],
     supervisor_name: &str,
-) -> Result<PlanOrAsk> {
+) -> Result<ExpertPlanOrAsk> {
     let experts_desc: String = experts
         .iter()
         .map(|s| format!("- **{}** (id=`{}`): {}", s.name, s.id, s.description))
@@ -475,23 +600,23 @@ pub async fn generate_expert_plan(
         .join("\n");
 
     let system_prompt = format!(
-        r#"你是 {}，负责把用户的多领域请求拆给合适的专家串行处理。
+        r#"你是 {}，负责把用户请求拆给合适的专家处理（可单专家或多专家）。
 
-可用的专家（skill_id 即专家 id，必须严格从下列 id 中选择，不要编造）：
+可用的专家（expert_id 必须严格从下列 id 中选择，不要编造）：
 {}
 
 规则：
 1. 先判断请求涉及几个领域；只涉及单个领域时，只排那一个专家即可
 2. 涉及多个领域时，按最自然的执行顺序排多个专家；前一步专家的输出会作为后一步专家的输入
-3. skill_id 必须精确等于上面列出的某个专家 id
+3. expert_id 必须精确等于上面列出的某个专家 id
 {}
 6. 以 JSON 格式返回专家编排计划（除非规则 5 需要提问）"#,
         supervisor_name, experts_desc, PLAN_COMMON_RULES
     );
 
     let user_prompt = format!(
-        "用户需求：\n{}\n\n请制定专家编排计划，以以下 JSON 格式返回：\n{}\n\n仅当确实缺失关键信息、且无法从上下文中推断时，才改为返回提问：\n{}",
-        input, PLAN_OUTPUT_EXAMPLE, ASK_OUTPUT_EXAMPLE
+        "用户需求：\n{}\n\n请制定专家编排计划，以以下 JSON 格式返回（expert_id 字段对应专家 id）：\n{}\n\n仅当确实缺失关键信息、且无法从上下文中推断时，才改为返回提问：\n{}",
+        input, EXPERT_PLAN_OUTPUT_EXAMPLE, ASK_OUTPUT_EXAMPLE
     );
 
     let messages = vec![
@@ -507,7 +632,7 @@ pub async fn generate_expert_plan(
         },
     ];
 
-    chat_and_parse_plan(
+    chat_and_parse_expert_plan(
         llm,
         messages,
         &format!("主管 {} 多专家编排", supervisor_name),
@@ -675,6 +800,42 @@ mod tests {
         let plan = parse_plan(input).unwrap();
         assert_eq!(plan.description, "编码计划");
         assert_eq!(plan.step_count(), 2);
+    }
+
+    #[test]
+    fn test_parse_expert_plan_or_ask_detects_plan() {
+        // 主管层 JSON：字段为 expert_id，而非技能层的 skill_id
+        let json = r#"{
+            "description": "跨领域协作",
+            "steps": [
+                {"order": 1, "expert_id": "blender", "description": "建模", "params": "角色"},
+                {"order": 2, "expert_id": "rust-expert", "description": "写工具", "params": "脚本"}
+            ]
+        }"#;
+        let parsed = parse_expert_plan_or_ask(json).unwrap();
+        match parsed {
+            ExpertPlanOrAsk::Plan(plan) => {
+                assert_eq!(plan.step_count(), 2);
+                assert_eq!(plan.steps[0].expert_id, "blender");
+                assert_eq!(plan.steps[1].expert_id, "rust-expert");
+            }
+            ExpertPlanOrAsk::Ask(_) => panic!("应识别为专家编排计划"),
+        }
+    }
+
+    #[test]
+    fn test_parse_expert_plan_or_ask_detects_ask() {
+        // 主管层也应能交出提问（信息不足时）
+        let json = r#"{
+            "question": "需要先确认目标平台",
+            "options": ["macOS", "Linux"],
+            "context": "不同平台的命令不同"
+        }"#;
+        let parsed = parse_expert_plan_or_ask(json).unwrap();
+        match parsed {
+            ExpertPlanOrAsk::Ask(ask) => assert_eq!(ask.question, "需要先确认目标平台"),
+            ExpertPlanOrAsk::Plan(_) => panic!("应识别为提问"),
+        }
     }
 
     #[test]

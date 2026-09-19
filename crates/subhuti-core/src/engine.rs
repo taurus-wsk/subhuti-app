@@ -111,14 +111,12 @@ impl Subhuti {
         self.orchestrator.register_actor(actor);
     }
 
-    /// 使用默认上下文执行编排
-    pub async fn dispatch(&self, input: &str) -> OrchestrationResult {
-        let mut ctx = AgentContext::new(input, "default");
-        let state = self.build_expert_state();
-        self.orchestrator.dispatch(&mut ctx, &state).await
-    }
-
     /// 使用自定义上下文执行编排
+    ///
+    /// 框架唯一对外编排入口（`dispatch_with_context`）：所有上层（SSE / MCP / skill 执行）
+    /// 都经它注入 session / 进度通道 / trace / expert_id 等上下文，并在执行后持久化会话。
+    /// 不再提供无上下文的 `dispatch(input)` 快捷入口——`AgentContext::new(input, "default")`
+    /// 即可构造等价裸上下文，避免两套入口造成语义二义。
     pub async fn dispatch_with_context(&self, mut ctx: AgentContext) -> OrchestrationResult {
         let state = self.build_expert_state();
 

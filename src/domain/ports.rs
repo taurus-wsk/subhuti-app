@@ -48,9 +48,7 @@ pub trait OrchestrationEnginePort: Send + Sync + 'static {
     ///
     /// - `trace_id`: 追踪 ID（写入框架 ctx.metadata，事件 emit 时带 trace 上下文）
     /// - `session_id`: 会话 ID（同上，写入 ctx.metadata 供事件关联）
-    /// - `graph`: 指定图名称（为空时自动匹配）
     /// - `expert_id`: 指定专家 ID（优先级最高，直接路由到该专家）
-    /// - `workspace_folder`: 项目工作目录路径（透传给专家）
     /// - `system_prompt`: 自定义系统提示词（覆盖专家默认 system prompt）
     #[allow(clippy::too_many_arguments)]
     fn orchestrate(

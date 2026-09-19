@@ -666,43 +666,6 @@ impl AgentEventData {
             } => format!("tool={}, ok={}, {}ms", tool_name, success, duration_ms),
             Self::MemoryWritten { key, category } => format!("{}={}", category, key),
             Self::MemoryRetrieved { results_count, .. } => format!("{} results", results_count),
-            Self::GraphStarted {
-                graph_name,
-                entry_node,
-                ..
-            } => {
-                format!("graph={}, entry={}", graph_name, entry_node)
-            }
-            Self::NodeExecuteRequested {
-                node_name, step, ..
-            } => {
-                format!("req node={}, step={}", node_name, step)
-            }
-            Self::NodeCompleted {
-                node_name,
-                success,
-                duration_ms,
-                ..
-            } => format!("done node={}, ok={}, {}ms", node_name, success, duration_ms),
-            Self::NodeFailed {
-                node_name, error, ..
-            } => format!("fail node={}, err={}", node_name, error),
-            Self::GraphCompleted {
-                success,
-                total_steps,
-                ..
-            } => format!("graph done, ok={}, {} steps", success, total_steps),
-            Self::ActorTaskRequested { node_name, .. } => {
-                format!("actor task: node={}", node_name)
-            }
-            Self::ActorBid {
-                actor_id, score, ..
-            } => {
-                format!("actor bid: {} score={}", actor_id, score)
-            }
-            Self::NodeTaskAssigned { actor_name, .. } => {
-                format!("task assigned: {}", actor_name)
-            }
         }
     }
 }

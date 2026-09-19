@@ -1,5 +1,6 @@
 pub mod actor;
 pub mod adaptive;
+pub mod flow;
 pub mod planner;
 pub mod rule_engine;
 
@@ -22,21 +23,6 @@ pub mod rule_engine;
 //   - 接到主题（用户问题）后，决定走哪条命运之路
 //   - 不自己执行，只决定执行的方向和路径
 //
-// 三层职责（命运的三个阶段）：
-//   Layer 1: TaskUnderstanding（命运占卜）
-//     输入：用户问题
-//     输出：任务画像（领域标签、任务类型、复杂度）
-//   Layer 2: ExecutionPlanning（命运抉择）
-//     输入：任务画像 + 可用专家/图
-//     输出：执行计划（执行策略、专家链、步骤顺序）
-//   Layer 3: ExecutionMonitoring（命运守护）
-//     输入：执行计划
-//     输出：执行结果（含超时、重试、失败处理）
-//
-// 两种命运之路：
-//   - 规则之路：RuleEngine 驱动的专家链顺序执行
-//   - 图之路：Graph 驱动的节点流程执行
-//
 // 代码标识符：`Orchestrator`（英文原意：编排者）
 // 概念隐喻：命运编织者（Destiny Weaver）
 //
@@ -51,10 +37,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 pub use self::actor::{Actor, ActorRegistry, ExpertAgentActorAdapter};
+pub use self::flow::{
+    react_flow, FlowContext, FlowNode, FlowNodeResult, FlowRunner, FlowTemplate, ReactStage,
+    ToolRuntime, REACT_FLOW_TYPE,
+};
 pub use self::planner::{
     execute_plan, generate_expert_plan, generate_plan, is_placeholder_step, parse_plan,
-    parse_plan_or_ask, strip_placeholder_steps, AskRequest, PlanExecution, PlanOrAsk, PlanStep,
-    SkillPlan,
+    parse_plan_or_ask, strip_placeholder_steps, AskRequest, ExpertPlan, ExpertPlanOrAsk,
+    ExpertStep, PlanExecution, PlanOrAsk, PlanStep, SkillPlan,
 };
 use crate::event::{AgentEventData, EventBus};
 use crate::runtime::llm::{Role, LLM};
@@ -452,8 +442,7 @@ impl Orchestrator {
         // 将用户消息添加到会话历史
         ctx.session.add_message(Role::User, input);
 
-        // 只保留图匹配 + 事件发布
-        // Actor 竞标制：图节点发布任务要求，Actor 池自评竞标
+        // 事件发布：广播用户消息（供观察者/进度流消费）
         self.emit_event(
             ctx,
             AgentEventData::UserMessage {
@@ -463,11 +452,10 @@ impl Orchestrator {
         .await;
 
         // 用户显式指定了专家：优先直接调度该专家（计划+技能执行），
-        // 避免被语义图路由截获后，图的每个节点又对「原始输入」整体重跑整个专家
-        //，导致 N 次递归重规划（plan_and_execute 叠加）与重复写文件。
+        // 绕过相关性打分路由，避免对「原始输入」整体重跑整个专家导致重复工作。
         if let Some(expert_id) = ctx.metadata.get("expert_id") {
             if let Some(actor) = self.actor_registry.get_by_id(expert_id) {
-                tracing::debug!("用户指定专家: {} → 直接调度 Actor（跳过图路由）", expert_id);
+                tracing::debug!("用户指定专家: {} → 直接调度 Actor", expert_id);
                 let _ = self
                     .emit_event(
                         ctx,
@@ -480,28 +468,9 @@ impl Orchestrator {
             }
         }
 
-        // graph_name 元数据：框架已无图路由（Workflow 下沉为专家内部），
-        // 这里仅把它当作「按专家 ID / 标签精确指定」的别名，等价于 expert_id。
-        // 找不到对应专家则回退到主管编排（单域快速路径 / 多域规划路径）。
-        let result = if let Some(graph_name) = ctx.metadata.get("graph_name") {
-            if let Some(actor) = self.actor_registry.get_by_id(graph_name) {
-                tracing::debug!("graph_name 命中专家 ID: {} → {}", graph_name, actor.name());
-                self.dispatch_via_actor(ctx, state, actor).await
-            } else if let Some(actor) = self
-                .actor_registry
-                .list()
-                .iter()
-                .find(|a| a.tags().iter().any(|t| t.eq_ignore_ascii_case(graph_name)))
-            {
-                tracing::debug!("graph_name 命中专家标签: {} → {}", graph_name, actor.name());
-                self.dispatch_via_actor(ctx, state, actor.clone()).await
-            } else {
-                tracing::warn!("graph_name 未命中任何专家，回退主管编排: {}", graph_name);
-                self.dispatch_without_graph(ctx, state).await
-            }
-        } else {
-            self.dispatch_without_graph(ctx, state).await
-        };
+        // 路由唯一裁决者是 dispatch_by_relevance（0 命中→领域边界 / 1 命中→快速
+        // 路径 / ≥2 命中→主管 LLM 编排）。
+        let result = self.dispatch_by_relevance(ctx, state).await;
 
         // 将助手回复添加到会话历史
         if result.success {
@@ -568,7 +537,7 @@ impl Orchestrator {
     ///   请补充说明」的提示——**只提示、不越权代答**，既保住了会话上下文的价值，
     ///   又不违反「零命中不兜底」的产品定位。
     ///
-    /// 之所以抽成方法：`dispatch_direct` 与 `dispatch_without_graph` 的零命中分支
+    /// 之所以抽成方法：`dispatch_direct` 与 `dispatch_by_relevance` 的零命中分支
     /// 此前各写了一份完全相同的长文案，属复制粘贴，容易改一处漏一处。
     fn unmatched_domain_result(&self, hint: Option<String>) -> OrchestrationResult {
         let mut output = format!(
@@ -635,38 +604,32 @@ impl Orchestrator {
         scored.into_iter().map(|(_, a)| a).collect()
     }
 
-    /// 无指定图时的 dispatch 流程：主管编排（Planner/ReAct 主管）。
+    /// 按「相关性打分」的自动路由：主管编排（Planner/ReAct 主管）。
     ///
-    /// 不再做自动图路由（框架已无 Graph，Workflow 下沉为专家内部，由主管 Planner 选专家）。
-    /// 三级决策（外加一层**受门控的**会话粘性兜底）：
-    ///   1. 单领域命中 → 直接黑盒调该专家（不额外消耗一次 LLM 规划，保留 M1a 速度）
-    ///   2. 多领域命中 → 主管用框架 Planner 把请求拆给多个专家串行执行
-    ///   3. 零命中   → **仅当输入表现为对上一轮的承接**（`looks_like_continuation`）时，
+    /// 框架已无 Graph 自动图路由，统一入口即此方法（Workflow 下沉为专家内部，
+    /// 由主管 Planner 选专家）。决策层级（外加一层**受门控的**会话粘性兜底）：
+    ///   1. 命中领域（单领域/多领域统一）→ 主管用框架 Planner 排一次计划，串行执行专家
+    ///   2. 零命中   → **仅当输入表现为对上一轮的承接**（`looks_like_continuation`）时，
     ///      延续本会话最近路由到的专家；否则返回「未匹配到领域专家」并列出本服务领域
     ///      边界（不做泛化兜底）
     ///
     /// 专家内部自带 Planner/ReAct（DomainExpert::plan_and_execute），框架只负责
     /// 「选哪些专家、按什么顺序」，专家如何内部执行对框架是黑盒。
-    async fn dispatch_without_graph(
+    async fn dispatch_by_relevance(
         &self,
         ctx: &mut AgentContext,
         state: &ExpertState,
     ) -> OrchestrationResult {
         let input = &ctx.input.clone();
 
-        tracing::debug!("未指定图，走主管编排（无图路由）: input={}", input);
+        tracing::debug!("未指定专家，走相关性自动路由: input={}", input);
 
         let relevant = self.relevant_actors(input);
         match relevant.len() {
-            // 清晰单领域：快速路径，直接黑盒调该专家
-            1 => {
-                let actor = relevant.into_iter().next().unwrap();
-                tracing::debug!("单领域命中，快速路径: {}", actor.name());
-                self.dispatch_via_actor(ctx, state, actor).await
-            }
-            // 多领域：主管规划，框架 Planner 拆给多个专家串行
-            n if n >= 2 => {
-                tracing::debug!("多领域命中 {} 个专家，走主管规划路径", n);
+            // 单领域/多领域统一走主管规划：LLM 编排计划串行执行专家。
+            // 单专家时主管排计划一次、调度该专家；多专家时按序串行。
+            _ if !relevant.is_empty() => {
+                tracing::debug!("命中 {} 个领域专家，统一走主管规划路径", relevant.len());
                 self.dispatch_with_plan(ctx, state, relevant).await
             }
             // 零命中：**仅在输入表现为「承接上一轮」时**才启用会话粘性，延续本会话
@@ -710,11 +673,12 @@ impl Orchestrator {
         }
     }
 
-    /// 主管规划路径（M1b）：框架 Planner 把多领域请求拆给多个专家串行执行。
+    /// 主管规划路径：框架 Planner 把请求拆给一个或多个专家串行执行。
     ///
-    /// 每个计划步骤 = 调一个专家（黑盒）；框架把上一步专家的输出作为下一步专家的输入，
-    /// 通过克隆 AgentContext、改写其 `input` 实现专家间的上下文传递。
-    /// 主管不感知专家内部如何执行（内部 Planner/ReAct/重试对框架不可见）。
+    /// 单专家/多专家统一经此：主管用 LLM 排一次计划；每个计划步骤 = 调一个专家
+    /// （黑盒）；框架把上一步专家的输出作为下一步专家的输入，通过克隆 AgentContext、
+    /// 改写其 `input` 实现专家间的上下文传递。主管不感知专家内部如何执行
+    /// （内部 Planner/ReAct/重试对框架不可见）。
     async fn dispatch_with_plan(
         &self,
         ctx: &mut AgentContext,
@@ -730,7 +694,7 @@ impl Orchestrator {
             }
         };
 
-        // 把候选专家渲染成 Planner 的「技能清单」，skill_id 即专家 id
+        // 把候选专家渲染成 Planner 的「技能清单」，
         let experts: Vec<SkillInfo> = roster
             .iter()
             .map(|a| SkillInfo {
@@ -745,9 +709,9 @@ impl Orchestrator {
             match generate_expert_plan(&llm, &ctx.input, &experts, "Subhuti 主管（多专家编排）")
                 .await
             {
-                Ok(PlanOrAsk::Plan(p)) => p,
+                Ok(ExpertPlanOrAsk::Plan(p)) => p,
                 // 规划返回提问 → 回退到首个相关专家，避免卡住用户
-                Ok(PlanOrAsk::Ask(_)) => {
+                Ok(ExpertPlanOrAsk::Ask(_)) => {
                     tracing::warn!("主管规划返回提问，回退单专家");
                     return self.dispatch_via_actor(ctx, state, roster[0].clone()).await;
                 }
@@ -772,10 +736,10 @@ impl Orchestrator {
         let mut failed_experts: Vec<String> = Vec::new();
 
         for (idx, step) in plan.steps.iter().enumerate() {
-            let actor = match self.actor_registry.get_by_id(&step.skill_id) {
+            let actor = match self.actor_registry.get_by_id(&step.expert_id) {
                 Some(a) => a,
                 None => {
-                    tracing::warn!("计划引用了未知专家 id={}，跳过该步", step.skill_id);
+                    tracing::warn!("计划引用了未知专家 id={}，跳过该步", step.expert_id);
                     continue;
                 }
             };
@@ -817,7 +781,7 @@ impl Orchestrator {
         }
 
         OrchestrationResult {
-            strategy: "plan:multi-expert".to_string(),
+            strategy: "plan:expert-route".to_string(),
             expert_chain,
             output: last_output,
             tokens: TokenUsage::default(),
@@ -828,7 +792,7 @@ impl Orchestrator {
 
     /// 直接通过专家（Actor）执行
     ///
-    /// 当 graph_name 不匹配任何图时，按专家 ID/标签找到 Actor 并直接执行。
+    /// 按专家 ID/标签找到 Actor 并直接执行（不经相关性打分与规划）。
     async fn dispatch_via_actor(
         &self,
         ctx: &mut AgentContext,
@@ -1120,29 +1084,6 @@ mod routing_tests {
             .select_actor_by_relevance("用 rust 写一个异步爬虫")
             .expect("应至少回退到一个专家");
         assert_eq!(picked.name(), "Rust 编程专家");
-    }
-
-    /// 回归（M1c）：graph_name 元数据作为「专家 ID 精确指定」别名，
-    /// 应直接命中对应专家（等价于 expert_id），框架不再走任何图路由。
-    #[tokio::test]
-    async fn graph_name_routes_to_expert_by_id() {
-        let orch = orch_with_two_experts();
-        let mut ctx = AgentContext::new("教我怎么用Blender做阵列修改器", "default");
-        ctx.set_metadata("graph_name", "blender");
-        let res = orch.dispatch(&mut ctx, &test_state()).await;
-        assert!(res.success);
-        assert_eq!(res.expert_chain, vec!["Blender 动画专家".to_string()]);
-    }
-
-    /// 反向回归（M1c）：graph_name 命中专家标签时同样直接路由。
-    #[tokio::test]
-    async fn graph_name_routes_to_expert_by_tag() {
-        let orch = orch_with_two_experts();
-        let mut ctx = AgentContext::new("用 rust 写点东西", "default");
-        ctx.set_metadata("graph_name", "rust");
-        let res = orch.dispatch(&mut ctx, &test_state()).await;
-        assert!(res.success);
-        assert_eq!(res.expert_chain, vec!["Rust 编程专家".to_string()]);
     }
 
     #[test]

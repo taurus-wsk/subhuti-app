@@ -1,23 +1,12 @@
 //! # Actor 竞标系统
 //!
-//! 舞台隐喻的核心：专家注册后成为 Actor，通过竞标机制竞争图节点任务。
+//! 舞台隐喻的核心：专家注册后成为 Actor，通过标签打分参与路由竞争。
 //!
 //! ## 设计哲学
 //!
 //! - **Actor = 演员**：每个专家注册后自动成为 Actor，拥有独立评分能力
-//! - **竞标制**：图节点发布任务要求，所有 Actor 自评分数，最高分上台
-//! - **双向奔赴**：节点定义"需要什么"，Actor 自评"我能做什么"，匹配成功才执行
-//!
-//! ## 竞标流程
-//!
-//! ```text
-//! 图节点需要执行
-//!   → 调度器发布 ActorTaskRequested（含任务标签/描述/状态）
-//!   → 所有 Actor 收到 → 各自评分（使用 RuleEngine 或自定义逻辑）
-//!   → 调度器收集竞标 → 选最高分
-//!   → 调度器发布 NodeTaskAssigned（含中标 Actor + 状态）
-//!   → 中标 Actor 执行 → 发布 NodeCompleted/NodeFailed
-//! ```
+//! - **竞标制**：`relevant_actors` 按标签打分，得分最高者被 `dispatch_via_actor` 调度
+//! - **双向奔赴**：路由按标签声明需求，Actor 自评匹配度，匹配成功才被调度执行
 
 use async_trait::async_trait;
 use std::sync::{Arc, RwLock};
